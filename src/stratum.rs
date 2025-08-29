@@ -1,4 +1,4 @@
-mod jobs;
+pub mod jobs;
 mod server;
 
 use anyhow::Result;
@@ -9,7 +9,7 @@ pub use server::Stratum;
 use std::borrow::Cow;
 use std::fmt;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Id {
     Number(u64),
     Text(Box<str>),

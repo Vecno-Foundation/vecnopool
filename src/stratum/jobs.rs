@@ -1,6 +1,6 @@
 use super::{Id, Response};
 use crate::vecnod::{VecnodHandle, RpcBlock};
-use crate::U256;
+use crate::uint::U256;
 use anyhow::Result;
 use log::debug;
 use serde_json::json;
@@ -26,31 +26,31 @@ impl Jobs {
         }
     }
 
-pub async fn insert(&self, template: RpcBlock) -> Option<JobParams> {
-    let header = template.header.as_ref()?;
-    let pre_pow = header.pre_pow().ok()?;
-    let difficulty = header.difficulty();
-    let timestamp = header.timestamp as u64;
+    pub async fn insert(&self, template: RpcBlock) -> Option<JobParams> {
+        let header = template.header.as_ref()?;
+        let pre_pow = header.pre_pow().ok()?;
+        let difficulty = header.difficulty();
+        let timestamp = header.timestamp as u64;
 
-    let mut w = self.inner.write().await;
-    let len = w.jobs.len();
-    let id = if len < 256 {
-        w.jobs.push(template);
-        (len) as u8
-    } else {
-        let id = w.next;
-        w.jobs[id as usize] = template; 
-        id
-    };
-    w.next = id.wrapping_add(1);
+        let mut w = self.inner.write().await;
+        let len = w.jobs.len();
+        let id = if len < 256 {
+            w.jobs.push(template);
+            len as u8
+        } else {
+            let id = w.next;
+            w.jobs[id as usize] = template;
+            id
+        };
+        w.next = id.wrapping_add(1);
 
-    Some(JobParams {
-        id,
-        pre_pow,
-        difficulty,
-        timestamp,
-    })
-}
+        Some(JobParams {
+            id,
+            pre_pow,
+            difficulty,
+            timestamp,
+        })
+    }
 
     pub async fn submit(
         &self,
@@ -68,16 +68,10 @@ pub async fn insert(&self, template: RpcBlock) -> Option<JobParams> {
             (block, r.handle.clone())
         };
         if let Some(header) = &mut block.header {
-            {
-                // Keep the lock on the pending jobs while we submit the block
-                // to guarantee that the ordering matches up
-                let mut pending = self.pending.lock().await;
-                pending.push_back(Pending { id: rpc_id, send });
-
-                header.nonce = nonce;
-                handle.submit_block(block);
-            }
-
+            let mut pending = self.pending.lock().await;
+            pending.push_back(Pending { id: rpc_id, send });
+            header.nonce = nonce;
+            handle.submit_block(block);
             true
         } else {
             false
@@ -91,6 +85,11 @@ pub async fn insert(&self, template: RpcBlock) -> Option<JobParams> {
             debug!("Resolve: nothing is pending");
         }
     }
+
+    pub async fn get_job(&self, job_id: u8) -> Option<RpcBlock> {
+        let r = self.inner.read().await;
+        r.jobs.get(job_id as usize).cloned()
+    }
 }
 
 struct JobsInner {
@@ -98,9 +97,9 @@ struct JobsInner {
     handle: VecnodHandle,
     jobs: Vec<RpcBlock>,
 }
-
+#[derive(Debug)]
 pub struct JobParams {
-    id: u8,
+    pub id: u8,
     pre_pow: U256,
     difficulty: u64,
     timestamp: u64,

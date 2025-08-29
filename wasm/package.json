@@ -1,0 +1,20 @@
+{
+  "name": "vecno-wasm",
+  "collaborators": [
+    "Vecno developers"
+  ],
+  "description": "VECNO WASM bindings",
+  "version": "0.0.1",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/vecno-foundation/vecno-testnet"
+  },
+  "files": [
+    "vecno_bg.wasm",
+    "vecno.js",
+    "vecno.d.ts"
+  ],
+  "main": "vecno.js",
+  "types": "vecno.d.ts"
+}

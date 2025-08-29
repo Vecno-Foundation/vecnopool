@@ -1,5 +1,5 @@
 use anyhow::Result;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use proto::vecnod_message::Payload;
 use proto::submit_block_response_message::RejectReason;
 pub use proto::RpcBlock;
@@ -28,6 +28,7 @@ impl VecnodHandle {
 
 #[derive(Debug)]
 pub enum Message {
+    #[allow(dead_code)]
     Info { version: String, synced: bool },
     Template(RpcBlock),
     NewTemplate,
@@ -79,7 +80,7 @@ impl ClientTask {
                     }
                     if let Some(block) = res.block {
                         if !self.synced && res.is_synced {
-                            info!("Node synced");
+                            warn!("Node synced");
                         }
                         self.synced = res.is_synced;
 
@@ -182,7 +183,7 @@ impl Client {
 
 mod proto {
     use crate::pow;
-    use crate::U256;
+    use crate::uint::U256;
     use anyhow::Result;
     use blake3::Hash;
     use blake3::Hasher as Blake3State;
@@ -283,6 +284,16 @@ mod proto {
 
             let hash = state.finalize();
             Ok(hash)
+        }
+    }
+
+    impl RpcBlock {
+        pub fn get_subsidy(&self) -> u64 {
+            self.transactions
+                .first()
+                .and_then(|tx| tx.outputs.first())
+                .map(|out| out.amount)
+                .unwrap_or(0)
         }
     }
 }

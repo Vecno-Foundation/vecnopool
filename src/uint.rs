@@ -1,74 +1,53 @@
 // Written in 2014 by Andrew Poelstra <apoelstra@wpsoftware.net>
 // SPDX-License-Identifier: CC0-1.0
 
-//! Big unsigned integer types.
-//!
-//! Implementation of various large-but-fixed sized unsigned integer types.
-//! The functions here are designed to be fast.
-
 pub trait BitArray {
-    /// Is bit set?
+    #[allow(dead_code)]
     fn bit(&self, idx: usize) -> bool;
-
-    /// Returns an array which is just the bits from start to end
+    #[allow(dead_code)]
     fn bit_slice(&self, start: usize, end: usize) -> Self;
-
-    /// Bitwise and with `n` ones
     fn mask(&self, n: usize) -> Self;
-
-    /// Trailing zeros
+    #[allow(dead_code)]
     fn trailing_zeros(&self) -> usize;
-
-    /// Create all-zeros value
     fn zero() -> Self;
-
-    /// Create value representing one
     fn one() -> Self;
 }
 
-/// Implements standard array methods for a given wrapper type
 macro_rules! impl_array_newtype {
     ($thing:ident, $ty:ty, $len:literal) => {
         impl $thing {
-            /// Converts the object to a raw pointer
             #[inline]
             pub fn as_ptr(&self) -> *const $ty {
                 let &$thing(ref dat) = self;
                 dat.as_ptr()
             }
 
-            /// Converts the object to a mutable raw pointer
             #[inline]
             pub fn as_mut_ptr(&mut self) -> *mut $ty {
                 let &mut $thing(ref mut dat) = self;
                 dat.as_mut_ptr()
             }
 
-            /// Returns the length of the object as an array
             #[inline]
             pub fn len(&self) -> usize {
                 $len
             }
 
-            /// Returns whether the object, as an array, is empty. Always false.
             #[inline]
             pub fn is_empty(&self) -> bool {
                 false
             }
 
-            /// Returns the underlying bytes.
             #[inline]
             pub fn as_bytes(&self) -> &[$ty; $len] {
                 &self.0
             }
 
-            /// Returns the underlying bytes.
             #[inline]
             pub fn to_bytes(&self) -> [$ty; $len] {
                 self.0.clone()
             }
 
-            /// Returns the underlying bytes.
             #[inline]
             pub fn into_bytes(self) -> [$ty; $len] {
                 self.0
@@ -98,9 +77,18 @@ macro_rules! impl_array_newtype {
     };
 }
 
+// Helper function to format U256 as hex string
+pub fn u256_to_hex(u: &U256) -> String {
+    let mut bytes = [0u8; 32];
+    let words = u.as_slice();
+    for i in 0..4 {
+        bytes[i * 8..(i + 1) * 8].copy_from_slice(&words[i].to_le_bytes());
+    }
+    hex::encode(&bytes)
+}
+
 macro_rules! construct_uint {
     ($name:ident, $n_words:literal) => {
-        /// Little-endian large integer type
         #[derive(Copy, Clone, PartialEq, Eq, Hash, Default)]
         pub struct $name([u64; $n_words]);
         impl_array_newtype!($name, u64, $n_words);
@@ -111,21 +99,18 @@ macro_rules! construct_uint {
                 &self.0
             }
 
-            /// Conversion to u32
             #[inline]
             pub fn low_u32(&self) -> u32 {
                 let &$name(ref arr) = self;
                 arr[0] as u32
             }
 
-            /// Conversion to u64
             #[inline]
             pub fn low_u64(&self) -> u64 {
                 let &$name(ref arr) = self;
                 arr[0] as u64
             }
 
-            /// Return the least number of bits needed to represent the number
             #[inline]
             pub fn bits(&self) -> usize {
                 let &$name(ref arr) = self;
@@ -138,7 +123,6 @@ macro_rules! construct_uint {
                 0x40 - arr[0].leading_zeros() as usize
             }
 
-            /// Multiplication by u32
             pub fn mul_u32(self, other: u32) -> $name {
                 let $name(ref arr) = self;
                 let mut carry = [0u64; $n_words];
@@ -159,7 +143,6 @@ macro_rules! construct_uint {
                 $name(ret) + $name(carry)
             }
 
-            /// Create an object from a given unsigned 64-bit integer
             #[inline]
             pub fn from_u64(init: u64) -> Option<$name> {
                 let mut ret = [0; $n_words];
@@ -167,7 +150,6 @@ macro_rules! construct_uint {
                 Some($name(ret))
             }
 
-            /// Create an object from a given signed 64-bit integer
             #[inline]
             pub fn from_i64(init: i64) -> Option<$name> {
                 if init >= 0 {
@@ -177,9 +159,20 @@ macro_rules! construct_uint {
                 }
             }
 
-            // divmod like operation, returns (quotient, remainder)
             #[inline]
-            fn div_rem(self, other: Self) -> (Self, Self) {
+            pub fn from_little_endian(bytes: &[u8]) -> $name {
+                let mut words = [0u64; $n_words];
+                for (i, chunk) in bytes.chunks(8).take($n_words).enumerate() {
+                    let mut word_bytes = [0u8; 8];
+                    let len = chunk.len().min(8);
+                    word_bytes[..len].copy_from_slice(&chunk[..len]);
+                    words[i] = u64::from_le_bytes(word_bytes);
+                }
+                $name(words)
+            }
+
+            #[inline]
+            pub fn div_rem(self, other: Self) -> (Self, Self) {
                 let mut sub_copy = self;
                 let mut shift_copy = other;
                 let mut ret = [0u64; $n_words];
@@ -187,15 +180,12 @@ macro_rules! construct_uint {
                 let my_bits = self.bits();
                 let your_bits = other.bits();
 
-                // Check for division by 0
                 assert!(your_bits != 0, "attempted to divide by zero");
 
-                // Early return in case we are dividing by a larger number than us
                 if my_bits < your_bits {
                     return ($name(ret), sub_copy);
                 }
 
-                // Bitwise long division
                 let mut shift = my_bits - your_bits;
                 shift_copy = shift_copy << shift;
                 loop {
@@ -213,7 +203,6 @@ macro_rules! construct_uint {
                 ($name(ret), sub_copy)
             }
 
-            /// Increment by 1
             #[inline]
             pub fn increment(&mut self) {
                 let &mut $name(ref mut arr) = self;
@@ -242,9 +231,6 @@ macro_rules! construct_uint {
         impl Ord for $name {
             #[inline]
             fn cmp(&self, other: &$name) -> core::cmp::Ordering {
-                // We need to manually implement ordering because we use little-endian
-                // and the auto derive is a lexicographic ordering(i.e. memcmp)
-                // which with numbers is equivalent to big-endian
                 for i in 0..$n_words {
                     if self[$n_words - 1 - i] < other[$n_words - 1 - i] {
                         return core::cmp::Ordering::Less;
@@ -296,7 +282,6 @@ macro_rules! construct_uint {
             fn mul(self, other: $name) -> $name {
                 use $crate::uint::BitArray;
                 let mut me = $name::zero();
-                // TODO: be more efficient about this
                 for i in 0..(2 * $n_words) {
                     let to_mul = (other >> (32 * i)).low_u32();
                     me = me + (self.mul_u32(to_mul) << (32 * i));
@@ -439,11 +424,9 @@ macro_rules! construct_uint {
                 let word_shift = shift / 64;
                 let bit_shift = shift % 64;
                 for i in 0..$n_words {
-                    // Shift
                     if bit_shift < 64 && i + word_shift < $n_words {
                         ret[i + word_shift] += original[i] << bit_shift;
                     }
-                    // Carry
                     if bit_shift > 0 && i + word_shift + 1 < $n_words {
                         ret[i + word_shift + 1] += original[i] >> (64 - bit_shift);
                     }
@@ -461,9 +444,7 @@ macro_rules! construct_uint {
                 let word_shift = shift / 64;
                 let bit_shift = shift % 64;
                 for i in word_shift..$n_words {
-                    // Shift
                     ret[i - word_shift] += original[i] >> bit_shift;
-                    // Carry
                     if bit_shift > 0 && i < $n_words - 1 {
                         ret[i - word_shift] += original[i + 1] << (64 - bit_shift);
                     }

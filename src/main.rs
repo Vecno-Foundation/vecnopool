@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use dotenv::dotenv;
 use log::{debug, info, warn, LevelFilter};
 use std::env;
 use tokio_retry::{Retry, strategy::ExponentialBackoff};
@@ -55,8 +54,11 @@ async fn start_metrics_server() {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    dotenv().context("Failed to load .env file")?;
+    // Initialize dotenv
+    dotenv::dotenv().context("Failed to load .env file")?;
 
+    // Load environment variables
+    let wrpc_url = env::var("WRPC_URL").context("WRPC_URL must be set in .env")?;
     let rpc_url = env::var("RPC_URL").context("RPC_URL must be set in .env")?;
     let stratum_addr = env::var("STRATUM_ADDR").unwrap_or("localhost:6969".to_string());
     let extra_data = env::var("EXTRA_DATA").unwrap_or("vecnod-stratum".to_string());
@@ -65,25 +67,46 @@ async fn main() -> Result<()> {
     let debug = env::var("DEBUG")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
+    let mnemonic = env::var("MNEMONIC").ok();
+    let private_key = env::var("PRIVATE_KEY").ok(); 
 
-    let level = if debug { LevelFilter::Debug } else { LevelFilter::Info };
-
+    // Validate PRIVATE_KEY or MNEMONIC
+    if private_key.is_none() && mnemonic.is_none() {
+        return Err(anyhow::anyhow!("Either PRIVATE_KEY or MNEMONIC must be set in .env"));
+    }
+    if let Some(pk) = &private_key {
+        if !pk.starts_with("kprv") {
+            return Err(anyhow::anyhow!("PRIVATE_KEY must be an xprv string starting with 'kprv'"));
+        }
+    }
+    if let Some(mn) = &mnemonic {
+        let words = mn.trim().split_whitespace().count();
+        if words != 24 {
+            return Err(anyhow::anyhow!("MNEMONIC must be 24-word phrase"));
+        }
+    }
+    // Set up logging
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
-        .filter_module("vecnod_stratum", level)
+        .filter_module("vecnod_stratum", if debug { LevelFilter::Debug } else { LevelFilter::Info })
         .init();
 
-    // Initialize WASM module
+    // Initialize WASM module (spawns run_vecno.js)
     wasm::initialize_wasm().await.context("Failed to initialize WASM module")?;
 
+    // Start metrics server
     tokio::spawn(start_metrics_server());
 
+    // Initialize stratum server
     let (handle, recv_cmd) = VecnodHandle::new();
     let stratum = stratum::Stratum::new(&stratum_addr, handle.clone(), &pool_address, &network_id)
         .await
         .context("Failed to initialize Stratum")?;
 
+    // Initialize vecnod client
     let (client, mut msgs) = Client::new(&rpc_url, &pool_address, &extra_data, handle, recv_cmd);
+
+    // Main loop for handling messages
     while let Some(msg) = msgs.recv().await {
         match msg {
             Message::Info { version, .. } => {
@@ -133,5 +156,6 @@ async fn main() -> Result<()> {
         }
     }
 
+    println!("Main loop exited, shutting down...");
     Ok(())
 }

@@ -6,62 +6,61 @@ const { w3cwebsocket } = require('websocket');
 
 // Load environment variables
 dotenv.config();
-const WRPC_URL = process.env.WRPC_URL || 'ws://127.0.0.1:8110';
+const RPC_URL = process.env.WRPC_URL;
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const MINING_ADDR = process.env.MINING_ADDR;
 
 // Set WebSocket for vecno.js
 globalThis.WebSocket = w3cwebsocket;
 
 async function init() {
-    let vecno, RpcClient;
+    let vecno, RpcClient, privateKey;
     try {
-        // Load vecno.js
+        // Load vecno.js and WASM module
         vecno = require('./vecno.js');
-        console.log('vecno.js exports:', Object.keys(vecno));
-
-        // Initialize WASM module
         const wasmPath = path.resolve(__dirname, 'vecno_bg.wasm');
         const wasmBuffer = await fs.readFile(wasmPath);
-
-        // Set up imports for wasm-bindgen
-        const imports = {};
-        imports['__wbindgen_placeholder__'] = vecno;
-
-        // Instantiate WASM module
+        const imports = { '__wbindgen_placeholder__': vecno };
         const wasmModule = await WebAssembly.compile(wasmBuffer);
         const wasmInstance = await WebAssembly.instantiate(wasmModule, imports);
-
-        // Assign wasm instance to global wasm variable
         vecno.wasm = wasmInstance.exports;
-        console.log('WASM module initialized successfully');
-
-        // Initialize WASM32 bindings
-        if (typeof vecno.initWASM32Bindings === 'function') {
-            vecno.initWASM32Bindings({});
-            console.log('WASM32 bindings initialized');
-        }
+        vecno.initWASM32Bindings({});
 
         // Initialize RpcClient
         RpcClient = vecno.RpcClient;
         if (!RpcClient) {
-            throw new Error('RpcClient not found in vecno.js exports');
+            throw new Error('RpcClient not found in vecno.js');
+        }
+
+        // Derive private key from xprv: m/44'/111111'/0'/0/0
+        const xprv = vecno.XPrv.fromXPrv(PRIVATE_KEY);
+        privateKey = xprv
+            .deriveChild(44, true)
+            .deriveChild(111111, true)
+            .deriveChild(0, true)
+            .deriveChild(0, false)
+            .deriveChild(0, false)
+            .toPrivateKey();
+
+        // Validate MINING_ADDR
+        const derivedAddress = privateKey.toAddress('mainnet').toString();
+        if (derivedAddress !== MINING_ADDR) {
+            throw new Error(`Derived address ${derivedAddress} does not match MINING_ADDR ${MINING_ADDR}`);
         }
     } catch (err) {
-        console.error('WASM initialization failed:', err);
-        throw err;
+        throw new Error(`Initialization failed: ${err.message}`);
     }
 
     // Create RpcClient instance
     let rpcClient;
     try {
-        rpcClient = new RpcClient({ url: WRPC_URL });
+        rpcClient = new RpcClient({ url: RPC_URL });
         await rpcClient.connect();
-        console.log('Connected to Vecno RPC at', WRPC_URL);
     } catch (err) {
-        console.error('Failed to connect to Vecno RPC:', err);
-        throw err;
+        throw new Error(`Failed to connect to Kaspa RPC: ${err.message}`);
     }
 
-    // Expose functions via HTTP server
+    // HTTP server
     const server = http.createServer((req, res) => {
         res.setHeader('Content-Type', 'application/json');
 
@@ -90,7 +89,9 @@ async function init() {
             req.on('end', async () => {
                 try {
                     const { from, to, amount, network_id } = JSON.parse(body);
-                    // Query UTXOs for the from address
+                    if (from !== MINING_ADDR) {
+                        throw new Error(`From address ${from} does not match MINING_ADDR ${MINING_ADDR}`);
+                    }
                     const utxos = await rpcClient.getUtxosByAddresses([from]);
                     if (!utxos || utxos.length === 0) {
                         throw new Error(`No UTXOs found for address: ${from}`);
@@ -105,7 +106,8 @@ async function init() {
                     }));
                     const outputs = [{ address: to, amount }];
                     const priority_fee = BigInt(0);
-                    const pendingTx = vecno.createTransaction(utxo_entry_source, outputs, priority_fee, null, null);
+                    let pendingTx = vecno.createTransaction(utxo_entry_source, outputs, priority_fee, null, null);
+                    pendingTx = vecno.signTransaction(pendingTx, [privateKey]);
                     const result = pendingTx.serializeToJSON();
                     res.writeHead(200);
                     res.end(JSON.stringify({ result }));
@@ -136,13 +138,9 @@ async function init() {
     });
 
     server.listen(8181, () => console.log('WASM server running on port 8181'));
-
     // Cleanup on process exit
     process.on('SIGINT', async () => {
-        if (rpcClient) {
-            await rpcClient.disconnect();
-            console.log('Disconnected from Vecno RPC');
-        }
+        if (rpcClient) await rpcClient.disconnect();
         process.exit(0);
     });
 }

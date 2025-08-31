@@ -4,6 +4,7 @@ authors = ["fungibilly <fungibilly@proton.me>"]
 license = "MIT"
 version = "0.1.0"
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0"
@@ -31,7 +32,6 @@ reqwest = { version = "0.11", features = ["json"] }
 tokio-retry = "0.3"
 futures = "0.3"
 warp = "0.3"
-
 
 [build-dependencies]
 tonic-build = "0.7"

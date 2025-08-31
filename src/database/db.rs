@@ -64,6 +64,31 @@ impl Db {
             [],
         )?;
         conn.execute(
+            "CREATE TABLE IF NOT EXISTS wallet_total (
+                address TEXT PRIMARY KEY,
+                total INTEGER NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                wallet_address TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                timestamp TEXT NOT NULL,
+                transaction_hash TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS reward_block_details (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reward_block_hash TEXT UNIQUE NOT NULL,
+                reward_txn_id TEXT UNIQUE NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
             "CREATE INDEX IF NOT EXISTS shares_timestamp_idx ON shares (timestamp)",
             [],
         )?;
@@ -169,6 +194,36 @@ impl Db {
         Ok(())
     }
 
+    pub fn add_balance_with_wallet_total(&self, miner_id: &str, wallet: &str, balance: u64, rebate: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("BEGIN", [])?;
+
+        let id = format!("{}_{}", miner_id, wallet);
+        conn.execute(
+            "INSERT OR REPLACE INTO balances (id, address, balance, rebate)
+             VALUES (?1, ?2, COALESCE((SELECT balance FROM balances WHERE id = ?1), 0) + ?3, COALESCE((SELECT rebate FROM balances WHERE id = ?1), 0) + ?4)",
+            params![id, wallet, balance as i64, rebate as i64],
+        )?;
+
+        conn.execute(
+            "INSERT OR REPLACE INTO wallet_total (address, total)
+             VALUES (?1, COALESCE((SELECT total FROM wallet_total WHERE address = ?1), 0) + ?2)",
+            params![wallet, balance as i64],
+        )?;
+
+        conn.execute("COMMIT", [])?;
+        Ok(())
+    }
+
+    pub fn reset_balance_by_address(&self, wallet: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE balances SET balance = 0 WHERE address = ?1",
+            [wallet],
+        )?;
+        Ok(())
+    }
+
     pub fn add_block_details(
         &self,
         mined_block_hash: &str,
@@ -198,6 +253,58 @@ impl Db {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn add_reward_details(&self, reward_block_hash: &str, reward_txn_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO reward_block_details (reward_block_hash, reward_txn_id) VALUES (?1, ?2)
+             ON CONFLICT (reward_txn_id) DO UPDATE SET reward_block_hash = EXCLUDED.reward_block_hash",
+            params![reward_block_hash, reward_txn_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_reward_block_hash(&self, reward_txn_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT reward_block_hash FROM reward_block_details WHERE reward_txn_id = ?1")?;
+        let result = stmt
+            .query_row([reward_txn_id], |row| row.get(0))
+            .optional()?;
+        Ok(result)
+    }
+
+    pub fn add_payment(&self, wallet_address: &str, amount: u64, transaction_hash: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO payments (wallet_address, amount, timestamp, transaction_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![wallet_address, amount as i64, Utc::now().to_rfc3339(), transaction_hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_payments_by_wallet(&self, wallet: &str) -> Result<Vec<(i64, String, u64, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, wallet_address, amount, timestamp, transaction_hash
+             FROM payments WHERE wallet_address = ?1 ORDER BY timestamp DESC",
+        )?;
+        let rows = stmt.query_map([wallet], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        let mut payments = Vec::new();
+        for row in rows {
+            let (id, wallet_address, amount, timestamp, transaction_hash): (i64, String, i64, String, String) = row?;
+            payments.push((id, wallet_address, amount as u64, timestamp, transaction_hash));
+        }
+        Ok(payments)
     }
 
     pub fn prune_old_shares(&self, hours: i64) -> Result<()> {
@@ -301,5 +408,30 @@ impl Db {
         let ts: i64 = stmt.query_row(params![addr, diff as i64], |row| row.get(0))?;
         Ok(DateTime::from_timestamp(ts, 0)
             .ok_or_else(|| anyhow::anyhow!("Invalid timestamp: {}", ts))?)
+    }
+
+    pub fn get_all_balances(&self) -> Result<Vec<(String, String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, address, balance FROM balances")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+        let mut balances = Vec::new();
+        for row in rows {
+            let (id, address, balance): (String, String, i64) = row?;
+            let miner_id = id.split('_').next().unwrap_or("unknown").to_string();
+            balances.push((miner_id, address, balance as u64));
+        }
+        Ok(balances)
+    }
+
+    pub fn get_user(&self, miner_id: &str, wallet: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let id = format!("{}_{}", miner_id, wallet);
+        let mut stmt = conn.prepare("SELECT balance FROM balances WHERE id = ?1")?;
+        let balance: Option<i64> = stmt
+            .query_row([id], |row| row.get(0))
+            .optional()?;
+        Ok(balance.unwrap_or(0) as u64)
     }
 }

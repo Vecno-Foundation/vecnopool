@@ -10,11 +10,10 @@ use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, RwLock};
 use anyhow::Result;
-
-use super::jobs::{JobParams, Jobs, PendingResult};
-use super::{Id, Request, Response};
+use crate::stratum::jobs::{PendingResult, Jobs, JobParams};
 use crate::database::{Contribution, StratumDb};
 use crate::pow;
+use crate::stratum::{Id, Request, Response};
 use crate::uint::{u256_to_hex, U256};
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use prometheus::{IntCounterVec, register_int_counter_vec};
@@ -48,6 +47,8 @@ struct StratumTask {
     pool_fee_percent: u8,
     last_template: Arc<RwLock<Option<RpcBlock>>>,
     worker_counter: Arc<AtomicU16>,
+    pool_address: String,
+    network_id: String,
 }
 
 impl StratumTask {
@@ -68,6 +69,8 @@ impl StratumTask {
                     let stratum_db = self.stratum_db.clone();
                     let pool_fee_percent = self.pool_fee_percent;
                     let last_template = self.last_template.clone();
+                    let pool_address = self.pool_address.clone();
+                    let network_id = self.network_id.clone();
 
                     tokio::spawn(async move {
                         let (reader, writer) = conn.split();
@@ -88,6 +91,8 @@ impl StratumTask {
                             pool_fee_percent,
                             last_template,
                             extranonce: String::new(),
+                            pool_address,
+                            network_id,
                         };
 
                         match conn.run().await {
@@ -110,16 +115,18 @@ pub struct Stratum {
     pub stratum_db: Arc<StratumDb>,
     pub pool_fee_percent: u8,
     pub last_template: Arc<RwLock<Option<RpcBlock>>>,
+    pub pool_address: String,
+    pub network_id: String,
 }
 
 impl Stratum {
-    pub async fn new(host: &str, handle: VecnodHandle) -> Result<Self> {
+    pub async fn new(host: &str, handle: VecnodHandle, pool_address: &str, network_id: &str) -> Result<Self> {
         let (send, recv) = watch::channel(None);
         let listener = TcpListener::bind(host).await?;
         info!("Listening on {host}");
 
         let jobs = Jobs::new(handle);
-        let stratum_db = Arc::new(StratumDb::new(Path::new("pool.db"), 10000, 300_000).await?); // 5 minutes window
+        let stratum_db = Arc::new(StratumDb::new(Path::new("pool.db"), 10000, 300_000, network_id.to_string()).await?);
         let pool_fee_percent = 1;
         let last_template = Arc::new(RwLock::new(None));
         let worker_counter = Arc::new(AtomicU16::new(0));
@@ -132,6 +139,8 @@ impl Stratum {
             pool_fee_percent,
             last_template: last_template.clone(),
             worker_counter,
+            pool_address: pool_address.to_string(),
+            network_id: network_id.to_string(),
         };
         tokio::spawn(task.run());
 
@@ -141,6 +150,8 @@ impl Stratum {
             stratum_db,
             pool_fee_percent,
             last_template,
+            pool_address: pool_address.to_string(),
+            network_id: network_id.to_string(),
         })
     }
 
@@ -162,7 +173,7 @@ impl Stratum {
             Some(t) => t.get_subsidy(),
             None => return,
         };
-        if let Err(e) = self.stratum_db.distribute_rewards(subsidy, self.pool_fee_percent, daa_score, &block_hash, &reward_block_hash).await {
+        if let Err(e) = self.stratum_db.distribute_rewards(subsidy, self.pool_fee_percent, daa_score, &block_hash, &reward_block_hash, &self.pool_address).await {
             warn!("Failed to distribute rewards: {}", e);
         }
     }
@@ -185,6 +196,8 @@ struct StratumConn<'a> {
     pool_fee_percent: u8,
     last_template: Arc<RwLock<Option<RpcBlock>>>,
     extranonce: String,
+    pool_address: String,
+    network_id: String,
 }
 
 impl<'a> StratumConn<'a> {
@@ -297,7 +310,6 @@ impl<'a> StratumConn<'a> {
                                 self.payout_addr = Some(params[0].clone());
                                 self.authorized = true;
                                 self.write_response(id, Some(true)).await?;
-                                // Ensure new worker gets latest template
                                 self.write_template().await?;
                             }
                             (Some(id), "mining.get_shares", Some(p)) => {
@@ -360,7 +372,6 @@ impl<'a> StratumConn<'a> {
                                     }
                                 };
 
-                                // Validate share
                                 let contribution = Contribution {
                                     address: address.clone(),
                                     difficulty: self.difficulty,
@@ -406,7 +417,6 @@ impl<'a> StratumConn<'a> {
                                     continue;
                                 }
 
-                                // Compute block hash and check if it's a valid block
                                 let (block_hash, is_block) = {
                                     let mut header = template.header.clone().unwrap();
                                     header.nonce = nonce;
@@ -421,7 +431,6 @@ impl<'a> StratumConn<'a> {
                                     (block_hash, pow_u256 <= network_target)
                                 };
 
-                                // Submit share or block
                                 if is_block {
                                     if self.jobs.submit(i.clone(), job_id, nonce, self.pending_send.clone()).await {
                                         MINER_ADDED_SHARES.with_label_values(&[&address]).inc();

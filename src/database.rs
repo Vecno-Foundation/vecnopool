@@ -1,5 +1,7 @@
 use crate::database::db::Db;
-use anyhow::Result;
+use crate::stratum::jobs::Jobs;
+use crate::wasm::Transaction;
+use anyhow::{Context, Result};
 use dashmap::DashMap;
 use rusqlite::params;
 use std::collections::{HashMap, VecDeque};
@@ -10,7 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 use log::{debug, info, warn};
 use rusqlite::OptionalExtension;
-use crate::stratum::jobs::Jobs;
 
 pub mod db;
 
@@ -36,16 +37,17 @@ pub struct StratumDb {
     pub share_batch: mpsc::Sender<Contribution>,
     pub worker_share_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
     pub worker_log_times: Arc<DashMap<String, Arc<AtomicU64>>>,
+    pub network_id: String,
 }
 
 impl StratumDb {
-    pub async fn new(path: &Path, n_window: usize, window_time_ms: u64) -> Result<Self> {
-        let db = Arc::new(Db::new(path).map_err(|e| anyhow::anyhow!("Failed to initialize DB: {}", e))?);
+    pub async fn new(path: &Path, n_window: usize, window_time_ms: u64, network_id: String) -> Result<Self> {
+        let db = Arc::new(Db::new(path).context("Failed to initialize DB")?);
         let balances = Arc::new(DashMap::new());
-        db.load_balances(&balances).map_err(|e| anyhow::anyhow!("Failed to load balances: {}", e))?;
+        db.load_balances(&balances).context("Failed to load balances")?;
         let mut share_window = VecDeque::new();
         let total_shares = db.load_recent_shares(&mut share_window, n_window)
-            .map_err(|e| anyhow::anyhow!("Failed to load recent shares: {}", e))?;
+            .context("Failed to load recent shares")?;
         let share_window = Arc::new(RwLock::new(share_window));
         let total_shares = Arc::new(AtomicU64::new(total_shares));
         let (share_batch, mut share_batch_rx) = mpsc::channel::<Contribution>(1000);
@@ -209,25 +211,29 @@ impl StratumDb {
             share_batch,
             worker_share_counts,
             worker_log_times,
+            network_id,
         })
     }
 
-    pub async fn distribute_rewards(&self, subsidy: u64, pool_fee_percent: u8, daa_score: u64, block_hash: &str, reward_block_hash: &str) -> Result<()> {
-        let fee = subsidy * pool_fee_percent as u64 / 100;
-        let net_reward = subsidy - fee;
-        let rebate = (fee as u128 * 33 / 10000) as u64;
+    pub async fn distribute_rewards(&self, subsidy: u64, pool_fee_percent: u8, daa_score: u64, block_hash: &str, reward_block_hash: &str, pool_address: &str) -> Result<()> {
+        let miner_reward = subsidy * (100 - pool_fee_percent as u64) / 100;
+        let pool_fee = subsidy - miner_reward;
+        let rebate = (pool_fee as f64 * 0.0033) as u64; // 0.33% rebate
+
+        debug!("Starting allocation. Miner Reward: {}, Pool Fee: {}, Reward Block Hash: {}", miner_reward, pool_fee, reward_block_hash);
+
+        let mut works: HashMap<String, (String, u64)> = HashMap::new();
+        let mut total_work = 0u64;
 
         let mut shares = self.get_shares_since_last_allocation(daa_score).await;
-        let mut total_work = 0;
-        let mut work_by_address: HashMap<String, u64> = HashMap::new();
-
         if shares.is_empty() {
             shares = self.get_difficulty_and_time_since_last_allocation().await;
             warn!("No shares found for daa_score {}, using fallback with {} shares", daa_score, shares.len());
         }
 
         for share in shares.iter() {
-            *work_by_address.entry(share.address.clone()).or_insert(0) += share.difficulty;
+            let entry = works.entry(share.address.clone()).or_insert((share.address.clone(), 0));
+            entry.1 += share.difficulty;
             total_work += share.difficulty;
         }
 
@@ -237,30 +243,58 @@ impl StratumDb {
         }
 
         let scaled_total = total_work as u128 * 100;
-        for (address, work) in work_by_address.iter() {
-            let scaled_work = *work as u128 * 100;
-            let miner_reward = ((scaled_work * net_reward as u128) / scaled_total) as u64;
-            let miner_rebate = ((scaled_work * rebate as u128) / scaled_total) as u64;
+        for (address, (_miner_id, difficulty)) in works.iter() {
+            let scaled_work = *difficulty as u128 * 100;
+            let share = ((scaled_work * miner_reward as u128) / scaled_total) as u64;
+            let nacho_rebate_kas = ((scaled_work * rebate as u128) / scaled_total) as u64;
 
-            if miner_reward > 0 || miner_rebate > 0 {
-                *self.balances.entry(address.clone()).or_insert(0) += miner_reward + miner_rebate;
-                if let Err(e) = self.db.update_balance_with_rebate(address, miner_reward, miner_rebate) {
-                    warn!("DB balance update failed for {}: {}", address, e);
-                }
+            if share > 0 || nacho_rebate_kas > 0 {
+                self.db.add_balance_with_wallet_total("pool", address, share, nacho_rebate_kas)?;
+                *self.balances.entry(address.clone()).or_insert(0) += share + nacho_rebate_kas;
+                debug!(
+                    "Allocated {} KAS, rebate {} KAS to {} (difficulty: {})",
+                    Transaction::new(pool_address, address, share, &self.network_id)
+                        .format_amount()
+                        .await
+                        .context("Failed to format share amount")?,
+                    Transaction::new(pool_address, address, nacho_rebate_kas, &self.network_id)
+                        .format_amount()
+                        .await
+                        .context("Failed to format nacho rebate amount")?,
+                    address,
+                    difficulty
+                );
             }
         }
 
-        if work_by_address.len() > 0 && fee > 0 {
-            if let Err(e) = self.db.add_balance("pool", "pool_address", fee) {
-                warn!("Failed to record pool fee revenue: {}", e);
-            }
+        if !works.is_empty() && pool_fee > 0 {
+            self.db.add_balance("pool", pool_address, pool_fee)?;
+            *self.balances.entry(pool_address.to_string()).or_insert(0) += pool_fee;
+            info!(
+                "Treasury generated {} KAS revenue for block {} in reward block {}",
+                Transaction::new(pool_address, pool_address, pool_fee, &self.network_id)
+                    .format_amount()
+                    .await
+                    .context("Failed to format pool fee amount")?,
+                block_hash,
+                reward_block_hash
+            );
         }
 
         if !reward_block_hash.is_empty() {
-            if let Err(e) = self.db.add_block_details(block_hash, "", reward_block_hash, "", daa_score, "pool_address", subsidy) {
-                warn!("Failed to record block details: {}", e);
-            }
+            self.db.add_block_details(
+                block_hash,
+                "pool",
+                reward_block_hash,
+                pool_address,
+                daa_score,
+                pool_address,
+                subsidy,
+            )?;
         }
+
+        // Process payouts
+        self.process_payouts(pool_address).await?;
 
         let share_window = self.share_window.read().await;
         debug!("Current share window size: {}", share_window.len());
@@ -276,6 +310,29 @@ impl StratumDb {
             }
         }
 
+        Ok(())
+    }
+
+    async fn process_payouts(&self, pool_address: &str) -> Result<()> {
+        let balances = self.db.get_all_balances()?;
+        for (_miner_id, address, balance) in balances {
+            if balance >= 1_000_000_000 { // Minimum payout threshold: 1 KAS
+                let tx = Transaction::new(pool_address, &address, balance, &self.network_id);
+                let tx_id = tx.submit().await
+                    .context("Failed to submit transaction")?;
+                self.db.add_payment(&address, balance, &tx_id)?;
+                self.db.reset_balance_by_address(&address)?;
+                *self.balances.entry(address.clone()).or_insert(0) = 0;
+                info!(
+                    "Payout of {} KAS to {} (txid: {})",
+                    tx.format_amount()
+                        .await
+                        .context("Failed to format payout amount")?,
+                    address,
+                    tx_id
+                );
+            }
+        }
         Ok(())
     }
 

@@ -16,5 +16,9 @@
     "vecno.d.ts"
   ],
   "main": "vecno.js",
-  "types": "vecno.d.ts"
+  "types": "vecno.d.ts",
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "websocket": "^1.0.34"
+  }
 }

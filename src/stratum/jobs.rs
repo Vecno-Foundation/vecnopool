@@ -1,4 +1,4 @@
-use super::{Id, Response};
+use crate::stratum::{Id, Response};
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use crate::uint::U256;
 use anyhow::Result;
@@ -97,6 +97,7 @@ struct JobsInner {
     handle: VecnodHandle,
     jobs: Vec<RpcBlock>,
 }
+
 #[derive(Debug)]
 pub struct JobParams {
     pub id: u8,

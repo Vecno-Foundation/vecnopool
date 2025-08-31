@@ -7,6 +7,7 @@ use serde_json::Value;
 use warp::Filter;
 
 use crate::vecnod::{Client, Message, VecnodHandle};
+use vecnod_stratum::wasm;
 pub use crate::uint::U256;
 
 mod vecnod;
@@ -24,7 +25,9 @@ async fn fetch_block_details(block_hash: &str) -> Result<(String, u64)> {
     let retry_strategy = ExponentialBackoff::from_millis(100).take(3);
     let response: Value = Retry::spawn(retry_strategy, || async {
         reqwest::get(&url).await?.json().await
-    }).await?;
+    })
+    .await
+    .context("Failed to fetch block details")?;
     let reward_block_hash = response["verboseData"]["mergeSetBluesHashes"]
         .as_array()
         .and_then(|arr| arr.get(0).and_then(|v| v.as_str()))
@@ -57,7 +60,8 @@ async fn main() -> Result<()> {
     let rpc_url = env::var("RPC_URL").context("RPC_URL must be set in .env")?;
     let stratum_addr = env::var("STRATUM_ADDR").unwrap_or("localhost:6969".to_string());
     let extra_data = env::var("EXTRA_DATA").unwrap_or("vecnod-stratum".to_string());
-    let mining_addr = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
+    let pool_address = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
+    let network_id = env::var("NETWORK_ID").unwrap_or("mainnet".to_string());
     let debug = env::var("DEBUG")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
@@ -69,12 +73,17 @@ async fn main() -> Result<()> {
         .filter_module("vecnod_stratum", level)
         .init();
 
+    // Initialize WASM module
+    wasm::initialize_wasm().await.context("Failed to initialize WASM module")?;
+
     tokio::spawn(start_metrics_server());
 
     let (handle, recv_cmd) = VecnodHandle::new();
-    let stratum = stratum::Stratum::new(&stratum_addr, handle.clone()).await?;
+    let stratum = stratum::Stratum::new(&stratum_addr, handle.clone(), &pool_address, &network_id)
+        .await
+        .context("Failed to initialize Stratum")?;
 
-    let (client, mut msgs) = Client::new(&rpc_url, &mining_addr, &extra_data, handle, recv_cmd);
+    let (client, mut msgs) = Client::new(&rpc_url, &pool_address, &extra_data, handle, recv_cmd);
     while let Some(msg) = msgs.recv().await {
         match msg {
             Message::Info { version, .. } => {
@@ -105,12 +114,7 @@ async fn main() -> Result<()> {
                                 .as_ref()
                                 .map(|v| v.hash.clone())
                                 .unwrap_or_else(|| "block_hash_placeholder".to_string());
-                            let daa_score = template
-                                .header
-                                .as_ref()
-                                .map(|h| h.daa_score)
-                                .unwrap_or(0);
-                            let (reward_block_hash, _) = fetch_block_details(&block_hash)
+                            let (reward_block_hash, daa_score) = fetch_block_details(&block_hash)
                                 .await
                                 .unwrap_or_else(|e| {
                                     warn!("Failed to fetch block details: {}", e);

@@ -1,11 +1,9 @@
 pub mod jobs;
-mod server;
+pub mod server;
 
 use anyhow::Result;
-use serde::{de, Serializer};
-use serde::{Deserialize, Serialize};
+use serde::{de, Serializer, Deserialize, Serialize};
 use serde_json::{json, Value};
-pub use server::Stratum;
 use std::borrow::Cow;
 use std::fmt;
 
@@ -65,7 +63,7 @@ impl Serialize for Id {
 }
 
 #[derive(Deserialize, Serialize)]
-struct Request {
+pub struct Request {
     #[serde(default)]
     id: Option<Id>,
     method: Cow<'static, str>,
@@ -117,3 +115,5 @@ pub struct ErrResponse {
     id: Id,
     error: Value,
 }
+
+pub use server::Stratum;

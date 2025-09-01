@@ -6,9 +6,9 @@ const { w3cwebsocket } = require('websocket');
 
 // Load environment variables
 dotenv.config();
-const RPC_URL = process.env.WRPC_URL;
+const RPC_URL = process.env.WRPC_URL || 'ws://127.0.0.1:8110';
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
-const MINING_ADDR = process.env.MINING_ADDR;
+const MINING_ADDR = process.env.MINING_ADDR || 'vecno:qznlxm9v9c5lv8atuyd34h6vc9d9nstrhy93fuy49ta5a0rdzv4pg9grqy3w4';
 
 // Set WebSocket for vecno.js
 globalThis.WebSocket = w3cwebsocket;
@@ -92,16 +92,20 @@ async function init() {
                     if (from !== MINING_ADDR) {
                         throw new Error(`From address ${from} does not match MINING_ADDR ${MINING_ADDR}`);
                     }
-                    const utxos = await rpcClient.getUtxosByAddresses([from]);
-                    if (!utxos || utxos.length === 0) {
+                    const utxoResponse = await rpcClient.getUtxosByAddresses([from]);
+                    const utxos = utxoResponse.entries || [];
+                    if (!Array.isArray(utxos)) {
+                        throw new Error(`Invalid UTXOs response: expected array in entries, got ${typeof utxoResponse.entries}`);
+                    }
+                    if (utxos.length === 0) {
                         throw new Error(`No UTXOs found for address: ${from}`);
                     }
                     const utxo_entry_source = utxos.map(utxo => ({
                         address: from,
                         amount: utxo.amount,
                         outpoint: {
-                            transactionId: utxo.transactionId,
-                            index: utxo.index
+                            transactionId: utxo.outpoint.transactionId,
+                            index: utxo.outpoint.index
                         }
                     }));
                     const outputs = [{ address: to, amount }];
@@ -138,6 +142,7 @@ async function init() {
     });
 
     server.listen(8181, () => console.log('WASM server running on port 8181'));
+
     // Cleanup on process exit
     process.on('SIGINT', async () => {
         if (rpcClient) await rpcClient.disconnect();

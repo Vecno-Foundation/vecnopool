@@ -1,6 +1,3 @@
-use crate::database::db::Db;
-use crate::stratum::jobs::Jobs;
-use crate::wasm::Transaction;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use rusqlite::params;
@@ -12,6 +9,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 use log::{debug, info, warn};
 use rusqlite::OptionalExtension;
+use tokio_retry::strategy::ExponentialBackoff;
+use tokio_retry::Retry;
+use reqwest::Client;
+use serde_json::Value;
+use serde::Deserialize;
+use std::sync::atomic::Ordering;
+use crate::database::db::Db;
+use crate::stratum::jobs::Jobs;
 
 pub mod db;
 
@@ -24,6 +29,14 @@ pub struct Contribution {
     pub daa_score: u64,
     pub extranonce: String,
     pub nonce: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Payout {
+    pub address: String,
+    pub amount: String,
+    #[serde(alias = "txid")]
+    pub txId: String,
 }
 
 #[derive(Debug)]
@@ -215,12 +228,17 @@ impl StratumDb {
         })
     }
 
-    pub async fn distribute_rewards(&self, subsidy: u64, pool_fee_percent: u8, daa_score: u64, block_hash: &str, reward_block_hash: &str, pool_address: &str) -> Result<()> {
+    pub async fn distribute_rewards(&self, block_hash: String, reward_block_hash: String, daa_score: u64) -> Result<()> {
+        let subsidy = 200000000u64; // Example subsidy, adjust as needed
+        let pool_fee_percent = 2u8; // Example fee, adjust as needed
         let miner_reward = subsidy * (100 - pool_fee_percent as u64) / 100;
         let pool_fee = subsidy - miner_reward;
-        let rebate = (pool_fee as f64 * 0.0033) as u64; // 0.33% rebate
+        let rebate = (pool_fee as f64 * 0.0033) as u64;
 
-        debug!("Starting allocation. Miner Reward: {}, Pool Fee: {}, Reward Block Hash: {}", miner_reward, pool_fee, reward_block_hash);
+        debug!(
+            "Starting allocation. Miner Reward: {} sompi, Pool Fee: {} sompi, Rebate: {} sompi, Block Hash: {}, Reward Block Hash: {}, DAA Score: {}",
+            miner_reward, pool_fee, rebate, block_hash, reward_block_hash, daa_score
+        );
 
         let mut works: HashMap<String, (String, u64)> = HashMap::new();
         let mut total_work = 0u64;
@@ -242,6 +260,7 @@ impl StratumDb {
             return Ok(());
         }
 
+        let pool_address = std::env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
         let scaled_total = total_work as u128 * 100;
         for (address, (_miner_id, difficulty)) in works.iter() {
             let scaled_work = *difficulty as u128 * 100;
@@ -251,50 +270,39 @@ impl StratumDb {
             if share > 0 || nacho_rebate_kas > 0 {
                 self.db.add_balance_with_wallet_total("pool", address, share, nacho_rebate_kas)?;
                 *self.balances.entry(address.clone()).or_insert(0) += share + nacho_rebate_kas;
+                let share_ve = share as f64 / 1e8;
+                let rebate_ve = nacho_rebate_kas as f64 / 1e8;
                 debug!(
-                    "Allocated {} KAS, rebate {} KAS to {} (difficulty: {})",
-                    Transaction::new(pool_address, address, share, &self.network_id)
-                        .format_amount()
-                        .await
-                        .context("Failed to format share amount")?,
-                    Transaction::new(pool_address, address, nacho_rebate_kas, &self.network_id)
-                        .format_amount()
-                        .await
-                        .context("Failed to format nacho rebate amount")?,
-                    address,
-                    difficulty
+                    "Allocated {} VE, rebate {} VE to {} (difficulty: {})",
+                    share_ve, rebate_ve, address, difficulty
                 );
             }
         }
 
         if !works.is_empty() && pool_fee > 0 {
-            self.db.add_balance("pool", pool_address, pool_fee)?;
-            *self.balances.entry(pool_address.to_string()).or_insert(0) += pool_fee;
+            self.db.add_balance("pool", &pool_address, pool_fee)?;
+            *self.balances.entry(pool_address.clone()).or_insert(0) += pool_fee;
+            let pool_fee_ve = pool_fee as f64 / 1e8;
             info!(
-                "Treasury generated {} KAS revenue for block {} in reward block {}",
-                Transaction::new(pool_address, pool_address, pool_fee, &self.network_id)
-                    .format_amount()
-                    .await
-                    .context("Failed to format pool fee amount")?,
-                block_hash,
-                reward_block_hash
+                "Treasury generated {} VE revenue for block {} in reward block {}",
+                pool_fee_ve, block_hash, reward_block_hash
             );
         }
 
         if !reward_block_hash.is_empty() {
             self.db.add_block_details(
-                block_hash,
+                &block_hash,
                 "pool",
-                reward_block_hash,
-                pool_address,
+                &reward_block_hash,
+                &pool_address,
                 daa_score,
-                pool_address,
+                &pool_address,
                 subsidy,
             )?;
         }
 
         // Process payouts
-        self.process_payouts(pool_address).await?;
+        self.process_payouts().await?;
 
         let share_window = self.share_window.read().await;
         debug!("Current share window size: {}", share_window.len());
@@ -313,26 +321,72 @@ impl StratumDb {
         Ok(())
     }
 
-    async fn process_payouts(&self, pool_address: &str) -> Result<()> {
-        let balances = self.db.get_all_balances()?;
-        for (_miner_id, address, balance) in balances {
-            if balance >= 1_000_000_000 { // Minimum payout threshold: 1 KAS
-                let tx = Transaction::new(pool_address, &address, balance, &self.network_id);
-                let tx_id = tx.submit().await
-                    .context("Failed to submit transaction")?;
-                self.db.add_payment(&address, balance, &tx_id)?;
-                self.db.reset_balance_by_address(&address)?;
-                *self.balances.entry(address.clone()).or_insert(0) = 0;
-                info!(
-                    "Payout of {} KAS to {} (txid: {})",
-                    tx.format_amount()
-                        .await
-                        .context("Failed to format payout amount")?,
-                    address,
-                    tx_id
-                );
-            }
+    async fn process_payouts(&self) -> Result<()> {
+        // Check balances before calling /processPayouts
+        let min_balance = 100000000; // 1 VE
+        let balances = self.db.get_balances_for_payout(min_balance)?;
+        debug!("Balances eligible for payout: {:?}", balances);
+        if balances.is_empty() {
+            warn!("No balances eligible for payout (min_balance: {} sompi)", min_balance);
+            return Ok(());
         }
+
+        let client = Client::new();
+        let retry_strategy = ExponentialBackoff::from_millis(100).take(3);
+        
+        // Call the /processPayouts endpoint
+        let response = Retry::spawn(retry_strategy, || async {
+            client
+                .post("http://localhost:8181/processPayouts")
+                .send()
+                .await
+        })
+        .await
+        .context("Failed to call processPayouts")?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .context("Failed to read processPayouts response text")?;
+        let result: Value = serde_json::from_str(&text)
+            .map_err(|e| {
+                warn!("Failed to parse JSON response: {}. Raw response: {}", e, text);
+                e
+            })
+            .context("Failed to parse processPayouts response as JSON")?;
+        
+        debug!("processPayouts response (status: {}): {:?}", status, result);
+
+        if let Some(error) = result.get("error") {
+            return Err(anyhow::anyhow!("Payout processing failed: {:?}", error));
+        }
+
+        let transactions: Vec<Payout> = serde_json::from_value(result["result"].clone())
+            .map_err(|e| {
+                warn!("Failed to parse transactions: {}. Response: {:?}", e, result);
+                e
+            })
+            .context("Failed to parse transactions")?;
+
+        if transactions.is_empty() {
+            warn!("No transactions returned from processPayouts");
+            return Ok(());
+        }
+
+        // Log payouts and update database
+        for payout in transactions {
+            let amount: u64 = payout.amount.parse().context("Failed to parse amount as u64")?;
+            info!(
+                "Payout of {} VE to {} (txid: {})",
+                amount as f64 / 1e8,
+                payout.address,
+                payout.txId
+            );
+            self.db.add_payment(&payout.address, amount, &payout.txId)?;
+            self.db.reset_balance_by_address(&payout.address)?;
+        }
+
         Ok(())
     }
 
@@ -414,12 +468,22 @@ impl StratumDb {
     pub async fn get_shares_since_last_allocation(&self, daa_score: u64) -> Vec<Contribution> {
         let mut shares = Vec::new();
         let mut share_window = self.share_window.write().await;
-        while share_window.len() > 0 && share_window.front().map(|s| s.daa_score).unwrap_or(0) <= daa_score {
-            if let Some(share) = share_window.pop_front() {
-                shares.push(share.clone());
-                self.total_shares.fetch_sub(share.difficulty, AtomicOrdering::Relaxed);
+        let current_time_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs();
+        let time_window_secs = 300; // 5 minutes
+        while let Some(share) = share_window.front() {
+            if share.daa_score <= daa_score || (share.timestamp <= current_time_ms && current_time_ms - share.timestamp <= time_window_secs) {
+                if let Some(s) = share_window.pop_front() {
+                    shares.push(s.clone());
+                    self.total_shares.fetch_sub(s.difficulty, AtomicOrdering::Relaxed);
+                }
+            } else {
+                break;
             }
         }
+        debug!("Retrieved {} shares for daa_score {}", shares.len(), daa_score);
         shares
     }
 
@@ -453,12 +517,13 @@ impl StratumDb {
                 difficulty: scaled_difficulty,
                 timestamp: current_time_ms / 1000,
                 job_id: "".to_string(),
-                daa_score: 0,
+                daa_score: current_time_ms / 1000,
                 extranonce: "".to_string(),
                 nonce: "".to_string(),
             });
         }
 
+        debug!("Generated {} fallback shares", shares.len());
         shares
     }
 
@@ -480,7 +545,7 @@ impl StratumDb {
             .expect("Time went backwards")
             .as_secs();
         if let Some(log_time) = self.worker_log_times.get(address) {
-            log_time.store(current_time, AtomicOrdering::Relaxed);
+            log_time.store(current_time, Ordering::Relaxed);
         }
     }
 

@@ -14,10 +14,10 @@ use crate::stratum::jobs::{PendingResult, Jobs, JobParams};
 use crate::database::{Contribution, StratumDb};
 use crate::pow;
 use crate::stratum::{Id, Request, Response};
-use crate::uint::{u256_to_hex, U256};
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use prometheus::{IntCounterVec, register_int_counter_vec};
 use lazy_static::lazy_static;
+use crate::uint::{u256_to_hex, U256};
 
 const NEW_LINE: &'static str = "\n";
 
@@ -168,12 +168,7 @@ impl Stratum {
     }
 
     pub async fn distribute_rewards(&self, block_hash: String, reward_block_hash: String, daa_score: u64) {
-        let template = self.last_template.read().await;
-        let subsidy = match &*template {
-            Some(t) => t.get_subsidy(),
-            None => return,
-        };
-        if let Err(e) = self.stratum_db.distribute_rewards(subsidy, self.pool_fee_percent, daa_score, &block_hash, &reward_block_hash, &self.pool_address).await {
+        if let Err(e) = self.stratum_db.distribute_rewards(block_hash, reward_block_hash, daa_score).await {
             warn!("Failed to distribute rewards: {}", e);
         }
     }

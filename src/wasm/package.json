@@ -18,9 +18,8 @@
   "main": "vecno.js",
   "types": "vecno.d.ts",
   "dependencies": {
-    "bip32": "^5.0.0-rc.0",
     "dotenv": "^16.6.1",
-    "tiny-secp256k1": "^2.2.4",
+    "sqlite3": "^5.1.7",
     "websocket": "^1.0.34"
   }
 }

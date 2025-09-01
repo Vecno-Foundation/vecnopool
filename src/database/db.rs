@@ -434,4 +434,18 @@ impl Db {
             .optional()?;
         Ok(balance.unwrap_or(0) as u64)
     }
+
+    pub fn get_balances_for_payout(&self, min_balance: u64) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT address, balance FROM balances WHERE balance >= ?1")?;
+        let rows = stmt.query_map([min_balance as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        let mut balances = Vec::new();
+        for row in rows {
+            let (address, balance): (String, i64) = row?;
+            balances.push((address, balance as u64));
+        }
+        Ok(balances)
+    }
 }

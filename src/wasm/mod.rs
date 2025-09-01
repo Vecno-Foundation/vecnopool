@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::process::{Command, ChildStdout, ChildStderr};
+use tokio::process::Command;
 use reqwest::Client;
 use serde_json::json;
 use tokio_retry::{Retry, strategy::ExponentialBackoff};
@@ -74,17 +74,20 @@ impl Transaction {
         let retry_strategy = ExponentialBackoff::from_millis(100).take(3);
         let response = Retry::spawn(retry_strategy, || async {
             client
-                .post("http://localhost:8181/sompiToKaspaStringWithSuffix")
+                .post("http://localhost:8181/sompiToVecnoStringWithSuffix")
                 .json(&json!({ "sompi": self.amount, "network_id": self.network_id }))
                 .send()
                 .await
         })
         .await
-        .context("Failed to call sompiToKaspaStringWithSuffix")?;
+        .context("Failed to call sompiToVecnoStringWithSuffix")?;
         let result: serde_json::Value = response
             .json()
             .await
-            .context("Failed to parse sompiToKaspaStringWithSuffix response")?;
+            .context("Failed to parse sompiToVecnoStringWithSuffix response")?;
+        if result.get("error").is_some() {
+            return Err(anyhow::anyhow!("sompiToVecnoStringWithSuffix failed: {:?}", result));
+        }
         let formatted: String = serde_json::from_value(result["result"].clone())
             .context("Failed to parse formatted amount")?;
         Ok(formatted)
@@ -94,7 +97,6 @@ impl Transaction {
 pub async fn initialize_wasm() -> Result<()> {
     let retry_strategy = ExponentialBackoff::from_millis(100).max_delay(std::time::Duration::from_secs(3)).take(5);
     Retry::spawn(retry_strategy, || async {
-        // Start the Node.js script with stderr and stdout capture
         let mut child = Command::new("node")
             .arg("src/wasm/run_vecno.js")
             .stdout(Stdio::piped())
@@ -102,7 +104,6 @@ pub async fn initialize_wasm() -> Result<()> {
             .spawn()
             .context("Failed to start Node.js process")?;
 
-        // Capture stdout and stderr
         let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("Failed to capture Node.js stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| anyhow::anyhow!("Failed to capture Node.js stderr"))?;
         let mut stdout_reader = BufReader::new(stdout);
@@ -119,10 +120,8 @@ pub async fn initialize_wasm() -> Result<()> {
             stderr_output
         });
 
-        // Wait to ensure the server starts
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-        // Check if the process is still running
         if let Some(status) = child.try_wait().context("Failed to check Node.js process status")? {
             let stdout = stdout_handle.await.context("Failed to read stdout")?;
             let stderr = stderr_handle.await.context("Failed to read stderr")?;
@@ -134,7 +133,6 @@ pub async fn initialize_wasm() -> Result<()> {
             ));
         }
 
-        // Verify server is responding
         let client = Client::new();
         let response = client
             .get("http://localhost:8181/ping")

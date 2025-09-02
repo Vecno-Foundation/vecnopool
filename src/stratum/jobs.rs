@@ -8,6 +8,60 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
+#[derive(Clone, Debug)]
+pub struct JobParams {
+    pub id: u8,
+    pre_pow: U256,
+    difficulty: u64,
+    timestamp: u64,
+}
+
+impl JobParams {
+    pub fn difficulty(&self) -> u64 {
+        self.difficulty
+    }
+
+    pub fn to_value(&self) -> serde_json::Value {
+        json!([
+            hex::encode([self.id]),
+            self.pre_pow.as_slice(),
+            self.timestamp
+        ])
+    }
+}
+
+pub struct Pending {
+    id: Id,
+    block_hash: String,
+    send: mpsc::UnboundedSender<PendingResult>,
+}
+
+impl Pending {
+    pub fn resolve(self, error: Option<Box<str>>) {
+        let result = PendingResult {
+            id: self.id,
+            block_hash: self.block_hash,
+            error,
+        };
+        let _ = self.send.send(result);
+    }
+}
+
+pub struct PendingResult {
+    id: Id,
+    block_hash: String,
+    error: Option<Box<str>>,
+}
+
+impl PendingResult {
+    pub fn into_response(self) -> Result<Response> {
+        match self.error {
+            Some(e) => Response::err(self.id, 20, e),
+            None => Response::ok(self.id, true),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Jobs {
     inner: Arc<RwLock<JobsInner>>,
@@ -57,6 +111,7 @@ impl Jobs {
         rpc_id: Id,
         job_id: u8,
         nonce: u64,
+        block_hash: String,
         send: mpsc::UnboundedSender<PendingResult>,
     ) -> bool {
         let (mut block, handle) = {
@@ -69,7 +124,11 @@ impl Jobs {
         };
         if let Some(header) = &mut block.header {
             let mut pending = self.pending.lock().await;
-            pending.push_back(Pending { id: rpc_id, send });
+            pending.push_back(Pending {
+                id: rpc_id,
+                block_hash,
+                send,
+            });
             header.nonce = nonce;
             handle.submit_block(block);
             true
@@ -96,52 +155,4 @@ struct JobsInner {
     next: u8,
     handle: VecnodHandle,
     jobs: Vec<RpcBlock>,
-}
-
-#[derive(Debug)]
-pub struct JobParams {
-    pub id: u8,
-    pre_pow: U256,
-    difficulty: u64,
-    timestamp: u64,
-}
-
-impl JobParams {
-    pub fn difficulty(&self) -> u64 {
-        self.difficulty
-    }
-
-    pub fn to_value(&self) -> serde_json::Value {
-        json!([
-            hex::encode([self.id]),
-            self.pre_pow.as_slice(),
-            self.timestamp
-        ])
-    }
-}
-
-pub struct Pending {
-    id: Id,
-    send: mpsc::UnboundedSender<PendingResult>,
-}
-
-impl Pending {
-    pub fn resolve(self, error: Option<Box<str>>) {
-        let result = PendingResult { id: self.id, error };
-        let _ = self.send.send(result);
-    }
-}
-
-pub struct PendingResult {
-    id: Id,
-    error: Option<Box<str>>,
-}
-
-impl PendingResult {
-    pub fn into_response(self) -> Result<Response> {
-        match self.error {
-            Some(e) => Response::err(self.id, 20, e),
-            None => Response::ok(self.id, true),
-        }
-    }
 }

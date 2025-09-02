@@ -3,21 +3,23 @@ use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::path::Path;
 use hex;
+use tokio::io::AsyncWriteExt;
 use serde::Serialize;
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, RwLock};
 use anyhow::Result;
 use crate::stratum::jobs::{PendingResult, Jobs, JobParams};
-use crate::database::{Contribution, StratumDb};
+use crate::treasury::sharehandler::{Contribution, Sharehandler};
 use crate::pow;
 use crate::stratum::{Id, Request, Response};
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use prometheus::{IntCounterVec, register_int_counter_vec};
 use lazy_static::lazy_static;
 use crate::uint::{u256_to_hex, U256};
+use crate::api::fetch_block_details;
 
 const NEW_LINE: &'static str = "\n";
 
@@ -43,12 +45,9 @@ struct StratumTask {
     listener: TcpListener,
     recv: watch::Receiver<Option<JobParams>>,
     jobs: Jobs,
-    stratum_db: Arc<StratumDb>,
-    pool_fee_percent: u8,
+    share_handler: Arc<Sharehandler>,
     last_template: Arc<RwLock<Option<RpcBlock>>>,
     worker_counter: Arc<AtomicU16>,
-    pool_address: String,
-    network_id: String,
 }
 
 impl StratumTask {
@@ -66,11 +65,8 @@ impl StratumTask {
                     let recv = self.recv.clone();
                     let jobs = self.jobs.clone();
                     let (pending_send, pending_recv) = mpsc::unbounded_channel();
-                    let stratum_db = self.stratum_db.clone();
-                    let pool_fee_percent = self.pool_fee_percent;
+                    let share_handler = self.share_handler.clone();
                     let last_template = self.last_template.clone();
-                    let pool_address = self.pool_address.clone();
-                    let network_id = self.network_id.clone();
 
                     tokio::spawn(async move {
                         let (reader, writer) = conn.split();
@@ -87,12 +83,9 @@ impl StratumTask {
                             difficulty: 0,
                             authorized: false,
                             payout_addr: None,
-                            stratum_db,
-                            pool_fee_percent,
+                            share_handler,
                             last_template,
                             extranonce: String::new(),
-                            pool_address,
-                            network_id,
                         };
 
                         match conn.run().await {
@@ -112,22 +105,19 @@ impl StratumTask {
 pub struct Stratum {
     pub send: watch::Sender<Option<JobParams>>,
     pub jobs: Jobs,
-    pub stratum_db: Arc<StratumDb>,
-    pub pool_fee_percent: u8,
+    pub share_handler: Arc<Sharehandler>,
     pub last_template: Arc<RwLock<Option<RpcBlock>>>,
-    pub pool_address: String,
-    pub network_id: String,
 }
 
 impl Stratum {
-    pub async fn new(host: &str, handle: VecnodHandle, pool_address: &str, network_id: &str) -> Result<Self> {
+    pub async fn new(host: &str, handle: VecnodHandle, _pool_address: &str, _network_id: &str) -> Result<Self> {
         let (send, recv) = watch::channel(None);
         let listener = TcpListener::bind(host).await?;
         info!("Listening on {host}");
 
         let jobs = Jobs::new(handle);
-        let stratum_db = Arc::new(StratumDb::new(Path::new("pool.db"), 10000, 300_000, network_id.to_string()).await?);
-        let pool_fee_percent = 1;
+        let db = Arc::new(crate::database::db::Db::new(Path::new("pool.db")).await?);
+        let share_handler = Arc::new(Sharehandler::new(db, 10000, 60_000).await?);
         let last_template = Arc::new(RwLock::new(None));
         let worker_counter = Arc::new(AtomicU16::new(0));
 
@@ -135,23 +125,17 @@ impl Stratum {
             listener,
             recv,
             jobs: jobs.clone(),
-            stratum_db: stratum_db.clone(),
-            pool_fee_percent,
+            share_handler: share_handler.clone(),
             last_template: last_template.clone(),
             worker_counter,
-            pool_address: pool_address.to_string(),
-            network_id: network_id.to_string(),
         };
         tokio::spawn(task.run());
 
         Ok(Stratum {
             send,
             jobs,
-            stratum_db,
-            pool_fee_percent,
+            share_handler,
             last_template,
-            pool_address: pool_address.to_string(),
-            network_id: network_id.to_string(),
         })
     }
 
@@ -165,12 +149,6 @@ impl Stratum {
 
     pub async fn resolve_pending_job(&self, error: Option<Box<str>>) {
         self.jobs.resolve_pending(error).await
-    }
-
-    pub async fn distribute_rewards(&self, block_hash: String, reward_block_hash: String, daa_score: u64) {
-        if let Err(e) = self.stratum_db.distribute_rewards(block_hash, reward_block_hash, daa_score).await {
-            warn!("Failed to distribute rewards: {}", e);
-        }
     }
 }
 
@@ -187,12 +165,9 @@ struct StratumConn<'a> {
     difficulty: u64,
     authorized: bool,
     payout_addr: Option<String>,
-    stratum_db: Arc<StratumDb>,
-    pool_fee_percent: u8,
+    share_handler: Arc<Sharehandler>,
     last_template: Arc<RwLock<Option<RpcBlock>>>,
     extranonce: String,
-    pool_address: String,
-    network_id: String,
 }
 
 impl<'a> StratumConn<'a> {
@@ -263,8 +238,7 @@ impl<'a> StratumConn<'a> {
     }
 
     async fn run(mut self) -> Result<()> {
-        debug!("Initialized connection with StratumDb: {:?}", self.stratum_db);
-        debug!("Pool fee percent: {}", self.pool_fee_percent);
+        debug!("Initialized connection with sharehandler");
         debug!("Last template: {:?}", self.last_template.read().await.is_some());
 
         loop {
@@ -283,7 +257,7 @@ impl<'a> StratumConn<'a> {
                 },
                 res = read(&mut self.reader) => match res {
                     Ok(Some(msg)) => {
-                        debug!("Processing message for worker {:?}: {}", self.payout_addr, msg.method);
+                        debug!("Processing message for worker {:?}", self.payout_addr);
                         match (msg.id, &*msg.method, msg.params) {
                             (Some(id), "mining.subscribe", _) => {
                                 debug!("Worker subscribed: {:?}", self.payout_addr);
@@ -318,7 +292,7 @@ impl<'a> StratumConn<'a> {
                                     self.write_error_response(id, 23, "Unknown worker".into()).await?;
                                     continue;
                                 }
-                                let (total_submissions, window_submissions) = self.stratum_db.get_share_counts(&address).await
+                                let (total_submissions, window_submissions) = self.share_handler.get_share_counts(&address).await
                                     .map_err(|e| anyhow::anyhow!("Failed to get share counts: {}", e))?;
                                 debug!("Sending share counts for {}: total={}, window={}", address, total_submissions, window_submissions);
                                 self.write_response(id, Some(json!([total_submissions, window_submissions]))).await?;
@@ -369,21 +343,21 @@ impl<'a> StratumConn<'a> {
 
                                 let contribution = Contribution {
                                     address: address.clone(),
-                                    difficulty: self.difficulty,
+                                    difficulty: self.difficulty as i64,
                                     timestamp: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .expect("Time went backwards")
-                                        .as_secs(),
+                                        .as_secs() as i64,
                                     job_id: job_id.to_string(),
                                     daa_score: template
                                         .header
                                         .as_ref()
-                                        .map(|h| h.daa_score)
+                                        .map(|h| h.daa_score as i64)
                                         .unwrap_or(0),
                                     extranonce: self.extranonce.clone(),
                                     nonce: format!("{:016x}", nonce),
                                 };
-                                if !self.stratum_db.validate_share(&contribution, &self.jobs, &self.extranonce, &format!("{:016x}", nonce)).await? {
+                                if !self.share_handler.validate_share(&contribution, &self.jobs, &self.extranonce, &format!("{:016x}", nonce)).await? {
                                     MINER_DUPLICATED_SHARES.with_label_values(&[&address]).inc();
                                     self.write_error_response(i, 22, "Invalid or duplicate share".into()).await?;
                                     debug!("Share rejected for worker {}: job_id={}, extranonce={}, nonce={}", address, job_id, self.extranonce, nonce);
@@ -412,65 +386,60 @@ impl<'a> StratumConn<'a> {
                                     continue;
                                 }
 
-                                let (block_hash, is_block) = {
+                                let block_hash = {
                                     let mut header = template.header.clone().unwrap();
                                     header.nonce = nonce;
                                     let pow_hash = header.hash(false)?;
-                                    let pow_u256 = U256::from_little_endian(pow_hash.as_bytes());
-                                    let network_target = pow::u256_from_compact_target(header.bits);
-                                    let block_hash = hex::encode(pow_hash.as_bytes());
-                                    debug!(
-                                        "Block check: job_id={}, pow_u256={}, network_target={}, is_block={}",
-                                        job_id, u256_to_hex(&pow_u256), u256_to_hex(&network_target), pow_u256 <= network_target
-                                    );
-                                    (block_hash, pow_u256 <= network_target)
+                                    hex::encode(pow_hash.as_bytes())
                                 };
 
-                                if is_block {
-                                    if self.jobs.submit(i.clone(), job_id, nonce, self.pending_send.clone()).await {
-                                        MINER_ADDED_SHARES.with_label_values(&[&address]).inc();
-                                        info!("Node accepted block for job_id={}: hash={}", job_id, &block_hash);
-                                        info!("Block found by {}: hash={}", address, &block_hash);
-                                        debug!("Sending mining.block_found notification: address={}, hash={}", address, &block_hash);
-                                        if let Err(e) = self.write_notification(
-                                            "mining.block_found",
-                                            Some(json!([address.clone(), block_hash.clone()]))
-                                        ).await {
-                                            warn!("Failed to send mining.block_found notification: {}", e);
-                                        }
-                                    } else {
-                                        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
-                                        debug!("Unable to submit block for job_id={}: hash={}", job_id, &block_hash);
-                                        self.write_error_response(i, 20, "Unable to submit block".into()).await?;
-                                        continue;
+                                if self.jobs.submit(i.clone(), job_id, nonce, block_hash.clone(), self.pending_send.clone()).await {
+                                    MINER_ADDED_SHARES.with_label_values(&[&address]).inc();
+                                    info!("Share accepted: job_id={} for worker {}", job_id, address);
+                                    if let Err(e) = self.share_handler.record_share(contribution).await {
+                                        warn!("Failed to record share: {}", e);
                                     }
+
+                                    // Fetch block details and distribute rewards
+                                    let (reward_block_hash, daa_score) = match fetch_block_details(&block_hash).await {
+                                        Ok(result) => result,
+                                        Err(e) => {
+                                            warn!("Failed to fetch block details: {}", e);
+                                            (block_hash.clone(), 0)
+                                        }
+                                    };
+
+                                    if let Err(e) = self.share_handler
+                                        .distribute_rewards(
+                                            block_hash.clone(),
+                                            reward_block_hash,
+                                            daa_score,
+                                            template.transactions.get(0).and_then(|tx| tx.outputs.get(0)).map(|output| output.amount),
+                                        )
+                                        .await
+                                    {
+                                        warn!("Failed to distribute rewards: {}", e);
+                                    }
+
+                                    let (total_submissions, window_submissions) = self.share_handler.get_share_counts(&address).await
+                                        .map_err(|e| anyhow::anyhow!("Failed to get share counts: {}", e))?;
+                                    if self.share_handler.should_log_share(&address, total_submissions).await {
+                                        info!(
+                                            "Share accepted: job_id={} for worker {}, total submissions: {} (in window: {})",
+                                            job_id, address, total_submissions, window_submissions
+                                        );
+                                        self.share_handler.update_log_time(&address).await;
+                                        let params = json!([address.clone(), total_submissions, window_submissions]);
+                                        if let Err(e) = self.write_notification("mining.share_update", Some(params)).await {
+                                            warn!("Failed to send share_update notification to worker {}: {}", address, e);
+                                        }
+                                    }
+                                    self.write_response(i, Some(true)).await?;
                                 } else {
-                                    if self.jobs.submit(i.clone(), job_id, nonce, self.pending_send.clone()).await {
-                                        MINER_ADDED_SHARES.with_label_values(&[&address]).inc();
-                                        info!("Share accepted: job_id={} for worker {}", job_id, address);
-                                        if let Err(e) = self.stratum_db.record_share(contribution).await {
-                                            warn!("Failed to record share: {}", e);
-                                        }
-                                        let (total_submissions, window_submissions) = self.stratum_db.get_share_counts(&address).await
-                                            .map_err(|e| anyhow::anyhow!("Failed to get share counts: {}", e))?;
-                                        if self.stratum_db.should_log_share(&address, total_submissions).await {
-                                            info!(
-                                                "Share accepted: job_id={} for worker {}, total submissions: {} (in window: {})",
-                                                job_id, address, total_submissions, window_submissions
-                                            );
-                                            self.stratum_db.update_log_time(&address).await;
-                                            let params = json!([address.clone(), total_submissions, window_submissions]);
-                                            if let Err(e) = self.write_notification("mining.share_update", Some(params)).await {
-                                                warn!("Failed to send share_update notification to worker {}: {}", address, e);
-                                            }
-                                        }
-                                        self.write_response(i, Some(true)).await?;
-                                    } else {
-                                        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
-                                        debug!("Unable to submit share for job_id={}: hash={}", job_id, &block_hash);
-                                        self.write_error_response(i, 20, "Unable to submit share".into()).await?;
-                                        continue;
-                                    }
+                                    MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
+                                    debug!("Unable to submit share for job_id={}: hash={}", job_id, &block_hash);
+                                    self.write_error_response(i, 20, "Unable to submit share".into()).await?;
+                                    continue;
                                 }
                             }
                             _ => {

@@ -8,6 +8,7 @@ use rpc_client::RpcClient;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
+use log::info;
 
 pub type Send<T> = mpsc::UnboundedSender<T>;
 type Recv<T> = mpsc::UnboundedReceiver<T>;
@@ -80,7 +81,7 @@ impl ClientTask {
                     }
                     if let Some(block) = res.block {
                         if !self.synced && res.is_synced {
-                            warn!("Node synced");
+                            info!("Node synced");
                         }
                         self.synced = res.is_synced;
 
@@ -284,16 +285,6 @@ mod proto {
 
             let hash = state.finalize();
             Ok(hash)
-        }
-    }
-
-    impl RpcBlock {
-        pub fn get_subsidy(&self) -> u64 {
-            self.transactions
-                .first()
-                .and_then(|tx| tx.outputs.first())
-                .map(|out| out.amount)
-                .unwrap_or(0)
         }
     }
 }

@@ -15,6 +15,7 @@ pub trait BitArray {
 
 macro_rules! impl_array_newtype {
     ($thing:ident, $ty:ty, $len:literal) => {
+        #[allow(dead_code)]
         impl $thing {
             #[inline]
             pub fn as_ptr(&self) -> *const $ty {
@@ -77,10 +78,10 @@ macro_rules! impl_array_newtype {
     };
 }
 
-// Helper function to format U256 as hex string
-pub fn u256_to_hex(u: &U256) -> String {
+// Helper function to convert U256 to hex string
+pub fn u256_to_hex(u256: &U256) -> String {
+    let words = u256.into_bytes(); // Returns [u64; 4]
     let mut bytes = [0u8; 32];
-    let words = u.as_slice();
     for i in 0..4 {
         bytes[i * 8..(i + 1) * 8].copy_from_slice(&words[i].to_le_bytes());
     }
@@ -148,15 +149,6 @@ macro_rules! construct_uint {
                 let mut ret = [0; $n_words];
                 ret[0] = init;
                 Some($name(ret))
-            }
-
-            #[inline]
-            pub fn from_i64(init: i64) -> Option<$name> {
-                if init >= 0 {
-                    $name::from_u64(init as u64)
-                } else {
-                    None
-                }
             }
 
             #[inline]

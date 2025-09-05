@@ -4,16 +4,14 @@ const { parseArgs } = require("../wasm/utils");
 const {
     RpcClient,
     Address,
-    TransactionInput,
-    Transaction,
-    signTransaction,
-    UtxoEntries,
     PrivateKey,
     Mnemonic,
     XPrv,
     NetworkType,
-    vecnoToSompi,
-    payToAddressScript
+    sompiToVecnoStringWithSuffix,
+    UtxoProcessor,
+    UtxoContext,
+    createTransactions
 } = vecno;
 
 // Helper function to serialize objects with BigInt
@@ -24,8 +22,8 @@ function serializeBigInt(obj) {
         if (typeof value === 'object' && value !== null) {
             if (seen.has(value)) return undefined;
             seen.add(value);
-            if (value instanceof Address || value instanceof Transaction || value instanceof TransactionInput ||
-                value instanceof UtxoEntries || value instanceof PrivateKey || value instanceof Mnemonic ||
+            if (value instanceof Address || value instanceof vecno.Transaction || value instanceof vecno.TransactionInput ||
+                value instanceof vecno.UtxoEntries || value instanceof PrivateKey || value instanceof Mnemonic ||
                 value instanceof XPrv) {
                 return Object.fromEntries(
                     Object.entries(value).filter(([k, v]) => typeof v !== 'function' && !(v instanceof Buffer))
@@ -36,67 +34,29 @@ function serializeBigInt(obj) {
     }, 2);
 }
 
-// Helper function to estimate transaction serialized size
-function transactionSerializedByteSize(tx) {
-    let size = 0;
-    size += 2; // Tx version (u16)
-    size += 8; // Number of inputs (u64)
-    size += tx.inputs.reduce((sum, input) => sum + transactionInputSerializedByteSize(input), 0);
-    size += 8; // Number of outputs (u64)
-    size += tx.outputs.reduce((sum, output) => sum + transactionOutputSerializedByteSize(output), 0);
-    size += 8; // Lock time (u64)
-    size += 20; // Subnetwork ID
-    size += 8; // Gas (u64)
-    size += 32; // Payload hash
-    size += 8; // Payload length (u64)
-    size += tx.payload.length;
-    return size;
-}
-
-function transactionInputSerializedByteSize(input) {
-    let size = 0;
-    size += 36; // Outpoint (32 txid + 4 index)
-    size += 8; // Signature script length (u64)
-    size += input.signatureScript.length;
-    size += 8; // Sequence (u64)
-    return size;
-}
-
-function transactionOutputSerializedByteSize(output) {
-    let size = 0;
-    size += 8; // Value (u64)
-    size += 2; // Script version (u16)
-    size += 8; // Script length (u64)
-    size += output.scriptPublicKey.script.length;
-    return size;
-}
-
 (async () => {
-    let rpc;
+    let rpc, processor, context;
     try {
         // Parse command-line arguments
         const { encoding = 'borsh', networkId = NetworkType.Mainnet } = parseArgs();
-        const rpcUrl = process.env.WRPC_URL || "127.0.0.1:8110";
+        const rpcUrl = process.env.WRPC_URL || "ws://127.0.0.1:8110";
 
         // Initialize RPC client
-        rpc = new RpcClient({ url: rpcUrl, encoding, networkId });
         console.log(`Connecting to ${rpcUrl}`);
+        rpc = new RpcClient({ url: rpcUrl, encoding, networkId });
         await rpc.connect();
+        console.log("RPC connection established");
 
         // Verify node sync status
         const { isSynced } = await rpc.getServerInfo();
         if (!isSynced) {
             throw new Error('Node is not synced. Please wait for the node to sync.');
         }
-
         console.log("Server info:", serializeBigInt(await rpc.getInfo()));
 
-        // Derive addresses from mnemonic
+        // Derive address from mnemonic
         const mnemonicPhrase = "acoustic once under insane delay void exhaust fold click cup raw evolve love pottery alpha often put marble bullet rapid cupboard chair cover supply";
-        const paths = ["m/44'/111111'/0'/0/0", "m/44'/111111'/0'/0/1", "m/44'/111111'/0'/1/0"];
-        const addresses = [];
-        const privateKeys = {};
-
+        const path = "m/44'/111111'/0'/0/0";
         console.log("Creating Mnemonic...");
         const mnemonic = new Mnemonic(mnemonicPhrase);
         console.log("Mnemonic created:", mnemonic.phrase);
@@ -106,184 +66,154 @@ function transactionOutputSerializedByteSize(output) {
 
         console.log("Creating XPrv...");
         const xPrv = new XPrv(seed);
-        console.log("Deriving private keys...");
-        for (const path of paths) {
-            const key = xPrv.derivePath(path).toPrivateKey();
-            const pubKey = key.toPublicKey();
-            const address = pubKey.toAddress(NetworkType.Mainnet);
-            console.log(`Private key [${path}]:`, key.toString());
-            console.log(`Public key [${path}]:`, pubKey.toString());
-            console.log(`Address [${path}]:`, address.toString());
-            addresses.push(address.toString());
-            privateKeys[address.toString()] = { key, pubKey };
-        }
+        console.log("Deriving private key...");
+        const privateKey = xPrv.derivePath(path).toPrivateKey();
+        const pubKey = privateKey.toPublicKey();
+        const address = pubKey.toAddress(NetworkType.Mainnet);
+        console.log(`Private key [${path}]:`, privateKey.toString());
+        console.log(`Public key [${path}]:`, pubKey.toString());
+        console.log(`Address [${path}]:`, address.toString());
 
-        // Fetch UTXOs for addresses
-        console.log("\nFetching UTXOs for addresses:", addresses);
-        const utxos = await rpc.getUtxosByAddresses({ addresses });
-        if (!utxos.entries || utxos.entries.length === 0) {
-            throw new Error(`No UTXOs found for addresses: ${addresses.join(', ')}`);
-        }
-
-        console.log("UTXOs:", serializeBigInt(utxos.entries));
-
-        // Calculate balances
-        const balances = {};
-        addresses.forEach(addr => balances[addr] = 0n);
-        utxos.entries.forEach(utxo => {
-            const addr = utxo.address.toString();
-            // Verify P2PK script (68 bytes, starts with '20', ends with 'ac')
-            if (utxo.scriptPublicKey.script.length !== 68 || 
-                !utxo.scriptPublicKey.script.startsWith('20') || 
-                !utxo.scriptPublicKey.script.endsWith('ac')) {
-                console.warn(`Skipping non-P2PK UTXO for address ${addr}`);
-                return;
-            }
-            balances[addr] += BigInt(utxo.amount);
+        // Initialize UtxoProcessor and UtxoContext
+        processor = new UtxoProcessor({ rpc, networkId });
+        context = new UtxoContext({ processor });
+        processor.addEventListener("utxo-proc-start", async () => {
+            console.log("Clearing UtxoContext and tracking address...");
+            await context.clear();
+            await context.trackAddresses([address.toString()]);
+            console.log("UtxoContext tracking initialized");
         });
+        console.log("Starting UtxoProcessor...");
+        await processor.start();
+        console.log("UtxoProcessor started");
 
-        console.log("Balances:");
-        addresses.forEach(addr => {
-            console.log(`${addr}: ${Number(balances[addr]) / 1e8} VE`);
-        });
+        // Wait for UTXO processor to initialize
+        console.log("Waiting for UTXO processor to initialize...");
+        await new Promise(resolve => setTimeout(resolve, 5000)); // 5-second timeout
 
-        // Select address with sufficient balance
-        const amount = vecnoToSompi('10'); // 10 VE
-        const minimumFee = 210000n; // 0.0021 VE
-        const requiredAmount = amount + minimumFee;
-        let selectedAddress = null;
-        let selectedPrivateKey = null;
-        let selectedUtxos = [];
-
-        for (const addr of addresses) {
-            if (balances[addr] >= requiredAmount) {
-                selectedAddress = addr;
-                selectedPrivateKey = privateKeys[addr].key;
-                selectedUtxos = utxos.entries.filter(utxo => 
-                    utxo.address.toString() === addr &&
-                    utxo.scriptPublicKey.script.length === 68 &&
-                    utxo.scriptPublicKey.script.startsWith('20') &&
-                    utxo.scriptPublicKey.script.endsWith('ac')
-                );
-                break;
-            }
-        }
-
-        if (!selectedAddress) {
-            throw new Error(`No address has sufficient balance for transaction: ${requiredAmount} sompi`);
-        }
-
-        console.log("Selected address:", selectedAddress);
-        console.log("Selected UTXOs:", serializeBigInt(selectedUtxos));
-
-        // Define destination and change addresses
-        const destinationAddress = "vecno:qz2ut20ajguxycqxdqyset3hvvjz50cszh88u5zy7avyruwxehqdzfefuva4t";
-        const changeAddress = selectedAddress;
-
-        // Create transaction inputs
-        const utxoEntryList = [];
-        const inputs = selectedUtxos.map((utxo, sequence) => {
-            utxoEntryList.push(utxo);
-            return new TransactionInput({
-                previousOutpoint: utxo.outpoint,
-                signatureScript: [],
-                sequence,
-                sigOpCount: 1, // P2PK requires 1 signature operation
-                utxo
-            });
-        });
-
-        const utxoEntries = new UtxoEntries(utxoEntryList);
-        console.log("Inputs:", serializeBigInt(inputs));
-
-        // Calculate total input amount
-        const totalInputAmount = utxoEntryList.reduce((sum, utxo) => sum + BigInt(utxo.amount), 0n);
-        console.log("Total input amount:", totalInputAmount.toString());
-
-        // Create transaction outputs
-        const destinationScriptPublicKey = payToAddressScript(destinationAddress);
-        const outputs = [
+        // Define test payments
+        const payments = [
             {
-                value: amount,
-                scriptPublicKey: destinationScriptPublicKey
+                address: "vecno:qz2ut20ajguxycqxdqyset3hvvjz50cszh88u5zy7avyruwxehqdzfefuva4t",
+                amount: BigInt(10_000_000_000) // 10 VE in sompi
+            },
+            {
+                address: "vecno:qrhqvg5m9txyvtw52jweww5xv05mnpqp8u5cp5tgcj63fnydsp6xkjgqfadrj",
+                amount: BigInt(5_000_000_000) // 5 VE in sompi
             }
         ];
-        const changeAmount = totalInputAmount - amount - minimumFee;
-        if (changeAmount > 0) {
-            outputs.push({
-                value: changeAmount,
-                scriptPublicKey: utxoEntryList[0].scriptPublicKey // Reuse P2PK script
-            });
-        } else if (changeAmount < 0) {
-            throw new Error("Insufficient funds: total input amount is less than amount + fee");
-        }
-        console.log("Outputs:", serializeBigInt(outputs));
-        console.log("UTXO entries:", serializeBigInt(utxoEntries.items));
 
-        // Create transaction
-        const transaction = new Transaction({
-            inputs,
-            outputs,
-            lockTime: 0,
-            subnetworkId: new Array(20).fill(0), // Zeroed subnetwork ID
-            version: 0,
-            gas: 0,
-            payload: [],
-        });
-        console.log("Transaction:", serializeBigInt(transaction));
-        console.log("Minimum fee:", minimumFee.toString());
+        console.log("Payments to process:", payments.map(p => ({
+            address: p.address,
+            amount: sompiToVecnoStringWithSuffix(p.amount, networkId)
+        })));
 
-        // Estimate transaction mass and fee
-        const storageMassParameter = 2.036e9;
-        const computeMass = transactionSerializedByteSize(transaction) + (66 * inputs.length); // 66 bytes per Schnorr signature
-        const outputHarmonic = outputs.reduce((sum, out) => sum + (storageMassParameter / Number(out.value)), 0);
-        const inputArithmetic = Number(totalInputAmount) / inputs.length;
-        const storageMass = outputHarmonic > inputArithmetic ? outputHarmonic - inputArithmetic : 0;
-        const totalMass = Math.max(computeMass, storageMass);
-        const estimatedFee = Math.ceil((totalMass * 1000) / 1000) || 1000;
-        console.log("Estimated compute mass:", computeMass);
-        console.log("Estimated storage mass:", storageMass);
-        console.log("Total estimated mass:", totalMass);
-        console.log("Estimated minimum fee:", estimatedFee);
-
-        // Verify private key matches address
-        const publicKey = selectedPrivateKey.toPublicKey();
-        const derivedAddress = publicKey.toAddress(NetworkType.Mainnet);
-        console.log("Public key:", publicKey.toString());
-        console.log("Derived address:", derivedAddress.toString());
-        if (derivedAddress.toString() !== selectedAddress) {
-            throw new Error("Private key does not match the selected address!");
+        if (payments.length === 0) {
+            throw new Error("No payments to process");
         }
 
-        // Verify public key matches UTXO scriptPublicKey
-        const utxoPubKey = utxoEntryList[0].scriptPublicKey.script.slice(2, 66);
-        const derivedPubKey = publicKey.toString().slice(2);
-        console.log("UTXO Public Key:", utxoPubKey);
-        console.log("Derived Public Key (no prefix):", derivedPubKey);
-        if (utxoPubKey !== derivedPubKey) {
-            throw new Error("Public key does not match UTXO scriptPublicKey!");
+        // Create and submit batched transactions
+        console.log("Creating transactions...");
+        let transactions, summary;
+        try {
+            ({ transactions, summary } = await createTransactions({
+                entries: context,
+                outputs: payments,
+                changeAddress: address.toString(),
+                priorityFee: 0n // Let createTransactions estimate fee
+            }));
+        } catch (txError) {
+            throw new Error(`Failed to create transactions: ${txError.message}`);
         }
 
-        // Sign transaction with Schnorr
-        console.log("Signing transaction with Schnorr...");
-        const signedTransaction = signTransaction(transaction, [selectedPrivateKey], true);
-        console.log("Signed transaction inputs:", signedTransaction.inputs.map(input => input.signatureScript.toString('hex')));
-        console.log("Signature script length:", signedTransaction.inputs[0].signatureScript.length, "bytes");
-        console.log("Signature script bytes:", Array.from(signedTransaction.inputs[0].signatureScript).map(b => b.toString(16).padStart(2, '0')).join(''));
+        console.log("Transaction summary:", serializeBigInt(summary));
+        console.log(`Number of transactions: ${transactions.length}`);
+        console.log("Transactions:", serializeBigInt(transactions));
 
-        // Verify signature script
-        if (signedTransaction.inputs.some(input => !input.signatureScript || input.signatureScript.length === 0)) {
-            throw new Error("Signature script is empty after signing!");
+        if (transactions.length === 0) {
+            throw new Error("No transactions created. Ensure the address has sufficient UTXOs.");
         }
 
-        // Submit transaction
-        const result = await rpc.submitTransaction({ transaction: signedTransaction, allowOrphan: false });
-        console.log("Result:", serializeBigInt(result));
-        console.log("Signed transaction:", serializeBigInt(signedTransaction));
+        for (const transaction of transactions) {
+            console.log(`Processing transaction ${transaction.id}...`);
+            // Check transaction structure
+            if (!transaction.transaction || !Array.isArray(transaction.transaction.inputs)) {
+                throw new Error(`Invalid transaction structure for ID ${transaction.id}: missing transaction or inputs`);
+            }
+            console.log(`Transaction inputs for ${transaction.id}:`, serializeBigInt(transaction.transaction.inputs));
+            console.log(`Signing transaction ${transaction.id}...`);
+            await transaction.sign([privateKey]);
+            // Verify signatures
+            if (!transaction.transaction.inputs.every(input => input.signatureScript && input.signatureScript.length > 0)) {
+                throw new Error(`Signature script is empty or missing for some inputs in transaction ${transaction.id}`);
+            }
+            console.log(`Submitting transaction ${transaction.id}...`);
+            const submissionResponse = await transaction.submit(rpc);
+            console.log(`Transaction ${transaction.id} submitted successfully. Response:`, serializeBigInt(submissionResponse));
+            await new Promise(resolve => setTimeout(resolve, 10000)); // 10-second delay to allow node processing
+        }
 
-        await rpc.disconnect();
+        // Log final transaction details
+        console.log("Raw summary object:", serializeBigInt(summary));
+        try {
+            if (!summary || typeof summary !== 'object') {
+                throw new Error("Summary object is invalid or undefined");
+            }
+            console.log("Final transaction ID:", summary.finalTransactionId || "undefined");
+            console.log("Total amount:", summary.finalAmount != null && typeof summary.finalAmount === 'bigint'
+                ? sompiToVecnoStringWithSuffix(summary.finalAmount, networkId)
+                : "undefined");
+            console.log("Total fee:", summary.fees != null && typeof summary.fees === 'bigint'
+                ? sompiToVecnoStringWithSuffix(summary.fees, networkId)
+                : "undefined");
+        } catch (summaryError) {
+            console.error("Error logging transaction summary:", summaryError.message);
+            console.error("Summary error stack:", summaryError.stack);
+        }
+
+        // Wait before cleanup to ensure node processing
+        console.log("Waiting before cleanup...");
+        await new Promise(resolve => setTimeout(resolve, 5000));
+
+        // Clean up
+        console.log("Cleaning up...");
+        try {
+            console.log("Stopping UtxoProcessor...");
+            await processor.stop();
+            console.log("UtxoProcessor stopped");
+        } catch (stopError) {
+            console.error("Error stopping UtxoProcessor:", stopError.message);
+            console.error("UtxoProcessor error stack:", stopError.stack);
+        }
+        try {
+            console.log("Disconnecting RPC...");
+            await rpc.disconnect();
+            console.log("RPC disconnected");
+        } catch (disconnectError) {
+            console.error("Error disconnecting RPC:", disconnectError.message);
+            console.error("RPC disconnect error stack:", disconnectError.stack);
+        }
+        console.log("Cleanup complete");
     } catch (error) {
         console.error("Error:", error.message);
-        if (rpc) await rpc.disconnect();
+        console.error("Error stack:", error.stack);
+        // Clean up on error
+        try {
+            console.log("Stopping UtxoProcessor due to error...");
+            await processor.stop();
+            console.log("UtxoProcessor stopped due to error");
+        } catch (stopError) {
+            console.error("Error stopping UtxoProcessor during cleanup:", stopError.message);
+            console.error("UtxoProcessor cleanup error stack:", stopError.stack);
+        }
+        try {
+            console.log("Disconnecting RPC due to error...");
+            await rpc.disconnect();
+            console.log("RPC disconnected due to error");
+        } catch (disconnectError) {
+            console.error("Error disconnecting RPC during cleanup:", disconnectError.message);
+            console.error("RPC disconnect cleanup error stack:", disconnectError.stack);
+        }
+        throw error; // Re-throw to ensure the error is visible
     }
 })();

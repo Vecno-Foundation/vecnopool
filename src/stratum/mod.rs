@@ -1,5 +1,8 @@
+//src/stratum/mod.rs
+
 pub mod jobs;
 pub mod server;
+pub mod protocol;
 
 use anyhow::Result;
 use serde::{de, Serializer, Deserialize, Serialize};

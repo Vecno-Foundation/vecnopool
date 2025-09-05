@@ -1,3 +1,4 @@
+// src/stratum/jobs.rs
 use crate::stratum::{Id, Response};
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use crate::uint::U256;
@@ -6,7 +7,7 @@ use log::debug;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, watch, Mutex, RwLock};
 
 #[derive(Clone, Debug)]
 pub struct JobParams {
@@ -37,10 +38,14 @@ pub struct Pending {
 }
 
 impl Pending {
+    pub fn new(id: Id, block_hash: String, send: mpsc::UnboundedSender<PendingResult>) -> Self {
+        Self { id, block_hash, send }
+    }
+
     pub fn resolve(self, error: Option<Box<str>>) {
         let result = PendingResult {
             id: self.id,
-            block_hash: self.block_hash,
+            _block_hash: self.block_hash,
             error,
         };
         let _ = self.send.send(result);
@@ -49,7 +54,7 @@ impl Pending {
 
 pub struct PendingResult {
     id: Id,
-    block_hash: String,
+    _block_hash: String,
     error: Option<Box<str>>,
 }
 
@@ -66,10 +71,12 @@ impl PendingResult {
 pub struct Jobs {
     inner: Arc<RwLock<JobsInner>>,
     pending: Arc<Mutex<VecDeque<Pending>>>,
+    job_sender: Arc<watch::Sender<Option<JobParams>>>,
 }
 
 impl Jobs {
     pub fn new(handle: VecnodHandle) -> Self {
+        let (job_sender, _) = watch::channel(None);
         Self {
             inner: Arc::new(RwLock::new(JobsInner {
                 next: 0,
@@ -77,7 +84,13 @@ impl Jobs {
                 handle,
             })),
             pending: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
+            job_sender: Arc::new(job_sender),
         }
+    }
+
+    pub fn subscribe(&self) -> watch::Receiver<Option<JobParams>> {
+        debug!("New subscription for job updates");
+        self.job_sender.subscribe()
     }
 
     pub async fn insert(&self, template: RpcBlock) -> Option<JobParams> {
@@ -98,12 +111,15 @@ impl Jobs {
         };
         w.next = id.wrapping_add(1);
 
-        Some(JobParams {
+        let job_params = JobParams {
             id,
             pre_pow,
             difficulty,
             timestamp,
-        })
+        };
+        debug!("Broadcasting job: id={}", job_params.id);
+        let _ = self.job_sender.send(Some(job_params.clone()));
+        Some(job_params)
     }
 
     pub async fn submit(
@@ -118,27 +134,29 @@ impl Jobs {
             let r = self.inner.read().await;
             let block = match r.jobs.get(job_id as usize) {
                 Some(b) => b.clone(),
-                None => return false,
+                None => {
+                    debug!("No job found for job_id={}", job_id);
+                    return false;
+                }
             };
             (block, r.handle.clone())
         };
         if let Some(header) = &mut block.header {
             let mut pending = self.pending.lock().await;
-            pending.push_back(Pending {
-                id: rpc_id,
-                block_hash,
-                send,
-            });
+            pending.push_back(Pending::new(rpc_id, block_hash, send));
             header.nonce = nonce;
             handle.submit_block(block);
+            debug!("Submitted block: job_id={}, nonce={:016x}", job_id, nonce);
             true
         } else {
+            debug!("No header for job_id={}", job_id);
             false
         }
     }
 
     pub async fn resolve_pending(&self, error: Option<Box<str>>) {
         if let Some(pending) = self.pending.lock().await.pop_front() {
+            debug!("Resolving pending job: id={:?}, block_hash={}", pending.id, pending.block_hash);
             pending.resolve(error);
         } else {
             debug!("Resolve: nothing is pending");

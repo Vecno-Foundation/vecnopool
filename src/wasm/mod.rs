@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use reqwest::Client;
-use serde_json::json;
 use tokio_retry::{Retry, strategy::ExponentialBackoff};
 use tokio::io::{AsyncReadExt, BufReader};
 use std::process::Stdio;
@@ -13,85 +12,6 @@ pub struct Transaction {
     to: String,
     amount: u64,
     network_id: String,
-}
-
-impl Transaction {
-    pub fn new(from: &str, to: &str, amount: u64, network_id: &str) -> Self {
-        Transaction {
-            from: from.to_string(),
-            to: to.to_string(),
-            amount,
-            network_id: network_id.to_string(),
-        }
-    }
-
-    pub async fn to_js_value(&self) -> Result<serde_json::Value> {
-        let client = Client::new();
-        let retry_strategy = ExponentialBackoff::from_millis(100).take(3);
-        let response = Retry::spawn(retry_strategy, || async {
-            client
-                .post("http://localhost:8181/createTransaction")
-                .json(&json!({ "from": self.from, "to": self.to, "amount": self.amount, "network_id": self.network_id }))
-                .send()
-                .await
-        })
-        .await
-        .context("Failed to call createTransaction")?;
-        response
-            .json::<serde_json::Value>()
-            .await
-            .context("Failed to parse createTransaction response")
-            .map(|v| v["result"].clone())
-    }
-
-    pub async fn submit(&self) -> Result<String> {
-        let tx = self.to_js_value().await?;
-        let client = Client::new();
-        let retry_strategy = ExponentialBackoff::from_millis(100).take(3);
-        let response = Retry::spawn(retry_strategy, || async {
-            client
-                .post("http://localhost:8181/submitTransaction")
-                .json(&json!({ "tx": tx }))
-                .send()
-                .await
-        })
-        .await
-        .context("Failed to call submitTransaction")?;
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse submitTransaction response")?;
-        if result.get("error").is_some() {
-            return Err(anyhow::anyhow!("Transaction submission failed: {:?}", result));
-        }
-        let tx_id: String = serde_json::from_value(result["result"].clone())
-            .context("Failed to parse transaction ID")?;
-        Ok(tx_id)
-    }
-
-    pub async fn format_amount(&self) -> Result<String> {
-        let client = Client::new();
-        let retry_strategy = ExponentialBackoff::from_millis(100).take(3);
-        let response = Retry::spawn(retry_strategy, || async {
-            client
-                .post("http://localhost:8181/sompiToVecnoStringWithSuffix")
-                .json(&json!({ "sompi": self.amount, "network_id": self.network_id }))
-                .send()
-                .await
-        })
-        .await
-        .context("Failed to call sompiToVecnoStringWithSuffix")?;
-        let result: serde_json::Value = response
-            .json()
-            .await
-            .context("Failed to parse sompiToVecnoStringWithSuffix response")?;
-        if result.get("error").is_some() {
-            return Err(anyhow::anyhow!("sompiToVecnoStringWithSuffix failed: {:?}", result));
-        }
-        let formatted: String = serde_json::from_value(result["result"].clone())
-            .context("Failed to parse formatted amount")?;
-        Ok(formatted)
-    }
 }
 
 pub async fn initialize_wasm() -> Result<()> {

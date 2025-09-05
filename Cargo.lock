@@ -2671,6 +2671,7 @@ dependencies = [
  "futures",
  "hex",
  "http",
+ "hyper",
  "lazy_static",
  "log",
  "num-traits",

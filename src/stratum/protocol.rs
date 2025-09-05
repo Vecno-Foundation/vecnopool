@@ -1,0 +1,387 @@
+use anyhow::Result;
+use log::{debug, info, warn};
+use serde::Serialize;
+use serde_json::json;
+use tokio::io::{AsyncWriteExt, BufReader, Lines};
+use tokio::net::tcp::{ReadHalf, WriteHalf};
+use tokio::sync::{mpsc, watch, RwLock};
+use hex;
+use std::sync::Arc;
+use crate::stratum::{Id, Request, Response};
+use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
+use crate::treasury::sharehandler::{Contribution, Sharehandler};
+use crate::treasury::share_validator::validate_share;
+use crate::pow;
+use crate::vecnod::RpcBlock;
+use crate::uint::{U256, u256_to_hex};
+use crate::api::fetch_block_details;
+use crate::metrics::{MINER_ADDED_SHARES, MINER_INVALID_SHARES, MINER_DUPLICATED_SHARES, MINER_ADDRESS_MISMATCH};
+
+const NEW_LINE: &'static str = "\n";
+
+pub struct StratumConn<'a> {
+    pub reader: Lines<BufReader<ReadHalf<'a>>>,
+    pub writer: WriteHalf<'a>,
+    pub recv: watch::Receiver<Option<JobParams>>,
+    pub jobs: Arc<Jobs>,
+    pub pending_send: mpsc::UnboundedSender<PendingResult>,
+    pub pending_recv: mpsc::UnboundedReceiver<PendingResult>,
+    pub worker: [u8; 2],
+    pub id: u64,
+    pub subscribed: bool,
+    pub difficulty: u64,
+    pub authorized: bool,
+    pub payout_addr: Option<String>,
+    pub share_handler: Arc<Sharehandler>,
+    pub last_template: Arc<RwLock<Option<RpcBlock>>>,
+    pub extranonce: String,
+    pub mining_addr: String,
+    pub client: reqwest::Client,
+    pub duplicate_share_count: u64,
+}
+
+impl<'a> StratumConn<'a> {
+    #[allow(dead_code)]
+    pub fn new(
+        reader: Lines<BufReader<ReadHalf<'a>>>,
+        writer: WriteHalf<'a>,
+        recv: watch::Receiver<Option<JobParams>>,
+        jobs: Arc<Jobs>,
+        pending_send: mpsc::UnboundedSender<PendingResult>,
+        pending_recv: mpsc::UnboundedReceiver<PendingResult>,
+        worker: [u8; 2],
+        share_handler: Arc<Sharehandler>,
+        last_template: Arc<RwLock<Option<RpcBlock>>>,
+        mining_addr: String,
+        client: reqwest::Client,
+    ) -> Self {
+        StratumConn {
+            reader,
+            writer,
+            recv,
+            jobs,
+            pending_send,
+            pending_recv,
+            worker,
+            id: 0,
+            subscribed: false,
+            difficulty: 0,
+            authorized: false,
+            payout_addr: None,
+            share_handler,
+            last_template,
+            extranonce: String::new(),
+            mining_addr,
+            client,
+            duplicate_share_count: 0,
+        }
+    }
+
+    pub async fn write_template(&mut self) -> Result<()> {
+        debug!("Sending template to worker: {worker:?}", worker = self.payout_addr);
+        let (difficulty, params) = {
+            let borrow = self.recv.borrow();
+            match borrow.as_ref() {
+                Some(j) => (j.difficulty(), j.to_value()),
+                None => {
+                    debug!("No job template available for worker: {worker:?}", worker = self.payout_addr);
+                    return Ok(());
+                }
+            }
+        };
+        self.write_request("mining.notify", Some(params)).await?;
+
+        if self.difficulty != difficulty {
+            self.difficulty = difficulty;
+            let difficulty_f64 = (self.difficulty as f64) / ((1u64 << 32) as f64);
+            debug!("Sending difficulty {difficulty} to worker: {worker:?}", difficulty = difficulty_f64, worker = self.payout_addr);
+            self.write_request("mining.set_difficulty", Some(json!([difficulty_f64])))
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn write_request(
+        &mut self,
+        method: &'static str,
+        params: Option<serde_json::Value>,
+    ) -> Result<()> {
+        self.id += 1;
+        let req = Request {
+            id: Some(self.id.into()),
+            method: method.into(),
+            params,
+        };
+        self.write(&req).await
+    }
+
+    async fn write_response<T: Serialize>(&mut self, id: Id, result: Option<T>) -> Result<()> {
+        let res = Response::ok(id, result)?;
+        self.write(&res).await
+    }
+
+    async fn write_error_response(&mut self, id: Id, code: u64, message: Box<str>) -> Result<()> {
+        let res = Response::err(id, code, message)?;
+        self.write(&res).await
+    }
+
+    async fn write_notification(&mut self, method: &'static str, params: Option<serde_json::Value>) -> Result<()> {
+        let req = Request {
+            id: None,
+            method: method.into(),
+            params,
+        };
+        self.write(&req).await
+    }
+
+    async fn write<T: Serialize>(&mut self, data: &T) -> Result<()> {
+        let data = serde_json::to_vec(data)?;
+        debug!("Writing to miner: {message} for worker: {worker:?}", message = String::from_utf8_lossy(&data), worker = self.payout_addr);
+        self.writer.write_all(&data).await?;
+        self.writer.write_all(NEW_LINE.as_bytes()).await?;
+        Ok(())
+    }
+
+    pub async fn run(&mut self) -> Result<()> {
+        debug!("Initialized connection with sharehandler for worker: {worker:?}", worker = self.payout_addr);
+        debug!("Last template status: has_template={has_template:?} for worker: {worker:?}", has_template = self.last_template.read().await.is_some(), worker = self.payout_addr);
+
+        loop {
+            tokio::select! {
+                res = self.recv.changed() => match res {
+                    Err(_) => break,
+                    Ok(_) => {
+                        if self.subscribed {
+                            self.write_template().await?;
+                        }
+                    }
+                },
+                item = self.pending_recv.recv() => {
+                    let res = item.expect("channel is always open").into_response()?;
+                    self.write(&res).await?;
+                },
+                res = read(&mut self.reader) => match res {
+                    Ok(Some(msg)) => {
+                        debug!("Processing message: method={method} for worker: {worker:?}", method = msg.method, worker = self.payout_addr);
+                        match (msg.id, &*msg.method, msg.params) {
+                            (Some(id), "mining.subscribe", _) => {
+                                debug!("Worker subscribed: {worker:?}", worker = self.payout_addr);
+                                self.subscribed = true;
+                                self.extranonce = hex::encode(&self.worker);
+                                self.write_response(id, Some(true)).await?;
+                                self.write_request(
+                                    "set_extranonce",
+                                    Some(json!([self.extranonce, 6u64])),
+                                ).await?;
+                                self.write_template().await?;
+                            }
+                            (Some(id), "mining.authorize", Some(p)) => {
+                                let params: Vec<String> = serde_json::from_value(p)?;
+                                if params.len() < 1 || !params[0].starts_with("vecno:") || params[0].len() < 10 {
+                                    self.write_error_response(id, 21, "Invalid address format".into()).await?;
+                                    continue;
+                                }
+                                self.payout_addr = Some(params[0].clone());
+                                self.authorized = true;
+                                self.write_response(id, Some(true)).await?;
+                                self.write_template().await?;
+                            }
+                            (Some(id), "mining.get_shares", Some(p)) => {
+                                if !self.authorized {
+                                    self.write_error_response(id, 24, "Unauthorized worker".into()).await?;
+                                    continue;
+                                }
+                                let params: Vec<String> = serde_json::from_value(p)?;
+                                let address = params.get(0).cloned().unwrap_or_default();
+                                if address != *self.payout_addr.as_ref().unwrap_or(&String::new()) {
+                                    MINER_ADDRESS_MISMATCH.with_label_values(&[&address]).inc();
+                                    self.write_error_response(id, 23, "Unknown worker".into()).await?;
+                                    continue;
+                                }
+                                let (total_submissions, window_submissions) = self.share_handler.get_share_counts(&address).await
+                                    .map_err(|e| anyhow::anyhow!("Failed to get share counts: {}", e))?;
+                                debug!(
+                                    "Sending share counts: total={total_submissions}, window={window_submissions} for address={address}"
+                                );
+                                self.write_response(id, Some(json!([total_submissions, window_submissions]))).await?;
+                            }
+                            (Some(id), "mining.configure", Some(_)) => {
+                                debug!("Received mining.configure for worker: {worker:?}", worker = self.payout_addr);
+                                self.write_response(id, Some(json!({
+                                    "version-rolling": false,
+                                    "minimum-difficulty": true
+                                }))).await?;
+                            }
+                            (Some(i), "mining.submit", Some(p)) => {
+                                if !self.authorized {
+                                    self.write_error_response(i, 24, "Unauthorized worker".into()).await?;
+                                    continue;
+                                }
+                                let (address, id_str, nonce_str): (String, String, String) = serde_json::from_value(p)?;
+                                if address != *self.payout_addr.as_ref().unwrap_or(&String::new()) {
+                                    MINER_ADDRESS_MISMATCH.with_label_values(&[&address]).inc();
+                                    self.write_error_response(i, 23, "Unknown worker".into()).await?;
+                                    continue;
+                                }
+                                let job_id = match u8::from_str_radix(&id_str, 16) {
+                                    Ok(id) => id,
+                                    Err(e) => {
+                                        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
+                                        self.write_error_response(i, 21, format!("Invalid job ID: {}", e).into()).await?;
+                                        continue;
+                                    }
+                                };
+                                let nonce = match u64::from_str_radix(nonce_str.trim_start_matches("0x"), 16) {
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
+                                        self.write_error_response(i, 21, format!("Invalid nonce: {}", e).into()).await?;
+                                        continue;
+                                    }
+                                };
+
+                                let template = match self.jobs.get_job(job_id).await {
+                                    Some(b) => b,
+                                    None => {
+                                        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
+                                        self.write_error_response(i, 21, "Stale job".into()).await?;
+                                        debug!("Stale job: job_id={job_id} for worker={address}");
+                                        continue;
+                                    }
+                                };
+
+                                let contribution = Contribution {
+                                    address: address.clone(),
+                                    difficulty: 1,
+                                    timestamp: std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .expect("Time went backwards")
+                                        .as_secs() as i64,
+                                    job_id: job_id.to_string(),
+                                    daa_score: template
+                                        .header
+                                        .as_ref()
+                                        .map(|h| h.daa_score as i64)
+                                        .unwrap_or(0),
+                                    extranonce: self.extranonce.clone(),
+                                    nonce: format!("{:016x}", nonce),
+                                };
+
+                                if !validate_share(&contribution, &self.jobs, self.share_handler.db.clone(), &self.extranonce, &format!("{:016x}", nonce)).await? {
+                                    self.duplicate_share_count += 1;
+                                    MINER_DUPLICATED_SHARES.with_label_values(&[&address]).inc();
+                                    self.write_error_response(i, 22, "Invalid or duplicate share".into()).await?;
+                                    debug!(
+                                        "Share rejected: job_id={job_id}, extranonce={extranonce}, nonce={nonce} for worker={address}",
+                                        extranonce = self.extranonce,
+                                        nonce = format!("{:016x}", nonce)
+                                    );
+                                    if self.duplicate_share_count > 100 {
+                                        warn!(
+                                            "Excessive duplicate shares: count={count} for worker={address}",
+                                            count = self.duplicate_share_count
+                                        );
+                                        return Err(anyhow::anyhow!("Excessive duplicate shares from {}", address));
+                                    }
+                                    continue;
+                                }
+
+                                let log_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    let mut header = template.header.clone().unwrap();
+                                    header.nonce = nonce;
+                                    let pow_hash = header.hash(false)?;
+                                    let pow_u256 = U256::from_little_endian(pow_hash.as_bytes());
+                                    let network_target = pow::u256_from_compact_target(header.bits);
+                                    let difficulty_f64 = (self.difficulty as f64) / ((1u64 << 32) as f64);
+
+                                    debug!(
+                                        "Share submitted: job_id={job_id}, nonce={nonce:016x}, pow_u256={pow_u256_hex}, network_target={network_target_hex}, pool_difficulty={difficulty}, difficulty_f64={difficulty_f64}",
+                                        pow_u256_hex = u256_to_hex(&pow_u256),
+                                        network_target_hex = u256_to_hex(&network_target),
+                                        difficulty = self.difficulty
+                                    );
+
+                                    Ok::<(), anyhow::Error>(())
+                                }));
+
+                                if let Err(panic_err) = log_result {
+                                    warn!(
+                                        "Diagnostic logging panicked: job_id={job_id}, error={panic_err:?}"
+                                    );
+                                    self.write_error_response(i, 23, "Internal server error".into()).await?;
+                                    continue;
+                                }
+
+                                let block_hash = {
+                                    let mut header = template.header.clone().unwrap();
+                                    header.nonce = nonce;
+                                    let pow_hash = header.hash(false)?;
+                                    hex::encode(pow_hash.as_bytes())
+                                };
+
+                                if self.jobs.submit(i.clone(), job_id, nonce, block_hash.clone(), self.pending_send.clone()).await {
+                                    MINER_ADDED_SHARES.with_label_values(&[&address]).inc();
+                                    info!("Share accepted: job_id={job_id} for worker={address}");
+                                    if let Err(e) = self.share_handler.record_share(&contribution).await {
+                                        warn!("Failed to record share for worker={worker}: {e:?}", worker = address);
+                                    }
+
+                                    // Add 0.2-second delay to allow block indexing before fetching details
+                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                                    let (_reward_block_hash, _daa_score) = match fetch_block_details(
+                                        self.share_handler.db.clone(),
+                                        &self.client,
+                                        &block_hash,
+                                        &self.mining_addr,
+                                    ).await {
+                                        Ok(result) => result,
+                                        Err(e) => {
+                                            warn!("Failed to fetch block details for block_hash={block_hash}: {e:?}");
+                                            (block_hash.clone(), contribution.daa_score as u64)
+                                        }
+                                    };
+
+                                    let (total_submissions, window_submissions) = self.share_handler.get_share_counts(&address).await
+                                        .map_err(|e| anyhow::anyhow!("Failed to get share counts: {}", e))?;
+                                    if self.share_handler.should_log_share(&address, total_submissions).await {
+                                        info!(
+                                            "Share accepted: job_id={job_id}, worker={address}, total_submissions={total_submissions}, window_submissions={window_submissions}"
+                                        );
+                                        self.share_handler.update_log_time(&address).await;
+                                        let params = json!([address.clone(), total_submissions, window_submissions]);
+                                        if let Err(e) = self.write_notification("mining.share_update", Some(params)).await {
+                                            warn!("Failed to send share_update notification for worker={worker}: {e:?}", worker = address);
+                                        }
+                                    }
+                                    self.write_response(i, Some(true)).await?;
+                                } else {
+                                    MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
+                                    debug!("Unable to submit share: job_id={job_id}, block_hash={block_hash}");
+                                    self.write_error_response(i, 20, "Unable to submit share".into()).await?;
+                                    continue;
+                                }
+                            }
+                            _ => {
+                                debug!("Got unknown method: {method} for worker: {worker:?}", method = msg.method, worker = self.payout_addr);
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(e),
+                },
+            }
+        }
+        Ok(())
+    }
+}
+
+pub async fn read(r: &mut Lines<BufReader<ReadHalf<'_>>>) -> Result<Option<Request>> {
+    let line = match r.next_line().await? {
+        Some(l) => l,
+        None => return Ok(None),
+    };
+    debug!("Received from miner: {line}");
+    Ok(Some(serde_json::from_str(&line)?))
+}

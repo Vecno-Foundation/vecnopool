@@ -1,8 +1,9 @@
 pub mod database;
-pub mod pow;
 pub mod stratum;
-pub mod uint;
-pub mod vecnod;
-pub mod wasm;
-pub mod api;
 pub mod treasury;
+pub mod pow;
+pub mod vecnod;
+pub mod uint;
+pub mod api;
+pub mod metrics;
+pub mod wasm;

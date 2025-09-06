@@ -53,8 +53,9 @@ async fn main() -> Result<()> {
 
     // Start payout task
     tokio::spawn({
-        let db = stratum.share_handler.db.clone(); 
+        let db = stratum.share_handler.db.clone();
         let client = client.clone();
+        let payout_notify = stratum.payout_notify.clone(); // Clone the broadcast sender
         async move {
             let mut confirmations_interval = time::interval(Duration::from_secs(30)); // 30 seconds
             let mut payouts_interval = time::interval(Duration::from_secs(600)); // 10 minutes
@@ -66,7 +67,7 @@ async fn main() -> Result<()> {
                         }
                     }
                     _ = payouts_interval.tick() => {
-                        if let Err(e) = process_payouts(db.clone(), &client).await {
+                        if let Err(e) = process_payouts(db.clone(), &client, payout_notify.clone()).await {
                             log::warn!("Failed to process payouts: {:?}", e);
                         }
                     }

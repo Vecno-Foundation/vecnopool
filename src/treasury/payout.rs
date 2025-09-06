@@ -8,6 +8,9 @@ use std::env;
 use std::sync::Arc;
 use sqlx::Row;
 use crate::metrics::{DB_QUERIES_SUCCESS, DB_QUERIES_FAILED, TRANSACTION_CREATION_FAILED, REWARDS_DISTRIBUTED, BLOCK_REWARDS};
+use crate::stratum::protocol::PayoutNotification;
+use tokio::sync::broadcast::Sender; // Changed to broadcast::Sender
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Helper function to strip worker suffix (e.g., .worker1) from address
 fn strip_worker_suffix(address: &str) -> &str {
@@ -120,8 +123,8 @@ pub async fn check_confirmations(db: Arc<Db>, client: &Client) -> Result<()> {
                         DB_QUERIES_SUCCESS.with_label_values(&["add_balance"]).inc();
                         REWARDS_DISTRIBUTED.with_label_values(&[address, &block.reward_block_hash]).inc_by(miner_reward_share as f64 / 100_000_000.0);
                         info!(
-                            "Added reward to balance: amount={} VE ({}%), address={}, block_hash={}, confirmations={}",
-                            miner_reward_share as f64 / 100_000_000.0, share_percentage * 100.0, address, block.reward_block_hash, confirmations
+                            "Added reward to balance: amount={} VE, address={}, block_hash={}, confirmations={}",
+                            miner_reward_share as f64 / 100_000_000.0, address, block.reward_block_hash, confirmations
                         );
                     }
                     Err(e) => {
@@ -141,7 +144,7 @@ pub async fn check_confirmations(db: Arc<Db>, client: &Client) -> Result<()> {
     Ok(())
 }
 
-pub async fn process_payouts(db: Arc<Db>, client: &Client) -> Result<()> {
+pub async fn process_payouts(db: Arc<Db>, client: &Client, payout_notify: Sender<PayoutNotification>) -> Result<()> {
     let pool_address = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
     let wasm_url = env::var("WASM_URL").unwrap_or("http://localhost:8181".to_string());
     debug!("Starting process_payouts with WASM_URL: {}", wasm_url);
@@ -222,6 +225,17 @@ pub async fn process_payouts(db: Arc<Db>, client: &Client) -> Result<()> {
 
         // Log payout since run_vecno.js already recorded it
         info!("Payout processed by run_vecno.js: amount={} VE, address={}, tx_id={}", amount as f64 / 100_000_000.0, address, tx_id);
+
+        // Send payout notification to miners
+        let notification = PayoutNotification {
+            address: address.to_string(),
+            amount,
+            tx_id: tx_id.to_string(),
+            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
+        };
+        if let Err(e) = payout_notify.send(notification) {
+            warn!("Failed to send payout notification for address={}: {:?}", address, e);
+        }
 
         // Verify payment exists
         let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payments WHERE tx_id = ?")

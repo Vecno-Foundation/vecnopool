@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::io::{AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, RwLock}; // Added broadcast
 use hex;
 use std::sync::Arc;
 use crate::stratum::{Id, Request, Response};
@@ -38,10 +38,18 @@ pub struct StratumConn<'a> {
     pub mining_addr: String,
     pub client: reqwest::Client,
     pub duplicate_share_count: u64,
+    pub payout_notify_recv: broadcast::Receiver<PayoutNotification>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PayoutNotification {
+    pub address: String,
+    pub amount: u64,
+    pub tx_id: String,
+    pub timestamp: i64,
 }
 
 impl<'a> StratumConn<'a> {
-    #[allow(dead_code)]
     pub fn new(
         reader: Lines<BufReader<ReadHalf<'a>>>,
         writer: WriteHalf<'a>,
@@ -54,6 +62,7 @@ impl<'a> StratumConn<'a> {
         last_template: Arc<RwLock<Option<RpcBlock>>>,
         mining_addr: String,
         client: reqwest::Client,
+        payout_notify_recv: broadcast::Receiver<PayoutNotification>, // Changed to broadcast::Receiver
     ) -> Self {
         StratumConn {
             reader,
@@ -74,6 +83,7 @@ impl<'a> StratumConn<'a> {
             mining_addr,
             client,
             duplicate_share_count: 0,
+            payout_notify_recv,
         }
     }
 
@@ -143,6 +153,23 @@ impl<'a> StratumConn<'a> {
         Ok(())
     }
 
+    async fn send_payout_notification(&mut self, payout: PayoutNotification) -> Result<()> {
+        if self.payout_addr.as_ref() == Some(&payout.address) {
+            debug!("Sending payout notification to worker: {worker:?}, amount={amount} VE, tx_id={tx_id}",
+                   worker = self.payout_addr, amount = payout.amount as f64 / 100_000_000.0, tx_id = payout.tx_id);
+            self.write_notification(
+                "mining.payout",
+                Some(json!({
+                    "address": payout.address,
+                    "amount": payout.amount as f64 / 100_000_000.0, // In VE
+                    "tx_id": payout.tx_id,
+                    "timestamp": payout.timestamp
+                }))
+            ).await?;
+        }
+        Ok(())
+    }
+
     pub async fn run(&mut self) -> Result<()> {
         debug!("Initialized connection with sharehandler for worker: {worker:?}", worker = self.payout_addr);
         debug!("Last template status: has_template={has_template:?} for worker: {worker:?}", has_template = self.last_template.read().await.is_some(), worker = self.payout_addr);
@@ -160,6 +187,21 @@ impl<'a> StratumConn<'a> {
                 item = self.pending_recv.recv() => {
                     let res = item.expect("channel is always open").into_response()?;
                     self.write(&res).await?;
+                },
+                payout = self.payout_notify_recv.recv() => {
+                    match payout {
+                        Ok(payout) => {
+                            self.send_payout_notification(payout).await?;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Payout notification receiver lagged by {} messages for worker {:?}", n, self.payout_addr);
+                            // Continue to avoid breaking the loop; missed notifications will be logged
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            warn!("Payout notification channel closed for worker {:?}", self.payout_addr);
+                            break;
+                        }
+                    }
                 },
                 res = read(&mut self.reader) => match res {
                     Ok(Some(msg)) => {
@@ -205,6 +247,28 @@ impl<'a> StratumConn<'a> {
                                     "Sending share counts: total={total_submissions}, window={window_submissions} for address={address}"
                                 );
                                 self.write_response(id, Some(json!([total_submissions, window_submissions]))).await?;
+                            }
+                            (Some(id), "mining.get_balance", Some(p)) => {
+                                if !self.authorized {
+                                    self.write_error_response(id, 24, "Unauthorized worker".into()).await?;
+                                    continue;
+                                }
+                                let params: Vec<String> = serde_json::from_value(p)?;
+                                let address = params.get(0).cloned().unwrap_or_default();
+                                if address != *self.payout_addr.as_ref().unwrap_or(&String::new()) {
+                                    MINER_ADDRESS_MISMATCH.with_label_values(&[&address]).inc();
+                                    self.write_error_response(id, 23, "Unknown worker".into()).await?;
+                                    continue;
+                                }
+                                let (available_balance, pending_balance) = self.share_handler.get_balances(&address, self).await
+                                    .map_err(|e| anyhow::anyhow!("Failed to get balances: {}", e))?;
+                                debug!(
+                                    "Sending balance: available={available_balance} VE, pending={pending_balance} VE for address={address}"
+                                );
+                                self.write_response(id, Some(json!({
+                                    "available_balance": available_balance as f64 / 100_000_000.0, // In VE
+                                    "pending_balance": pending_balance as f64 / 100_000_000.0 // In VE
+                                }))).await?;
                             }
                             (Some(id), "mining.configure", Some(_)) => {
                                 debug!("Received mining.configure for worker: {worker:?}", worker = self.payout_addr);

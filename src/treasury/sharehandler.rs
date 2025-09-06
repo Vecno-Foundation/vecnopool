@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, RwLock};
 use log::{debug, info, warn};
 use crate::database::db::Db;
 use crate::metrics::{TOTAL_SHARES_RECORDED, SHARE_WINDOW_SIZE, SHARE_PROCESSING_FAILED};
+use crate::stratum::protocol::StratumConn;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Contribution {
@@ -41,7 +42,7 @@ impl Sharehandler {
             .context("Failed to load recent shares")?;
         let share_window = Arc::new(RwLock::new(share_window));
         let total_shares = Arc::new(AtomicU64::new(total_shares));
-        let (share_batch, mut share_batch_rx) = mpsc::channel::<Contribution>(1000);
+        let (share_batch, mut share_batch_rx) = mpsc::channel::<Contribution>(10000); // Bounded channel
         let worker_share_counts = Arc::new(DashMap::new());
         let worker_log_times = Arc::new(DashMap::new());
 
@@ -93,101 +94,29 @@ impl Sharehandler {
                             info!("Recording share: worker={worker}, total_submissions={count}", worker = share.address);
                             worker_log_times_clone.get(&share.address).unwrap().store(current_time, AtomicOrdering::Relaxed);
                         }
-                        if batch.len() >= 100 {
-                            for share in batch.drain(..) {
-                                if let Err(e) = db_clone.record_share(
-                                    &share.address,
-                                    1,
-                                    share.timestamp as u64,
-                                    &share.job_id,
-                                    share.daa_score as u64,
-                                    &share.extranonce,
-                                    &share.nonce,
-                                ).await {
-                                    warn!("Failed to record batched share for worker={worker}: {e:?}", worker = share.address);
-                                    SHARE_PROCESSING_FAILED.with_label_values(&[&share.address]).inc();
-                                } else {
-                                    TOTAL_SHARES_RECORDED.with_label_values(&[&share.address]).inc();
-                                }
-                                let mut w = share_window_clone.write().await;
-                                w.push_back(share.clone());
-                                while w.len() > n_window {
-                                    if let Some(old_share) = w.pop_front() {
-                                        total_shares_clone.fetch_sub(1, AtomicOrdering::Relaxed);
-                                        if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
-                                            *count -= 1;
-                                            if *count == 0 {
-                                                window_submission_counts.remove(&old_share.address);
-                                            }
-                                        }
-                                    }
-                                }
-                                let current_time_ms = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .expect("Time went backwards")
-                                    .as_millis() as u64;
-                                while w.len() > 0 && current_time_ms - w.front().map(|s| (s.timestamp as u64) * 1000).unwrap_or(0) > window_time_ms {
-                                    if let Some(old_share) = w.pop_front() {
-                                        total_shares_clone.fetch_sub(1, AtomicOrdering::Relaxed);
-                                        if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
-                                            *count -= 1;
-                                            if *count == 0 {
-                                                window_submission_counts.remove(&old_share.address);
-                                            }
-                                        }
-                                    }
-                                }
-                                SHARE_WINDOW_SIZE.set(w.len() as f64);
-                            }
+                        if batch.len() >= 500 { // Increased batch size
+                            Self::process_batch(
+                                &db_clone,
+                                &share_window_clone,
+                                &total_shares_clone,
+                                &mut window_submission_counts,
+                                &mut batch,
+                                n_window,
+                                window_time_ms,
+                            ).await;
                         }
                     }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => { // Reduced sleep time
                         if !batch.is_empty() {
-                            for share in batch.drain(..) {
-                                if let Err(e) = db_clone.record_share(
-                                    &share.address,
-                                    1,
-                                    share.timestamp as u64,
-                                    &share.job_id,
-                                    share.daa_score as u64,
-                                    &share.extranonce,
-                                    &share.nonce,
-                                ).await {
-                                    warn!("Failed to record batched share for worker={worker}: {e:?}", worker = share.address);
-                                    SHARE_PROCESSING_FAILED.with_label_values(&[&share.address]).inc();
-                                } else {
-                                    TOTAL_SHARES_RECORDED.with_label_values(&[&share.address]).inc();
-                                }
-                                let mut w = share_window_clone.write().await;
-                                w.push_back(share);
-                                while w.len() > n_window {
-                                    if let Some(old_share) = w.pop_front() {
-                                        total_shares_clone.fetch_sub(1, AtomicOrdering::Relaxed);
-                                        if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
-                                            *count -= 1;
-                                            if *count == 0 {
-                                                window_submission_counts.remove(&old_share.address);
-                                            }
-                                        }
-                                    }
-                                }
-                                let current_time_ms = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .expect("Time went backwards")
-                                    .as_millis() as u64;
-                                while w.len() > 0 && current_time_ms - w.front().map(|s| (s.timestamp as u64) * 1000).unwrap_or(0) > window_time_ms {
-                                    if let Some(old_share) = w.pop_front() {
-                                        total_shares_clone.fetch_sub(1, AtomicOrdering::Relaxed);
-                                        if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
-                                            *count -= 1;
-                                            if *count == 0 {
-                                                window_submission_counts.remove(&old_share.address);
-                                            }
-                                        }
-                                    }
-                                }
-                                SHARE_WINDOW_SIZE.set(w.len() as f64);
-                            }
+                            Self::process_batch(
+                                &db_clone,
+                                &share_window_clone,
+                                &total_shares_clone,
+                                &mut window_submission_counts,
+                                &mut batch,
+                                n_window,
+                                window_time_ms,
+                            ).await;
                         }
                     }
                 }
@@ -204,6 +133,62 @@ impl Sharehandler {
             worker_share_counts,
             worker_log_times,
         })
+    }
+
+    async fn process_batch(
+        db: &Arc<Db>,
+        share_window: &Arc<RwLock<VecDeque<Contribution>>>,
+        total_shares: &Arc<AtomicU64>,
+        window_submission_counts: &mut HashMap<String, u64>,
+        batch: &mut Vec<Contribution>,
+        n_window: usize,
+        window_time_ms: u64,
+    ) {
+        for share in batch.drain(..) {
+            if let Err(e) = db.record_share(
+                &share.address,
+                1,
+                share.timestamp as u64,
+                &share.job_id,
+                share.daa_score as u64,
+                &share.extranonce,
+                &share.nonce,
+            ).await {
+                warn!("Failed to record batched share for worker={}: {:?}", share.address, e);
+                SHARE_PROCESSING_FAILED.with_label_values(&[&share.address]).inc();
+            } else {
+                TOTAL_SHARES_RECORDED.with_label_values(&[&share.address]).inc();
+            }
+            let mut w = share_window.write().await;
+            w.push_back(share.clone());
+            while w.len() > n_window {
+                if let Some(old_share) = w.pop_front() {
+                    total_shares.fetch_sub(1, AtomicOrdering::Relaxed);
+                    if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
+                        *count -= 1;
+                        if *count == 0 {
+                            window_submission_counts.remove(&old_share.address);
+                        }
+                    }
+                }
+            }
+            let current_time_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time went backwards")
+                .as_millis() as u64;
+            while w.len() > 0 && current_time_ms - w.front().map(|s| (s.timestamp as u64) * 1000).unwrap_or(0) > window_time_ms {
+                if let Some(old_share) = w.pop_front() {
+                    total_shares.fetch_sub(1, AtomicOrdering::Relaxed);
+                    if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
+                        *count -= 1;
+                        if *count == 0 {
+                            window_submission_counts.remove(&old_share.address);
+                        }
+                    }
+                }
+            }
+            SHARE_WINDOW_SIZE.set(w.len() as f64);
+        }
     }
 
     pub async fn record_share(&self, contribution: &Contribution) -> Result<()> {
@@ -271,13 +256,13 @@ impl Sharehandler {
             &contribution.extranonce,
             &contribution.nonce,
         ).await {
-            warn!("Failed to record share for worker={worker}: {e:?}", worker = contribution.address);
+            warn!("Failed to record share for worker={}: {:?}", contribution.address, e);
             SHARE_PROCESSING_FAILED.with_label_values(&[&contribution.address]).inc();
             Err(e)
         } else {
             TOTAL_SHARES_RECORDED.with_label_values(&[&contribution.address]).inc();
             if let Err(e) = self.share_batch.send(contribution.clone()).await {
-                warn!("Failed to send share to batch for worker={worker}: {e:?}", worker = contribution.address);
+                warn!("Failed to send share to batch for worker={}: {:?}", contribution.address, e);
                 SHARE_PROCESSING_FAILED.with_label_values(&[&contribution.address]).inc();
             }
             Ok(())
@@ -320,5 +305,43 @@ impl Sharehandler {
         if let Some(log_time) = self.worker_log_times.get(address) {
             log_time.store(current_time, AtomicOrdering::Relaxed);
         }
+    }
+
+    pub async fn get_balances(&self, address: &str, stratum_conn: &StratumConn<'_>) -> Result<(u64, u64)> {
+        let available_balance = sqlx::query_scalar::<_, i64>("SELECT available_balance FROM balances WHERE address = ?")
+            .bind(address)
+            .fetch_optional(&self.db.pool)
+            .await
+            .context("Failed to fetch available balance")?
+            .unwrap_or(0) as u64;
+
+        let unconfirmed_blocks = stratum_conn.share_handler.db.get_unconfirmed_blocks().await
+            .context("Failed to get unconfirmed blocks")?;
+
+        let mut pending_balance = 0;
+        let pool_fee_percent = 2.0;
+
+        for block in unconfirmed_blocks {
+            let share_counts = self.db.get_shares_in_window(block.daa_score as u64, 1000).await
+                .context("Failed to get share counts for reward distribution")?;
+            let total_shares: u64 = share_counts.iter().map(|entry| *entry.value()).sum();
+            if total_shares == 0 {
+                continue;
+            }
+
+            let miner_shares = share_counts.get(address).map(|entry| *entry.value()).unwrap_or(0);
+            let share_percentage = miner_shares as f64 / total_shares as f64;
+            let block_amount = block.amount as u64;
+            let miner_reward = ((block_amount as f64) * (1.0 - pool_fee_percent / 100.0) * share_percentage) as u64;
+            pending_balance += miner_reward;
+        }
+
+        debug!(
+            "Balances for address={}: available={} VE, pending={} VE",
+            address,
+            available_balance as f64 / 100_000_000.0,
+            pending_balance as f64 / 100_000_000.0
+        );
+        Ok((available_balance, pending_balance))
     }
 }

@@ -85,7 +85,7 @@ async fn main() -> Result<()> {
     tokio::spawn({
         let client = client.clone();
         async move {
-            let mut interval = time::interval(Duration::from_millis(500)); // Changed to 500ms
+            let mut interval = time::interval(Duration::from_millis(1000));
             loop {
                 interval.tick().await;
                 if !client.request_template() {

@@ -1,5 +1,3 @@
-//src/database/db.rs
-
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
@@ -104,7 +102,7 @@ impl Db {
     pub async fn record_share(
         &self,
         address: &str,
-        difficulty: u64,
+        difficulty: i64,
         timestamp: u64,
         job_id: &str,
         daa_score: u64,
@@ -116,7 +114,7 @@ impl Db {
              VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(address)
-        .bind(difficulty as i64)
+        .bind(difficulty)
         .bind(timestamp as i64)
         .bind(job_id)
         .bind(daa_score as i64)
@@ -314,7 +312,7 @@ impl Db {
     ) -> Result<()> {
         let mut amount = get_block_reward(daa_score)
             .context(format!("Failed to calculate block reward for daa_score {}", daa_score))?;
-        let pool_fee: f64 = 2.0 / 100.0; // 2% pool fee
+        let pool_fee: f64 = 2.0 / 100.0;
         amount = ((amount as f64) * (1.0 - pool_fee)) as u64;
 
         let result = sqlx::query(

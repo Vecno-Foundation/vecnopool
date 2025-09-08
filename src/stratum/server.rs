@@ -1,5 +1,3 @@
-//src/stratum/server.js
-
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
@@ -8,10 +6,11 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::io::AsyncBufReadExt;
 use crate::stratum::protocol::{StratumConn, PayoutNotification};
-use crate::stratum::jobs::{Jobs, PendingResult, JobParams};
+use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
 use crate::treasury::sharehandler::Sharehandler;
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use crate::database::db::Db;
+use dashmap::DashMap;
 
 pub struct Stratum {
     pub last_template: Arc<tokio::sync::RwLock<Option<RpcBlock>>>,
@@ -36,7 +35,7 @@ impl Stratum {
         let (send, recv) = watch::channel(None); // Keep the receiver for spawning tasks
         let (payout_notify, _) = broadcast::channel(100);
         let db = Arc::new(Db::new(std::path::Path::new("pool.db")).await?);
-        let share_handler = Arc::new(Sharehandler::new(db, 1000, 3600 * 1000, pool_address.to_string()).await?);
+        let share_handler = Arc::new(Sharehandler::new(db, 100, 30_000, pool_address.to_string()).await?);
         let worker_counter = Arc::new(AtomicU16::new(0));
         
         let jobs_clone = jobs.clone();
@@ -72,7 +71,7 @@ impl Stratum {
                             let mut conn = StratumConn {
                                 reader: tokio::io::BufReader::new(reader).lines(),
                                 writer,
-                                recv: recv_clone, // Use the cloned receiver
+                                recv: recv_clone,
                                 jobs,
                                 pending_send: pending_send_inner,
                                 pending_recv,
@@ -89,11 +88,12 @@ impl Stratum {
                                 client,
                                 duplicate_share_count: 0,
                                 payout_notify_recv,
+                                is_gpu_miner: false,
+                                submitted_nonces: Arc::new(DashMap::new()), // Initialize submitted_nonces
                             };
                             debug!("Initialized StratumConn for worker {:?}", addr);
                             if let Err(e) = conn.run().await {
                                 error!("Stratum connection error for {}: {}", addr, e);
-                                // Send PendingResult directly instead of creating Pending
                                 let result = PendingResult {
                                     id: conn.id.into(),
                                     error: Some(format!("Connection closed: {}", e).into_boxed_str()),

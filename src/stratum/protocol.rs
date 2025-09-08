@@ -1,5 +1,3 @@
-//src/stratum/protocol.rs
-
 use anyhow::Result;
 use log::{debug, info};
 use serde::Serialize;
@@ -9,12 +7,13 @@ use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use hex;
 use std::sync::Arc;
+use std::collections::HashSet;
+use dashmap::DashMap;
 use crate::stratum::{Id, Request, Response};
 use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
 use crate::treasury::sharehandler::{Contribution, Sharehandler};
 use crate::treasury::share_validator::validate_share;
 use crate::pow;
-use log::warn;
 use crate::vecnod::RpcBlock;
 use crate::uint::{U256, u256_to_hex};
 use crate::api::fetch_block_details;
@@ -42,6 +41,8 @@ pub struct StratumConn<'a> {
     pub client: reqwest::Client,
     pub duplicate_share_count: u64,
     pub payout_notify_recv: broadcast::Receiver<PayoutNotification>,
+    pub is_gpu_miner: bool,
+    pub submitted_nonces: Arc<DashMap<String, HashSet<String>>>, // job_id -> set of nonces
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,26 +54,74 @@ pub struct PayoutNotification {
 }
 
 impl<'a> StratumConn<'a> {
+    pub async fn new(
+        reader: Lines<BufReader<ReadHalf<'a>>>,
+        writer: WriteHalf<'a>,
+        recv: watch::Receiver<Option<JobParams>>,
+        jobs: Arc<Jobs>,
+        pending_send: mpsc::UnboundedSender<PendingResult>,
+        pending_recv: mpsc::UnboundedReceiver<PendingResult>,
+        worker: [u8; 2],
+        share_handler: Arc<Sharehandler>,
+        last_template: Arc<RwLock<Option<RpcBlock>>>,
+        mining_addr: String,
+        client: reqwest::Client,
+        payout_notify_recv: broadcast::Receiver<PayoutNotification>,
+    ) -> Self {
+        StratumConn {
+            reader,
+            writer,
+            recv,
+            jobs,
+            pending_send,
+            pending_recv,
+            worker,
+            id: 0,
+            subscribed: false,
+            difficulty: 0,
+            authorized: false,
+            payout_addr: None,
+            share_handler,
+            last_template,
+            extranonce: String::new(),
+            mining_addr,
+            client,
+            duplicate_share_count: 0,
+            payout_notify_recv,
+            is_gpu_miner: false,
+            submitted_nonces: Arc::new(DashMap::new()),
+        }
+    }
+
     pub async fn write_template(&mut self) -> Result<()> {
-        debug!("Sending template to worker: {worker:?}", worker = self.payout_addr);
-        let (difficulty, params) = {
+        debug!("Sending template to worker: {:?}", self.payout_addr);
+        let (base_difficulty, params) = {
             let borrow = self.recv.borrow();
             match borrow.as_ref() {
                 Some(j) => (j.difficulty(), j.to_value()),
                 None => {
-                    debug!("No job template available for worker: {worker:?}", worker = self.payout_addr);
+                    debug!("No job template available for worker: {:?}", self.payout_addr);
                     return Ok(());
                 }
             }
         };
+        debug!("Base difficulty for job: {}", base_difficulty);
         self.write_request("mining.notify", Some(params)).await?;
 
-        if self.difficulty != difficulty {
-            self.difficulty = difficulty;
-            let difficulty_f64 = (self.difficulty as f64) / ((1u64 << 32) as f64);
-            debug!("Sending difficulty {difficulty} to worker: {worker:?}", difficulty = difficulty_f64, worker = self.payout_addr);
-            self.write_request("mining.set_difficulty", Some(json!([difficulty_f64])))
-                .await?;
+        // Get dynamic difficulty based on share rate
+        let address = self.payout_addr.as_ref().unwrap_or(&String::new()).clone();
+        if !address.is_empty() && self.authorized {
+            let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(&address, base_difficulty, self.is_gpu_miner).await;
+            let difficulty_f64 = (adjusted_difficulty as f64) / ((1u64 << 32) as f64);
+            if self.difficulty != adjusted_difficulty {
+                self.difficulty = adjusted_difficulty;
+                info!(
+                    "Sending difficulty {} (raw: {}) to worker: {:?} (is_gpu_miner: {})",
+                    difficulty_f64, adjusted_difficulty, self.payout_addr, self.is_gpu_miner
+                );
+                self.write_request("mining.set_difficulty", Some(json!([difficulty_f64])))
+                    .await?;
+            }
         }
 
         Ok(())
@@ -113,7 +162,7 @@ impl<'a> StratumConn<'a> {
 
     async fn write<T: Serialize>(&mut self, data: &T) -> Result<()> {
         let data = serde_json::to_vec(data)?;
-        debug!("Writing to miner: {message} for worker: {worker:?}", message = String::from_utf8_lossy(&data), worker = self.payout_addr);
+        debug!("Writing to miner: {} for worker: {:?}", String::from_utf8_lossy(&data), self.payout_addr);
         self.writer.write_all(&data).await?;
         self.writer.write_all(NEW_LINE.as_bytes()).await?;
         Ok(())
@@ -121,13 +170,13 @@ impl<'a> StratumConn<'a> {
 
     async fn send_payout_notification(&mut self, payout: PayoutNotification) -> Result<()> {
         if self.payout_addr.as_ref() == Some(&payout.address) {
-            debug!("Sending payout notification to worker: {worker:?}, amount={amount} VE, tx_id={tx_id}",
-                   worker = self.payout_addr, amount = payout.amount as f64 / 100_000_000.0, tx_id = payout.tx_id);
+            debug!("Sending payout notification to worker: {:?}, amount={} VE, tx_id={}",
+                   self.payout_addr, payout.amount as f64 / 100_000_000.0, payout.tx_id);
             self.write_notification(
                 "mining.payout",
                 Some(json!({
                     "address": payout.address,
-                    "amount": payout.amount as f64 / 100_000_000.0, // In VE
+                    "amount": payout.amount as f64 / 100_000_000.0,
                     "tx_id": payout.tx_id,
                     "timestamp": payout.timestamp
                 }))
@@ -137,8 +186,8 @@ impl<'a> StratumConn<'a> {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        debug!("Initialized connection with sharehandler for worker: {worker:?}", worker = self.payout_addr);
-        debug!("Last template status: has_template={has_template:?} for worker: {worker:?}", has_template = self.last_template.read().await.is_some(), worker = self.payout_addr);
+        debug!("Initialized connection with sharehandler for worker: {:?}", self.payout_addr);
+        debug!("Last template status: has_template={:?} for worker: {:?}", self.last_template.read().await.is_some(), self.payout_addr);
 
         loop {
             tokio::select! {
@@ -160,29 +209,32 @@ impl<'a> StratumConn<'a> {
                             self.send_payout_notification(payout).await?;
                         }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("Payout notification receiver lagged by {} messages for worker {:?}", n, self.payout_addr);
-                            // Continue to avoid breaking the loop; missed notifications will be logged
+                            info!("Payout notification receiver lagged by {} messages for worker {:?}", n, self.payout_addr);
+                            continue;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            warn!("Payout notification channel closed for worker {:?}", self.payout_addr);
+                            info!("Payout notification channel closed for worker {:?}", self.payout_addr);
                             break;
                         }
                     }
                 },
                 res = read(&mut self.reader) => match res {
                     Ok(Some(msg)) => {
-                        debug!("Processing message: method={method} for worker: {worker:?}", method = msg.method, worker = self.payout_addr);
+                        debug!("Processing message: method={} for worker: {:?}", msg.method, self.payout_addr);
                         match (msg.id, &*msg.method, msg.params) {
-                            (Some(id), "mining.subscribe", _) => {
-                                debug!("Worker subscribed: {worker:?}", worker = self.payout_addr);
+                            (Some(id), "mining.subscribe", Some(p)) => {
+                                debug!("Worker subscribed: {:?}", self.payout_addr);
                                 self.subscribed = true;
                                 self.extranonce = hex::encode(&self.worker);
+                                let params: Vec<String> = serde_json::from_value(p)?;
+                                self.is_gpu_miner = params.get(1).map_or(false, |agent| agent.to_lowercase().contains("gpu"));
+                                info!("Miner type detected: is_gpu_miner={} for worker {:?}", self.is_gpu_miner, self.payout_addr);
                                 self.write_response(id, Some(true)).await?;
                                 self.write_request(
                                     "set_extranonce",
                                     Some(json!([self.extranonce, 6u64])),
                                 ).await?;
-                                self.write_template().await?;
+                                // Do not send difficulty here; wait for authorize
                             }
                             (Some(id), "mining.authorize", Some(p)) => {
                                 let params: Vec<String> = serde_json::from_value(p)?;
@@ -192,6 +244,18 @@ impl<'a> StratumConn<'a> {
                                 }
                                 self.payout_addr = Some(params[0].clone());
                                 self.authorized = true;
+                                // Send initial difficulty after authorize
+                                let address = self.payout_addr.as_ref().unwrap();
+                                let base_difficulty = self.recv.borrow().as_ref().map_or(58000, |j| j.difficulty());
+                                let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(address, base_difficulty, self.is_gpu_miner).await;
+                                self.difficulty = adjusted_difficulty;
+                                let difficulty_f64 = (adjusted_difficulty as f64) / ((1u64 << 32) as f64);
+                                info!(
+                                    "Sending initial difficulty {} (raw: {}) to worker: {} (is_gpu_miner: {})",
+                                    difficulty_f64, adjusted_difficulty, address, self.is_gpu_miner
+                                );
+                                self.write_request("mining.set_difficulty", Some(json!([difficulty_f64])))
+                                    .await?;
                                 self.write_response(id, Some(true)).await?;
                                 self.write_template().await?;
                             }
@@ -210,7 +274,8 @@ impl<'a> StratumConn<'a> {
                                 let (total_submissions, window_submissions) = self.share_handler.get_share_counts(&address).await
                                     .map_err(|e| anyhow::anyhow!("Failed to get share counts: {}", e))?;
                                 debug!(
-                                    "Sending share counts: total={total_submissions}, window={window_submissions} for address={address}"
+                                    "Sending share counts: total={}, window={} for address={}",
+                                    total_submissions, window_submissions, address
                                 );
                                 self.write_response(id, Some(json!([total_submissions, window_submissions]))).await?;
                             }
@@ -226,18 +291,23 @@ impl<'a> StratumConn<'a> {
                                     self.write_error_response(id, 23, "Unknown worker".into()).await?;
                                     continue;
                                 }
-                                let (available_balance, pending_balance) = self.share_handler.get_balances(&address, self).await
+                                let (available_balance, pending_balance, effective_hashrate) = self.share_handler.get_balances_and_hashrate(&address, self).await
                                     .map_err(|e| anyhow::anyhow!("Failed to get balances: {}", e))?;
                                 debug!(
-                                    "Sending balance: available={available_balance} VE, pending={pending_balance} VE for address={address}"
+                                    "Sending balance: available={} VE, pending={} VE, effective_hashrate={} Mhash/s for address={}",
+                                    available_balance as f64 / 100_000_000.0,
+                                    pending_balance as f64 / 100_000_000.0,
+                                    effective_hashrate,
+                                    address
                                 );
                                 self.write_response(id, Some(json!({
-                                    "available_balance": available_balance as f64 / 100_000_000.0, // In VE
-                                    "pending_balance": pending_balance as f64 / 100_000_000.0 // In VE
+                                    "available_balance": available_balance as f64 / 100_000_000.0,
+                                    "pending_balance": pending_balance as f64 / 100_000_000.0,
+                                    "effective_hashrate": effective_hashrate
                                 }))).await?;
                             }
                             (Some(id), "mining.configure", Some(_)) => {
-                                debug!("Received mining.configure for worker: {worker:?}", worker = self.payout_addr);
+                                debug!("Received mining.configure for worker: {:?}", self.payout_addr);
                                 self.write_response(id, Some(json!({
                                     "version-rolling": false,
                                     "minimum-difficulty": true
@@ -271,19 +341,43 @@ impl<'a> StratumConn<'a> {
                                     }
                                 };
 
+                                // Check for duplicate nonce
+                                let nonce_hex = format!("{:016x}", nonce);
+                                let job_id_str = job_id.to_string();
+                                let is_duplicate = if let Some(mut nonces) = self.submitted_nonces.get_mut(&job_id_str) {
+                                    !nonces.insert(nonce_hex.clone())
+                                } else {
+                                    self.submitted_nonces.insert(job_id_str.clone(), HashSet::new());
+                                    if let Some(mut nonces) = self.submitted_nonces.get_mut(&job_id_str) {
+                                        nonces.insert(nonce_hex.clone())
+                                    } else {
+                                        false // Should not happen
+                                    }
+                                };
+                                if is_duplicate {
+                                    self.duplicate_share_count += 1;
+                                    MINER_DUPLICATED_SHARES.with_label_values(&[&address]).inc();
+                                    self.write_error_response(i, 22, "Duplicate nonce submitted".into()).await?;
+                                    info!("Rejected duplicate share: job_id={}, nonce={}, worker={}", job_id, nonce_hex, address);
+                                    if self.duplicate_share_count > 100 {
+                                        return Err(anyhow::anyhow!("Excessive duplicate shares from {}", address));
+                                    }
+                                    continue;
+                                }
+
                                 let template = match self.jobs.get_job(job_id).await {
                                     Some(b) => b,
                                     None => {
                                         MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
                                         self.write_error_response(i, 21, "Stale job".into()).await?;
-                                        debug!("Stale job: job_id={job_id} for worker={address}");
+                                        debug!("Stale job: job_id={} for worker={}", job_id, address);
                                         continue;
                                     }
                                 };
 
                                 let contribution = Contribution {
                                     address: address.clone(),
-                                    difficulty: 1,
+                                    difficulty: 1, // Normalize share difficulty to 1
                                     timestamp: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .expect("Time went backwards")
@@ -295,22 +389,21 @@ impl<'a> StratumConn<'a> {
                                         .map(|h| h.daa_score as i64)
                                         .unwrap_or(0),
                                     extranonce: self.extranonce.clone(),
-                                    nonce: format!("{:016x}", nonce),
+                                    nonce: nonce_hex,
                                 };
 
-                                if !validate_share(&contribution, &self.jobs, self.share_handler.db.clone(), &self.extranonce, &format!("{:016x}", nonce)).await? {
+                                if !validate_share(&contribution, &self.jobs, self.share_handler.db.clone(), &self.extranonce, &contribution.nonce).await? {
                                     self.duplicate_share_count += 1;
                                     MINER_DUPLICATED_SHARES.with_label_values(&[&address]).inc();
                                     self.write_error_response(i, 22, "Invalid or duplicate share".into()).await?;
                                     debug!(
-                                        "Share rejected: job_id={job_id}, extranonce={extranonce}, nonce={nonce} for worker={address}",
-                                        extranonce = self.extranonce,
-                                        nonce = format!("{:016x}", nonce)
+                                        "Share rejected: job_id={}, extranonce={}, nonce={} for worker={}",
+                                        job_id, self.extranonce, contribution.nonce, address
                                     );
                                     if self.duplicate_share_count > 100 {
-                                        warn!(
-                                            "Excessive duplicate shares: count={count} for worker={address}",
-                                            count = self.duplicate_share_count
+                                        info!(
+                                            "Excessive duplicate shares: count={} for worker={}",
+                                            self.duplicate_share_count, address
                                         );
                                         return Err(anyhow::anyhow!("Excessive duplicate shares from {}", address));
                                     }
@@ -326,18 +419,17 @@ impl<'a> StratumConn<'a> {
                                     let difficulty_f64 = (self.difficulty as f64) / ((1u64 << 32) as f64);
 
                                     debug!(
-                                        "Share submitted: job_id={job_id}, nonce={nonce:016x}, pow_u256={pow_u256_hex}, network_target={network_target_hex}, pool_difficulty={difficulty}, difficulty_f64={difficulty_f64}",
-                                        pow_u256_hex = u256_to_hex(&pow_u256),
-                                        network_target_hex = u256_to_hex(&network_target),
-                                        difficulty = self.difficulty
+                                        "Share submitted: job_id={}, nonce={:016x}, pow_u256={}, network_target={}, difficulty={}",
+                                        job_id, nonce, u256_to_hex(&pow_u256), u256_to_hex(&network_target), difficulty_f64
                                     );
 
                                     Ok::<(), anyhow::Error>(())
                                 }));
 
                                 if let Err(panic_err) = log_result {
-                                    warn!(
-                                        "Diagnostic logging panicked: job_id={job_id}, error={panic_err:?}"
+                                    info!(
+                                        "Diagnostic logging panicked: job_id={}, error={:?}",
+                                        job_id, panic_err
                                     );
                                     self.write_error_response(i, 23, "Internal server error".into()).await?;
                                     continue;
@@ -350,14 +442,14 @@ impl<'a> StratumConn<'a> {
                                     hex::encode(pow_hash.as_bytes())
                                 };
 
+                                debug!("Submitting share to jobs: job_id={}, nonce={:016x}, block_hash={}", job_id, nonce, block_hash);
                                 if self.jobs.submit(i.clone(), job_id, nonce, self.pending_send.clone()).await {
                                     MINER_ADDED_SHARES.with_label_values(&[&address]).inc();
-                                    info!("Share accepted: job_id={job_id} for worker={address}");
-                                    if let Err(e) = self.share_handler.record_share(&contribution).await {
-                                        warn!("Failed to record share for worker={worker}: {e:?}", worker = address);
+                                    info!("Share accepted: job_id={} for worker={}", job_id, address);
+                                    if let Err(e) = self.share_handler.record_share(&contribution, self.difficulty).await {
+                                        info!("Failed to record share for worker={}: {:?}", address, e);
                                     }
 
-                                    // Add 0.2-second delay to allow block indexing before fetching details
                                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
                                     let (_reward_block_hash, _daa_score) = match fetch_block_details(
@@ -368,7 +460,6 @@ impl<'a> StratumConn<'a> {
                                     ).await {
                                         Ok(result) => result,
                                         Err(_e) => {
-                                            // Warning log removed
                                             (block_hash.clone(), contribution.daa_score as u64)
                                         }
                                     };
@@ -377,24 +468,25 @@ impl<'a> StratumConn<'a> {
                                         .map_err(|e| anyhow::anyhow!("Failed to get share counts: {}", e))?;
                                     if self.share_handler.should_log_share(&address, total_submissions).await {
                                         info!(
-                                            "Share accepted: job_id={job_id}, worker={address}, total_submissions={total_submissions}, window_submissions={window_submissions}"
+                                            "Share accepted: job_id={}, worker={}, total_submissions={}, window_submissions={}",
+                                            job_id, address, total_submissions, window_submissions
                                         );
                                         self.share_handler.update_log_time(&address).await;
                                         let params = json!([address.clone(), total_submissions, window_submissions]);
                                         if let Err(e) = self.write_notification("mining.share_update", Some(params)).await {
-                                            warn!("Failed to send share_update notification for worker={worker}: {e:?}", worker = address);
+                                            info!("Failed to send share_update notification for worker={}: {:?}", address, e);
                                         }
                                     }
                                     self.write_response(i, Some(true)).await?;
                                 } else {
                                     MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
-                                    debug!("Unable to submit share: job_id={job_id}, block_hash={block_hash}");
+                                    debug!("Unable to submit share: job_id={}, block_hash={}", job_id, block_hash);
                                     self.write_error_response(i, 20, "Unable to submit share".into()).await?;
                                     continue;
                                 }
                             }
                             _ => {
-                                debug!("Got unknown method: {method} for worker: {worker:?}", method = msg.method, worker = self.payout_addr);
+                                debug!("Got unknown method: {} for worker: {:?}", msg.method, self.payout_addr);
                             }
                         }
                     }
@@ -403,6 +495,8 @@ impl<'a> StratumConn<'a> {
                 },
             }
         }
+        // Clear submitted_nonces on connection close
+        self.submitted_nonces.clear();
         Ok(())
     }
 }
@@ -412,6 +506,6 @@ pub async fn read(r: &mut Lines<BufReader<ReadHalf<'_>>>) -> Result<Option<Reque
         Some(l) => l,
         None => return Ok(None),
     };
-    debug!("Received from miner: {line}");
+    debug!("Received from miner: {}", line);
     Ok(Some(serde_json::from_str(&line)?))
 }

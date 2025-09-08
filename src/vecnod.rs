@@ -1,3 +1,5 @@
+//src/vecnod.rs
+
 use anyhow::Result;
 use log::{debug, warn};
 use proto::vecnod_message::Payload;
@@ -9,28 +11,33 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use log::info;
+use http::Uri;
 
 pub type Send<T> = mpsc::UnboundedSender<T>;
 type Recv<T> = mpsc::UnboundedReceiver<T>;
 
 #[derive(Clone)]
-pub struct VecnodHandle(Send<Payload>);
+pub struct VecnodHandle {
+    send: Send<Payload>,
+}
 
 impl VecnodHandle {
     pub fn new() -> (Self, Recv<Payload>) {
         let (send, recv) = mpsc::unbounded_channel();
-        (VecnodHandle(send), recv)
+        (VecnodHandle {
+            send,
+        }, recv)
     }
 
     pub fn submit_block(&self, block: RpcBlock) {
-        let _ = self.0.send(Payload::submit_block(block, false));
+        let _ = self.send.send(Payload::submit_block(block, false));
     }
+
 }
 
 #[derive(Debug)]
 pub enum Message {
-    #[allow(dead_code)]
-    Info { version: String, synced: bool },
+    Info { version: String, _synced: bool },
     Template(RpcBlock),
     NewTemplate,
     SubmitBlockResult(Option<Box<str>>),
@@ -45,7 +52,9 @@ struct ClientTask {
 
 impl ClientTask {
     async fn run(mut self) -> Result<()> {
-        let mut client = RpcClient::connect(self.url).await?;
+        // Convert String to Uri
+        let uri: Uri = self.url.parse().map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
+        let mut client = RpcClient::connect(uri).await?;
         let mut stream = client
             .message_stream(
                 UnboundedReceiverStream::new(self.recv_cmd)
@@ -63,7 +72,7 @@ impl ClientTask {
                     }
                     Message::Info {
                         version: info.server_version,
-                        synced: info.is_synced,
+                        _synced: info.is_synced,
                     }
                 }
                 Some(Payload::SubmitBlockResponse(res)) => {
@@ -84,7 +93,6 @@ impl ClientTask {
                             info!("Node synced");
                         }
                         self.synced = res.is_synced;
-
                         if block.header.is_none() {
                             warn!("Template block is missing a header");
                             continue;
@@ -159,7 +167,7 @@ impl Client {
             }
         });
 
-        let send_cmd = handle.0;
+        let send_cmd = handle.send.clone();
         send_cmd.send(Payload::get_info()).unwrap();
         send_cmd.send(Payload::notify_new_block_template()).unwrap();
 

@@ -1,3 +1,5 @@
+//src/main.rs
+
 use anyhow::{Context, Result};
 use log::{debug, info, LevelFilter};
 use std::env;
@@ -6,6 +8,7 @@ use crate::metrics::start_metrics_server;
 use crate::treasury::payout::{check_confirmations, process_payouts};
 use crate::vecnod::{Client, Message, VecnodHandle};
 use crate::stratum::Stratum;
+use log::warn;
 
 mod vecnod;
 mod pow;
@@ -55,10 +58,10 @@ async fn main() -> Result<()> {
     tokio::spawn({
         let db = stratum.share_handler.db.clone();
         let client = client.clone();
-        let payout_notify = stratum.payout_notify.clone(); // Clone the broadcast sender
+        let payout_notify = stratum.payout_notify.clone();
         async move {
-            let mut confirmations_interval = time::interval(Duration::from_secs(30)); // 30 seconds
-            let mut payouts_interval = time::interval(Duration::from_secs(600)); // 10 minutes
+            let mut confirmations_interval = time::interval(Duration::from_secs(30));
+            let mut payouts_interval = time::interval(Duration::from_secs(600));
             loop {
                 tokio::select! {
                     _ = confirmations_interval.tick() => {
@@ -77,6 +80,21 @@ async fn main() -> Result<()> {
     });
 
     let (client, mut msgs) = Client::new(&rpc_url, &pool_address, &extra_data, handle, recv_cmd);
+
+    // Start periodic template request task
+    tokio::spawn({
+        let client = client.clone();
+        async move {
+            let mut interval = time::interval(Duration::from_millis(500)); // Changed to 500ms
+            loop {
+                interval.tick().await;
+                if !client.request_template() {
+                    warn!("Failed to request template: channel closed");
+                    break;
+                }
+            }
+        }
+    });
 
     while let Some(msg) = msgs.recv().await {
         match msg {

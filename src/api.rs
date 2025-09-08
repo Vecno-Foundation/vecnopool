@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
-use log::{debug, warn};
+use log::debug;
 use serde::Deserialize;
 use std::sync::Arc;
 use crate::database::db::Db;
 use crate::metrics::{BLOCK_DETAILS_FETCH_SUCCESS, BLOCK_DETAILS_FETCH_FAILED};
+use log::warn;
 
 #[derive(Deserialize, Debug)]
 struct BlockResponse {
@@ -86,15 +87,12 @@ pub async fn fetch_block_details(
     let script_public_key_address = &coinbase_output.verbose_data.script_public_key_address;
 
     if script_public_key_address != mining_addr {
-        warn!(
-            "Block {block_hash} mined to address {script_public_key_address}, not pool's MINING_ADDR {mining_addr}",
-            block_hash = block_hash,
-            script_public_key_address = script_public_key_address,
-            mining_addr = mining_addr
-        );
         BLOCK_DETAILS_FETCH_FAILED.with_label_values(&[block_hash]).inc();
         return Err(anyhow::anyhow!(
-            "Block {block_hash} mined to address {script_public_key_address}, not pool's MINING_ADDR {mining_addr}"
+            "Block {} mined to address {}, not pool's MINING_ADDR {}",
+            block_hash,
+            script_public_key_address,
+            mining_addr
         ));
     }
 

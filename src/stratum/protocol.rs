@@ -1,10 +1,12 @@
+//src/stratum/protocol.rs
+
 use anyhow::Result;
-use log::{debug, info, warn};
+use log::{debug, info};
 use serde::Serialize;
 use serde_json::json;
 use tokio::io::{AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
-use tokio::sync::{broadcast, mpsc, watch, RwLock}; // Added broadcast
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use hex;
 use std::sync::Arc;
 use crate::stratum::{Id, Request, Response};
@@ -12,6 +14,7 @@ use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
 use crate::treasury::sharehandler::{Contribution, Sharehandler};
 use crate::treasury::share_validator::validate_share;
 use crate::pow;
+use log::warn;
 use crate::vecnod::RpcBlock;
 use crate::uint::{U256, u256_to_hex};
 use crate::api::fetch_block_details;
@@ -50,43 +53,6 @@ pub struct PayoutNotification {
 }
 
 impl<'a> StratumConn<'a> {
-    pub fn new(
-        reader: Lines<BufReader<ReadHalf<'a>>>,
-        writer: WriteHalf<'a>,
-        recv: watch::Receiver<Option<JobParams>>,
-        jobs: Arc<Jobs>,
-        pending_send: mpsc::UnboundedSender<PendingResult>,
-        pending_recv: mpsc::UnboundedReceiver<PendingResult>,
-        worker: [u8; 2],
-        share_handler: Arc<Sharehandler>,
-        last_template: Arc<RwLock<Option<RpcBlock>>>,
-        mining_addr: String,
-        client: reqwest::Client,
-        payout_notify_recv: broadcast::Receiver<PayoutNotification>, // Changed to broadcast::Receiver
-    ) -> Self {
-        StratumConn {
-            reader,
-            writer,
-            recv,
-            jobs,
-            pending_send,
-            pending_recv,
-            worker,
-            id: 0,
-            subscribed: false,
-            difficulty: 0,
-            authorized: false,
-            payout_addr: None,
-            share_handler,
-            last_template,
-            extranonce: String::new(),
-            mining_addr,
-            client,
-            duplicate_share_count: 0,
-            payout_notify_recv,
-        }
-    }
-
     pub async fn write_template(&mut self) -> Result<()> {
         debug!("Sending template to worker: {worker:?}", worker = self.payout_addr);
         let (difficulty, params) = {
@@ -384,7 +350,7 @@ impl<'a> StratumConn<'a> {
                                     hex::encode(pow_hash.as_bytes())
                                 };
 
-                                if self.jobs.submit(i.clone(), job_id, nonce, block_hash.clone(), self.pending_send.clone()).await {
+                                if self.jobs.submit(i.clone(), job_id, nonce, self.pending_send.clone()).await {
                                     MINER_ADDED_SHARES.with_label_values(&[&address]).inc();
                                     info!("Share accepted: job_id={job_id} for worker={address}");
                                     if let Err(e) = self.share_handler.record_share(&contribution).await {
@@ -401,8 +367,8 @@ impl<'a> StratumConn<'a> {
                                         &self.mining_addr,
                                     ).await {
                                         Ok(result) => result,
-                                        Err(e) => {
-                                            warn!("Failed to fetch block details for block_hash={block_hash}: {e:?}");
+                                        Err(_e) => {
+                                            // Warning log removed
                                             (block_hash.clone(), contribution.daa_score as u64)
                                         }
                                     };

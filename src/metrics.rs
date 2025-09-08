@@ -1,4 +1,4 @@
-use prometheus::{CounterVec, Gauge, register_counter_vec, register_gauge, Encoder, TextEncoder};
+use prometheus::{CounterVec, Gauge, register_counter_vec, register_gauge, Counter, register_counter, Encoder, TextEncoder};
 use hyper::{Body, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
 use std::convert::Infallible;
@@ -94,6 +94,16 @@ lazy_static::lazy_static! {
         "Number of failed transaction submissions",
         &["address"]
     ).unwrap();
+
+    pub static ref SHARES_PURGED: Counter = register_counter!(
+        "shares_purged_total",
+        "Total number of shares purged from the database"
+    ).unwrap();
+
+    pub static ref BLOCKS_PURGED: Counter = register_counter!(
+        "blocks_purged_total",
+        "Total number of processed blocks purged from the database"
+    ).unwrap();
 }
 
 pub async fn start_metrics_server() {
@@ -109,11 +119,165 @@ pub async fn start_metrics_server() {
     }
 }
 
-async fn metrics_handler(_req: Request<Body>) -> Result<Response<Body>, Infallible> {
-    let encoder = TextEncoder::new();
-    let metric_families = prometheus::gather();
-    let mut buffer = vec![];
-    encoder.encode(&metric_families, &mut buffer).unwrap();
+async fn metrics_handler(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+    let path = req.uri().path();
 
-    Ok(Response::new(Body::from(buffer)))
+    if path == "/metrics" {
+        // Serve raw Prometheus metrics for scraping
+        let encoder = TextEncoder::new();
+        let metric_families = prometheus::gather();
+        let mut buffer = vec![];
+        encoder.encode(&metric_families, &mut buffer).unwrap();
+        Ok(Response::builder()
+            .header("Content-Type", "text/plain; version=0.0.4")
+            .body(Body::from(buffer))
+            .unwrap())
+    } else {
+        // Serve styled HTML page for browser visits
+        let metric_families = prometheus::gather();
+        let html = generate_metrics_html(&metric_families);
+        Ok(Response::builder()
+            .header("Content-Type", "text/html")
+            .body(Body::from(html))
+            .unwrap())
+    }
+}
+
+fn generate_metrics_html(metric_families: &[prometheus::proto::MetricFamily]) -> String {
+    let mut html = String::from(
+        r#"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mining Pool Metrics</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f4f4f9;
+            color: #333;
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            background-color: #fff;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #ddd;
+        }
+        th {
+            background-color: #3498db;
+            color: white;
+        }
+        tr:hover {
+            background-color: #f1f1f1;
+        }
+        .metric-name {
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .metric-help {
+            font-style: italic;
+            color: #7f8c8d;
+        }
+        .metric-labels {
+            font-size: 0.9em;
+            color: #34495e;
+        }
+        footer {
+            text-align: center;
+            margin-top: 20px;
+            color: #7f8c8d;
+        }
+        a {
+            color: #3498db;
+            text-decoration: none;
+        }
+        a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Mining Pool Metrics</h1>
+        <table>
+            <tr>
+                <th>Metric Name</th>
+                <th>Description</th>
+                <th>Labels</th>
+                <th>Value</th>
+                <th>Type</th>
+            </tr>
+"#,
+    );
+
+    for family in metric_families {
+        let name = family.get_name();
+        let help = family.get_help();
+        // Convert MetricType to string manually
+        let metric_type = match family.get_field_type() {
+            prometheus::proto::MetricType::COUNTER => "Counter",
+            prometheus::proto::MetricType::GAUGE => "Gauge",
+            prometheus::proto::MetricType::HISTOGRAM => "Histogram",
+            prometheus::proto::MetricType::SUMMARY => "Summary",
+            _ => "Unknown",
+        };
+
+        for metric in family.get_metric() {
+            let labels = metric
+                .get_label()
+                .iter()
+                .map(|l| format!("{}=\"{}\"", l.get_name(), l.get_value()))
+                .collect::<Vec<String>>()
+                .join(", ");
+            let value = match family.get_field_type() {
+                prometheus::proto::MetricType::COUNTER => metric.get_counter().get_value(),
+                prometheus::proto::MetricType::GAUGE => metric.get_gauge().get_value(),
+                _ => 0.0, // Handle other types if needed
+            };
+
+            html.push_str(&format!(
+                r#"
+                <tr>
+                    <td class="metric-name">{}</td>
+                    <td class="metric-help">{}</td>
+                    <td class="metric-labels">{}</td>
+                    <td>{:.2}</td>
+                    <td>{}</td>
+                </tr>
+                "#,
+                name, help, labels, value, metric_type
+            ));
+        }
+    }
+
+    html.push_str(
+        r#"
+        </table>
+        <footer>
+            <p>Visit <a href="/metrics">/metrics</a> for raw Prometheus metrics.</p>
+        </footer>
+    </div>
+</body>
+</html>
+"#,
+    );
+
+    html
 }

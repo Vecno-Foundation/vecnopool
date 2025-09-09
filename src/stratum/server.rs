@@ -1,3 +1,5 @@
+//src/stratum/server.rs
+
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
@@ -10,7 +12,6 @@ use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
 use crate::treasury::sharehandler::Sharehandler;
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use crate::database::db::Db;
-use dashmap::DashMap;
 
 pub struct Stratum {
     pub last_template: Arc<tokio::sync::RwLock<Option<RpcBlock>>>,
@@ -32,7 +33,7 @@ impl Stratum {
         let last_template = Arc::new(tokio::sync::RwLock::new(None));
         let jobs = Arc::new(Jobs::new(handle));
         let (pending, _) = mpsc::unbounded_channel();
-        let (send, recv) = watch::channel(None); // Keep the receiver for spawning tasks
+        let (send, recv) = watch::channel(None);
         let (payout_notify, _) = broadcast::channel(100);
         let db = Arc::new(Db::new(std::path::Path::new("pool.db")).await?);
         let share_handler = Arc::new(Sharehandler::new(db, 100, 30_000, pool_address.to_string()).await?);
@@ -65,7 +66,7 @@ impl Stratum {
                         let (pending_send_inner, pending_recv) = mpsc::unbounded_channel();
                         let mining_addr = pool_address_clone.clone();
                         let client = reqwest::Client::new();
-                        let recv_clone = recv.clone(); // Clone the receiver for each connection
+                        let recv_clone = recv.clone();
                         tokio::spawn(async move {
                             let (reader, writer) = stream.split();
                             let mut conn = StratumConn {
@@ -89,7 +90,6 @@ impl Stratum {
                                 duplicate_share_count: 0,
                                 payout_notify_recv,
                                 is_gpu_miner: false,
-                                submitted_nonces: Arc::new(DashMap::new()), // Initialize submitted_nonces
                             };
                             debug!("Initialized StratumConn for worker {:?}", addr);
                             if let Err(e) = conn.run().await {

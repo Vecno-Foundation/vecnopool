@@ -1,4 +1,4 @@
-//src/main.rs
+// src/main.rs
 
 use anyhow::{Context, Result};
 use log::{debug, info, LevelFilter};
@@ -81,30 +81,15 @@ async fn main() -> Result<()> {
 
     let (client, mut msgs) = Client::new(&rpc_url, &pool_address, &extra_data, handle, recv_cmd);
 
-    // Start periodic template request task
-    tokio::spawn({
-        let client = client.clone();
-        async move {
-            let mut interval = time::interval(Duration::from_millis(1000));
-            loop {
-                interval.tick().await;
-                if !client.request_template() {
-                    warn!("Failed to request template: channel closed");
-                    break;
-                }
-            }
-        }
-    });
-
     while let Some(msg) = msgs.recv().await {
         match msg {
             Message::Info { version, .. } => {
                 info!("Connected to Vecnod {version}");
             }
             Message::NewTemplate => {
-                debug!("Requesting new template");
+                debug!("New block template available, requesting new template");
                 if !client.request_template() {
-                    debug!("Channel closed");
+                    warn!("Failed to request template: channel closed");
                     break;
                 }
             }

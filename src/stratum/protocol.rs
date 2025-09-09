@@ -1,3 +1,5 @@
+//src/stratum/protocol.rs
+
 use anyhow::Result;
 use log::{debug, info};
 use serde::Serialize;
@@ -7,8 +9,6 @@ use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
 use hex;
 use std::sync::Arc;
-use std::collections::HashSet;
-use dashmap::DashMap;
 use crate::stratum::{Id, Request, Response};
 use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
 use crate::treasury::sharehandler::{Contribution, Sharehandler};
@@ -42,7 +42,6 @@ pub struct StratumConn<'a> {
     pub duplicate_share_count: u64,
     pub payout_notify_recv: broadcast::Receiver<PayoutNotification>,
     pub is_gpu_miner: bool,
-    pub submitted_nonces: Arc<DashMap<String, HashSet<String>>>, // job_id -> set of nonces
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,7 +88,6 @@ impl<'a> StratumConn<'a> {
             duplicate_share_count: 0,
             payout_notify_recv,
             is_gpu_miner: false,
-            submitted_nonces: Arc::new(DashMap::new()),
         }
     }
 
@@ -108,7 +106,6 @@ impl<'a> StratumConn<'a> {
         debug!("Base difficulty for job: {}", base_difficulty);
         self.write_request("mining.notify", Some(params)).await?;
 
-        // Get dynamic difficulty based on share rate
         let address = self.payout_addr.as_ref().unwrap_or(&String::new()).clone();
         if !address.is_empty() && self.authorized {
             let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(&address, base_difficulty, self.is_gpu_miner).await;
@@ -116,8 +113,8 @@ impl<'a> StratumConn<'a> {
             if self.difficulty != adjusted_difficulty {
                 self.difficulty = adjusted_difficulty;
                 info!(
-                    "Sending difficulty {} (raw: {}) to worker: {:?} (is_gpu_miner: {})",
-                    difficulty_f64, adjusted_difficulty, self.payout_addr, self.is_gpu_miner
+                    "Sending difficulty {} (raw: {}) to worker: {} (is_gpu_miner: {})",
+                    difficulty_f64, adjusted_difficulty, address, self.is_gpu_miner
                 );
                 self.write_request("mining.set_difficulty", Some(json!([difficulty_f64])))
                     .await?;
@@ -234,7 +231,6 @@ impl<'a> StratumConn<'a> {
                                     "set_extranonce",
                                     Some(json!([self.extranonce, 6u64])),
                                 ).await?;
-                                // Do not send difficulty here; wait for authorize
                             }
                             (Some(id), "mining.authorize", Some(p)) => {
                                 let params: Vec<String> = serde_json::from_value(p)?;
@@ -244,7 +240,6 @@ impl<'a> StratumConn<'a> {
                                 }
                                 self.payout_addr = Some(params[0].clone());
                                 self.authorized = true;
-                                // Send initial difficulty after authorize
                                 let address = self.payout_addr.as_ref().unwrap();
                                 let base_difficulty = self.recv.borrow().as_ref().map_or(58000, |j| j.difficulty());
                                 let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(address, base_difficulty, self.is_gpu_miner).await;
@@ -341,30 +336,6 @@ impl<'a> StratumConn<'a> {
                                     }
                                 };
 
-                                // Check for duplicate nonce
-                                let nonce_hex = format!("{:016x}", nonce);
-                                let job_id_str = job_id.to_string();
-                                let is_duplicate = if let Some(mut nonces) = self.submitted_nonces.get_mut(&job_id_str) {
-                                    !nonces.insert(nonce_hex.clone())
-                                } else {
-                                    self.submitted_nonces.insert(job_id_str.clone(), HashSet::new());
-                                    if let Some(mut nonces) = self.submitted_nonces.get_mut(&job_id_str) {
-                                        nonces.insert(nonce_hex.clone())
-                                    } else {
-                                        false // Should not happen
-                                    }
-                                };
-                                if is_duplicate {
-                                    self.duplicate_share_count += 1;
-                                    MINER_DUPLICATED_SHARES.with_label_values(&[&address]).inc();
-                                    self.write_error_response(i, 22, "Duplicate nonce submitted".into()).await?;
-                                    info!("Rejected duplicate share: job_id={}, nonce={}, worker={}", job_id, nonce_hex, address);
-                                    if self.duplicate_share_count > 100 {
-                                        return Err(anyhow::anyhow!("Excessive duplicate shares from {}", address));
-                                    }
-                                    continue;
-                                }
-
                                 let template = match self.jobs.get_job(job_id).await {
                                     Some(b) => b,
                                     None => {
@@ -375,9 +346,17 @@ impl<'a> StratumConn<'a> {
                                     }
                                 };
 
+                                let block_hash = {
+                                    let mut header = template.header.clone().unwrap();
+                                    header.nonce = nonce;
+                                    let pow_hash = header.hash(false)?;
+                                    hex::encode(pow_hash.as_bytes())
+                                };
+
+                                let nonce_hex = format!("{:016x}", nonce);
                                 let contribution = Contribution {
                                     address: address.clone(),
-                                    difficulty: 1, // Normalize share difficulty to 1
+                                    difficulty: 1,
                                     timestamp: std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .expect("Time went backwards")
@@ -389,16 +368,17 @@ impl<'a> StratumConn<'a> {
                                         .map(|h| h.daa_score as i64)
                                         .unwrap_or(0),
                                     extranonce: self.extranonce.clone(),
-                                    nonce: nonce_hex,
+                                    nonce: nonce_hex.clone(),
+                                    reward_block_hash: Some(block_hash.clone()),
                                 };
 
-                                if !validate_share(&contribution, &self.jobs, self.share_handler.db.clone(), &self.extranonce, &contribution.nonce).await? {
+                                if !validate_share(&contribution, &self.jobs, self.share_handler.db.clone(), &nonce_hex).await? {
                                     self.duplicate_share_count += 1;
                                     MINER_DUPLICATED_SHARES.with_label_values(&[&address]).inc();
                                     self.write_error_response(i, 22, "Invalid or duplicate share".into()).await?;
                                     debug!(
-                                        "Share rejected: job_id={}, extranonce={}, nonce={} for worker={}",
-                                        job_id, self.extranonce, contribution.nonce, address
+                                        "Share rejected: job_id={}, block_hash={}, nonce={} for worker={}",
+                                        job_id, block_hash, nonce_hex, address
                                     );
                                     if self.duplicate_share_count > 100 {
                                         info!(
@@ -435,13 +415,6 @@ impl<'a> StratumConn<'a> {
                                     continue;
                                 }
 
-                                let block_hash = {
-                                    let mut header = template.header.clone().unwrap();
-                                    header.nonce = nonce;
-                                    let pow_hash = header.hash(false)?;
-                                    hex::encode(pow_hash.as_bytes())
-                                };
-
                                 debug!("Submitting share to jobs: job_id={}, nonce={:016x}, block_hash={}", job_id, nonce, block_hash);
                                 if self.jobs.submit(i.clone(), job_id, nonce, self.pending_send.clone()).await {
                                     MINER_ADDED_SHARES.with_label_values(&[&address]).inc();
@@ -450,7 +423,7 @@ impl<'a> StratumConn<'a> {
                                         info!("Failed to record share for worker={}: {:?}", address, e);
                                     }
 
-                                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
                                     let (_reward_block_hash, _daa_score) = match fetch_block_details(
                                         self.share_handler.db.clone(),
@@ -495,8 +468,6 @@ impl<'a> StratumConn<'a> {
                 },
             }
         }
-        // Clear submitted_nonces on connection close
-        self.submitted_nonces.clear();
         Ok(())
     }
 }

@@ -43,7 +43,8 @@ impl Db {
                 daa_score INTEGER NOT NULL,
                 extranonce TEXT NOT NULL,
                 nonce TEXT NOT NULL,
-                UNIQUE(job_id, address, extranonce, nonce)
+                reward_block_hash TEXT,
+                UNIQUE(reward_block_hash, nonce)
             )"
         )
         .execute(&pool)
@@ -109,9 +110,10 @@ impl Db {
         extranonce: &str,
         nonce: &str,
     ) -> Result<()> {
+        // Since reward_block_hash is not provided here, we insert NULL for it
         let result = sqlx::query(
-            "INSERT INTO shares (address, difficulty, timestamp, job_id, daa_score, extranonce, nonce)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO shares (address, difficulty, timestamp, job_id, daa_score, extranonce, nonce, reward_block_hash)
+             VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
         )
         .bind(address)
         .bind(difficulty)
@@ -400,29 +402,27 @@ impl Db {
         }
     }
 
-    pub async fn check_duplicate_share(&self, job_id: &str, address: &str, extranonce: &str, nonce: &str) -> Result<i64> {
+    pub async fn check_duplicate_share_by_hash(&self, reward_block_hash: &str, nonce: &str) -> Result<i64> {
         let result = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM shares WHERE job_id = ? AND address = ? AND extranonce = ? AND nonce = ?"
+            "SELECT COUNT(*) FROM shares WHERE reward_block_hash = ? AND nonce = ?"
         )
-        .bind(job_id)
-        .bind(address)
-        .bind(extranonce)
+        .bind(reward_block_hash)
         .bind(nonce)
         .fetch_one(&self.pool)
         .await
-        .context("Failed to check for duplicate share");
+        .context("Failed to check for duplicate share by hash");
         match result {
             Ok(count) => {
                 if count > 0 {
                     debug!(
-                        "Duplicate share found for job_id={job_id}, address={address}, extranonce={extranonce}, nonce={nonce}"
+                        "Duplicate share found for reward_block_hash={reward_block_hash}, nonce={nonce}"
                     );
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["check_duplicate_share"]).inc();
+                DB_QUERIES_SUCCESS.with_label_values(&["check_duplicate_share_by_hash"]).inc();
                 Ok(count)
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["check_duplicate_share"]).inc();
+                DB_QUERIES_FAILED.with_label_values(&["check_duplicate_share_by_hash"]).inc();
                 Err(e)
             }
         }

@@ -1,3 +1,5 @@
+//src/treasury/sharehandler.rs
+
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,7 @@ pub struct Contribution {
     pub daa_score: i64,
     pub extranonce: String,
     pub nonce: String,
+    pub reward_block_hash: Option<String>,
 }
 
 #[derive(Debug)]
@@ -159,7 +162,7 @@ impl Sharehandler {
             }
             if let Err(e) = db.record_share(
                 &share.address,
-                1,
+                share.difficulty,
                 share.timestamp as u64,
                 &share.job_id,
                 share.daa_score as u64,
@@ -283,7 +286,7 @@ impl Sharehandler {
 
         if let Err(e) = self.db.record_share(
             &contribution.address,
-            1,
+            contribution.difficulty,
             contribution.timestamp as u64,
             &contribution.job_id,
             contribution.daa_score as u64,
@@ -322,15 +325,13 @@ impl Sharehandler {
     }
 
     pub async fn get_dynamic_difficulty(&self, address: &str, base_difficulty: u64, is_gpu_miner: bool) -> u64 {
-        const ADJUSTMENT_FACTOR: f64 = 0.1; // 50% adjustment per update
-        const MAX_SHARE_RATE: f64 = 5.0; // Adjust if above 5.0 shares/s
-        const MIN_SHARE_RATE: f64 = 1.0; // Adjust if below 1.0 shares/s
-        const DIFFICULTY_CHECK_INTERVAL_MS: u64 = 10_000; // Check every 30s
+        const ADJUSTMENT_FACTOR: f64 = 0.1;
+        const MAX_SHARE_RATE: f64 = 5.0;
+        const MIN_SHARE_RATE: f64 = 1.0;
+        const DIFFICULTY_CHECK_INTERVAL_MS: u64 = 10_000;
 
-        // Use network difficulty from node as base_difficulty
         let mut target_difficulty = base_difficulty;
 
-        // Check for network difficulty changes
         let current_time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
@@ -360,7 +361,6 @@ impl Sharehandler {
             }
         }
 
-        // Adjust based on share rate
         let share_rates = self.worker_share_rates
             .get(address)
             .map(|entry| entry.clone())

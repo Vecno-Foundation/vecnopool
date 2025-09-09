@@ -10,8 +10,8 @@ use rpc_client::RpcClient;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
-use log::info;
 use http::Uri;
+use std::convert::TryFrom;
 
 pub type Send<T> = mpsc::UnboundedSender<T>;
 type Recv<T> = mpsc::UnboundedReceiver<T>;
@@ -24,20 +24,17 @@ pub struct VecnodHandle {
 impl VecnodHandle {
     pub fn new() -> (Self, Recv<Payload>) {
         let (send, recv) = mpsc::unbounded_channel();
-        (VecnodHandle {
-            send,
-        }, recv)
+        (VecnodHandle { send }, recv)
     }
 
     pub fn submit_block(&self, block: RpcBlock) {
         let _ = self.send.send(Payload::submit_block(block, false));
     }
-
 }
 
 #[derive(Debug)]
 pub enum Message {
-    Info { version: String, _synced: bool },
+    Info { version: String },
     Template(RpcBlock),
     NewTemplate,
     SubmitBlockResult(Option<Box<str>>),
@@ -47,11 +44,10 @@ struct ClientTask {
     url: String,
     send_msg: Send<Message>,
     recv_cmd: Recv<Payload>,
-    synced: bool,
 }
 
 impl ClientTask {
-    async fn run(mut self) -> Result<()> {
+    async fn run(self) -> Result<()> {
         // Convert String to Uri
         let uri: Uri = self.url.parse().map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
         let mut client = RpcClient::connect(uri).await?;
@@ -65,21 +61,15 @@ impl ClientTask {
 
         while let Some(VecnodMessage { payload }) = stream.message().await? {
             let msg = match payload {
-                Some(Payload::GetInfoResponse(info)) => {
-                    self.synced = info.is_synced;
-                    if !self.synced {
-                        warn!("Not yet synced");
-                    }
-                    Message::Info {
-                        version: info.server_version,
-                        _synced: info.is_synced,
-                    }
-                }
+                Some(Payload::GetInfoResponse(info)) => Message::Info {
+                    version: info.server_version,
+                },
                 Some(Payload::SubmitBlockResponse(res)) => {
-                    let res = match (RejectReason::from_i32(res.reject_reason), res.error) {
-                        (Some(RejectReason::None), None) => None,
-                        (_, Some(e)) => Some(e.message.into_boxed_str()),
-                        _ => Some("Unknown error".into()),
+                    let res = match (RejectReason::try_from(res.reject_reason), res.error) {
+                        (Ok(RejectReason::None), None) => None,
+                        (Ok(_), Some(e)) => Some(e.message.into_boxed_str()),
+                        (Err(_), Some(e)) => Some(e.message.into_boxed_str()),
+                        _ => Some(Box::from("Unknown error")),
                     };
                     Message::SubmitBlockResult(res)
                 }
@@ -89,10 +79,6 @@ impl ClientTask {
                         continue;
                     }
                     if let Some(block) = res.block {
-                        if !self.synced && res.is_synced {
-                            info!("Node synced");
-                        }
-                        self.synced = res.is_synced;
                         if block.header.is_none() {
                             warn!("Template block is missing a header");
                             continue;
@@ -157,7 +143,6 @@ impl Client {
             url,
             send_msg,
             recv_cmd,
-            synced: false,
         };
 
         tokio::spawn(async move {
@@ -194,7 +179,7 @@ mod proto {
     use crate::pow;
     use crate::uint::U256;
     use anyhow::Result;
-    use blake3::Hash;
+    use blake3::Hash as Blake3Hash;
     use blake3::Hasher as Blake3State;
     use vecnod_message::Payload;
 
@@ -222,7 +207,7 @@ mod proto {
         }
 
         pub fn notify_new_block_template() -> Self {
-            Payload::NotifyNewBlockTemplateRequest(super::NotifyNewBlockTemplateRequestMessage {})
+            Payload::NotifyNewBlockTemplateRequest(NotifyNewBlockTemplateRequestMessage {})
         }
     }
 
@@ -241,7 +226,7 @@ mod proto {
             Ok(out.into())
         }
 
-        pub fn hash(&self, pre_pow: bool) -> Result<Hash> {
+        pub fn hash(&self, pre_pow: bool) -> Result<Blake3Hash> {
             let mut state = Blake3State::new_keyed(BLOCK_HASH_DOMAIN);
 
             let version = self.version as u16;

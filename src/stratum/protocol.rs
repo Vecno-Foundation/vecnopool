@@ -1,4 +1,4 @@
-//src/stratum/protocol.rs
+// src/stratum/protocol.rs
 
 use anyhow::Result;
 use log::{debug, info};
@@ -53,44 +53,6 @@ pub struct PayoutNotification {
 }
 
 impl<'a> StratumConn<'a> {
-    pub async fn new(
-        reader: Lines<BufReader<ReadHalf<'a>>>,
-        writer: WriteHalf<'a>,
-        recv: watch::Receiver<Option<JobParams>>,
-        jobs: Arc<Jobs>,
-        pending_send: mpsc::UnboundedSender<PendingResult>,
-        pending_recv: mpsc::UnboundedReceiver<PendingResult>,
-        worker: [u8; 2],
-        share_handler: Arc<Sharehandler>,
-        last_template: Arc<RwLock<Option<RpcBlock>>>,
-        mining_addr: String,
-        client: reqwest::Client,
-        payout_notify_recv: broadcast::Receiver<PayoutNotification>,
-    ) -> Self {
-        StratumConn {
-            reader,
-            writer,
-            recv,
-            jobs,
-            pending_send,
-            pending_recv,
-            worker,
-            id: 0,
-            subscribed: false,
-            difficulty: 0,
-            authorized: false,
-            payout_addr: None,
-            share_handler,
-            last_template,
-            extranonce: String::new(),
-            mining_addr,
-            client,
-            duplicate_share_count: 0,
-            payout_notify_recv,
-            is_gpu_miner: false,
-        }
-    }
-
     pub async fn write_template(&mut self) -> Result<()> {
         debug!("Sending template to worker: {:?}", self.payout_addr);
         let (base_difficulty, params) = {
@@ -196,12 +158,8 @@ impl<'a> StratumConn<'a> {
                         }
                     }
                 },
-                item = self.pending_recv.recv() => {
-                    let res = item.expect("channel is always open").into_response()?;
-                    self.write(&res).await?;
-                },
-                payout = self.payout_notify_recv.recv() => {
-                    match payout {
+                item = self.payout_notify_recv.recv() => {
+                    match item {
                         Ok(payout) => {
                             self.send_payout_notification(payout).await?;
                         }
@@ -214,6 +172,10 @@ impl<'a> StratumConn<'a> {
                             break;
                         }
                     }
+                },
+                item = self.pending_recv.recv() => {
+                    let res = item.expect("channel is always open").into_response()?;
+                    self.write(&res).await?;
                 },
                 res = read(&mut self.reader) => match res {
                     Ok(Some(msg)) => {

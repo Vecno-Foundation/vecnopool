@@ -89,7 +89,6 @@ impl Stratum {
                                 client,
                                 duplicate_share_count: 0,
                                 payout_notify_recv,
-                                is_gpu_miner: false,
                             };
                             debug!("Initialized StratumConn for worker {:?}", addr);
                             if let Err(e) = conn.run().await {

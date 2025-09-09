@@ -41,7 +41,6 @@ pub struct StratumConn<'a> {
     pub client: reqwest::Client,
     pub duplicate_share_count: u64,
     pub payout_notify_recv: broadcast::Receiver<PayoutNotification>,
-    pub is_gpu_miner: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,13 +69,13 @@ impl<'a> StratumConn<'a> {
 
         let address = self.payout_addr.as_ref().unwrap_or(&String::new()).clone();
         if !address.is_empty() && self.authorized {
-            let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(&address, base_difficulty, self.is_gpu_miner).await;
+            let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(&address, base_difficulty).await;
             let difficulty_f64 = (adjusted_difficulty as f64) / ((1u64 << 32) as f64);
             if self.difficulty != adjusted_difficulty {
                 self.difficulty = adjusted_difficulty;
                 info!(
-                    "Sending difficulty {} (raw: {}) to worker: {} (is_gpu_miner: {})",
-                    difficulty_f64, adjusted_difficulty, address, self.is_gpu_miner
+                    "Sending difficulty {} (raw: {}) to worker: {}",
+                    difficulty_f64, adjusted_difficulty, address
                 );
                 self.write_request("mining.set_difficulty", Some(json!([difficulty_f64])))
                     .await?;
@@ -181,13 +180,10 @@ impl<'a> StratumConn<'a> {
                     Ok(Some(msg)) => {
                         debug!("Processing message: method={} for worker: {:?}", msg.method, self.payout_addr);
                         match (msg.id, &*msg.method, msg.params) {
-                            (Some(id), "mining.subscribe", Some(p)) => {
+                            (Some(id), "mining.subscribe", Some(_p)) => {
                                 debug!("Worker subscribed: {:?}", self.payout_addr);
                                 self.subscribed = true;
                                 self.extranonce = hex::encode(&self.worker);
-                                let params: Vec<String> = serde_json::from_value(p)?;
-                                self.is_gpu_miner = params.get(1).map_or(false, |agent| agent.to_lowercase().contains("gpu"));
-                                info!("Miner type detected: is_gpu_miner={} for worker {:?}", self.is_gpu_miner, self.payout_addr);
                                 self.write_response(id, Some(true)).await?;
                                 self.write_request(
                                     "set_extranonce",
@@ -203,13 +199,13 @@ impl<'a> StratumConn<'a> {
                                 self.payout_addr = Some(params[0].clone());
                                 self.authorized = true;
                                 let address = self.payout_addr.as_ref().unwrap();
-                                let base_difficulty = self.recv.borrow().as_ref().map_or(58000, |j| j.difficulty());
-                                let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(address, base_difficulty, self.is_gpu_miner).await;
+                                let base_difficulty = self.recv.borrow().as_ref().map_or(0, |j| j.difficulty());
+                                let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(address, base_difficulty).await;
                                 self.difficulty = adjusted_difficulty;
                                 let difficulty_f64 = (adjusted_difficulty as f64) / ((1u64 << 32) as f64);
                                 info!(
-                                    "Sending initial difficulty {} (raw: {}) to worker: {} (is_gpu_miner: {})",
-                                    difficulty_f64, adjusted_difficulty, address, self.is_gpu_miner
+                                    "Sending initial difficulty {} (raw: {}) to worker: {}",
+                                    difficulty_f64, adjusted_difficulty, address
                                 );
                                 self.write_request("mining.set_difficulty", Some(json!([difficulty_f64])))
                                     .await?;

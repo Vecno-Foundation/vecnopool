@@ -324,7 +324,7 @@ impl Sharehandler {
         Ok((total_submissions, window_submissions))
     }
 
-    pub async fn get_dynamic_difficulty(&self, address: &str, base_difficulty: u64, is_gpu_miner: bool) -> u64 {
+    pub async fn get_dynamic_difficulty(&self, address: &str, base_difficulty: u64) -> u64 {
         const ADJUSTMENT_FACTOR: f64 = 0.1;
         const MAX_SHARE_RATE: f64 = 5.0;
         const MIN_SHARE_RATE: f64 = 1.0;
@@ -377,21 +377,11 @@ impl Sharehandler {
             debug!("Decreasing difficulty for {}: share_rate={:.2} shares/s, new_difficulty={}", address, share_rate, target_difficulty);
         }
 
-        let adjusted_difficulty = if is_gpu_miner {
-            target_difficulty * 10
-        } else {
-            target_difficulty
-        };
-        let network_min_difficulty = if is_gpu_miner {
-            base_difficulty * 10
-        } else {
-            base_difficulty
-        };
-        let final_difficulty = adjusted_difficulty.max(network_min_difficulty);
+        let final_difficulty = target_difficulty;
 
         debug!(
-            "Dynamic difficulty for {}: base_difficulty={}, is_gpu_miner={}, share_rate={:.2}, final_difficulty={}",
-            address, base_difficulty, is_gpu_miner, share_rate, final_difficulty
+            "Dynamic difficulty for {}: base_difficulty={}, share_rate={:.2}, final_difficulty={}",
+            address, base_difficulty, share_rate, final_difficulty
         );
         final_difficulty
     }

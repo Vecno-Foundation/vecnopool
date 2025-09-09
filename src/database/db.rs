@@ -32,7 +32,9 @@ impl Db {
         let options = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true);
-        let pool = SqlitePool::connect_with(options).await?;
+        let pool = SqlitePool::connect_with(options)
+            .await
+            .context("Failed to connect to SQLite database")?;
 
         debug!("Initializing database tables");
         sqlx::query(
@@ -98,6 +100,18 @@ impl Db {
         .context("Failed to create blocks table")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_blocks_table"]).inc();
 
+        // Verify schema integrity
+        let tables: Vec<(String,)> = sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table'")
+            .fetch_all(&pool)
+            .await
+            .context("Failed to verify database schema")?;
+        let expected_tables = vec!["shares", "balances", "payments", "blocks"];
+        for table in expected_tables {
+            if !tables.iter().any(|(name,)| name == table) {
+                return Err(anyhow::anyhow!("Database schema missing table: {}", table));
+            }
+        }
+
         debug!("Database initialized successfully");
         Ok(Db { pool })
     }
@@ -112,7 +126,6 @@ impl Db {
         extranonce: &str,
         nonce: &str,
     ) -> Result<()> {
-        // Since reward_block_hash is not provided here, we insert NULL for it
         let result = sqlx::query(
             "INSERT INTO shares (address, difficulty, timestamp, job_id, daa_score, extranonce, nonce, reward_block_hash)
              VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
@@ -148,7 +161,7 @@ impl Db {
 
     pub async fn load_recent_shares(&self, share_window: &mut VecDeque<Contribution>, n: usize) -> Result<u64> {
         let result = sqlx::query_as::<_, Contribution>(
-            "SELECT address, difficulty, timestamp, job_id, daa_score, extranonce, nonce
+            "SELECT address, difficulty, timestamp, job_id, daa_score, extranonce, nonce, reward_block_hash
              FROM shares
              ORDER BY timestamp DESC
              LIMIT ?"
@@ -313,11 +326,11 @@ impl Db {
         daa_score: u64,
         pool_wallet: &str,
         _amount: u64,
+        pool_fee: f64,
     ) -> Result<()> {
         let mut amount = get_block_reward(daa_score)
             .context(format!("Failed to calculate block reward for daa_score {}", daa_score))?;
-        let pool_fee: f64 = 2.0 / 100.0;
-        amount = ((amount as f64) * (1.0 - pool_fee)) as u64;
+        amount = ((amount as f64) * (1.0 - pool_fee / 100.0)) as u64;
 
         let result = sqlx::query(
             "INSERT OR REPLACE INTO blocks (reward_block_hash, miner_id, daa_score, pool_wallet, amount, confirmations, processed)
@@ -345,7 +358,7 @@ impl Db {
 
     pub async fn get_unconfirmed_blocks(&self) -> Result<Vec<BlockDetails>> {
         let result = sqlx::query_as::<_, BlockDetails>(
-            "SELECT miner_id, reward_block_hash, daa_score, pool_wallet, amount, confirmations
+            "SELECT miner_id, reward_block_hash, daa_score, amount, confirmations
              FROM blocks WHERE confirmations < 100 AND processed = 0"
         )
         .fetch_all(&self.pool)

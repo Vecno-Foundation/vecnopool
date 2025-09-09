@@ -44,8 +44,9 @@ pub async fn fetch_block_details(
     client: &reqwest::Client,
     block_hash: &str,
     mining_addr: &str,
+    pool_fee: f64,
 ) -> Result<(String, u64)> {
-    debug!("Fetching block details for hash {block_hash}", block_hash = block_hash);
+    debug!("Fetching block details for hash {}, pool fee: {}%", block_hash, pool_fee);
 
     // Check database first
     let result = sqlx::query_as::<_, (String, i64)>(
@@ -110,7 +111,7 @@ pub async fn fetch_block_details(
         })?;
 
     // Store in database
-    db.add_block_details(block_hash, "pool", block_hash, "", daa_score, mining_addr, 0)
+    db.add_block_details(block_hash, "pool", block_hash, "", daa_score, mining_addr, 0, pool_fee)
         .await
         .context("Failed to store block details in database")?;
 

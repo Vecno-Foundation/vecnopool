@@ -37,10 +37,11 @@ pub struct Sharehandler {
     pub worker_log_times: Arc<DashMap<String, Arc<AtomicU64>>>,
     pub worker_share_rates: Arc<DashMap<String, Arc<RwLock<VecDeque<(u64, u64)>>>>>,
     pub worker_last_difficulty_check: Arc<DashMap<String, Arc<AtomicU64>>>,
+    pub pool_fee: f64, // Store pool_fee
 }
 
 impl Sharehandler {
-    pub async fn new(db: Arc<Db>, n_window: usize, window_time_ms: u64, _mining_addr: String) -> Result<Self> {
+    pub async fn new(db: Arc<Db>, n_window: usize, window_time_ms: u64, _mining_addr: String, pool_fee: f64) -> Result<Self> {
         let mut share_window = VecDeque::new();
         let total_shares = db.load_recent_shares(&mut share_window, n_window)
             .await
@@ -59,7 +60,7 @@ impl Sharehandler {
             }
         }
 
-        debug!("Initialized sharehandler: n_window={n_window}, window_time_ms={window_time_ms}");
+        debug!("Initialized sharehandler: n_window={n_window}, window_time_ms={window_time_ms}, pool_fee={pool_fee}");
 
         let db_clone = db.clone();
         let share_window_clone = share_window.clone();
@@ -139,6 +140,7 @@ impl Sharehandler {
             worker_log_times,
             worker_share_rates,
             worker_last_difficulty_check,
+            pool_fee,
         })
     }
 
@@ -398,7 +400,6 @@ impl Sharehandler {
             .context("Failed to get unconfirmed blocks")?;
 
         let mut pending_balance = 0;
-        let pool_fee_percent = 2.0;
 
         for block in unconfirmed_blocks {
             let share_counts = self.db.get_shares_in_window(block.daa_score as u64, 1000).await
@@ -410,8 +411,8 @@ impl Sharehandler {
 
             let miner_shares = share_counts.get(address).map(|entry| *entry.value()).unwrap_or(0);
             let share_percentage = miner_shares as f64 / total_shares as f64;
-            let block_amount = block.amount as u64;
-            let miner_reward = ((block_amount as f64) * (1.0 - pool_fee_percent / 100.0) * share_percentage) as u64;
+            let block_amount = block.amount as u64; // Fee already deducted
+            let miner_reward = ((block_amount as f64) * share_percentage) as u64;
             pending_balance += miner_reward;
         }
 

@@ -383,11 +383,14 @@ impl<'a> StratumConn<'a> {
 
                                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+                                    let pool_fee = self.share_handler.pool_fee; // Use pool_fee from share_handler
+                                    info!("Using pool fee {}% for block {}", pool_fee, block_hash);
                                     let (_reward_block_hash, _daa_score) = match fetch_block_details(
                                         self.share_handler.db.clone(),
                                         &self.client,
                                         &block_hash,
                                         &self.mining_addr,
+                                        pool_fee,
                                     ).await {
                                         Ok(result) => result,
                                         Err(_e) => {

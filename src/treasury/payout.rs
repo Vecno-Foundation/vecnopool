@@ -9,17 +9,15 @@ use log::{debug, warn, info, error};
 use std::env;
 use std::sync::Arc;
 use sqlx::Row;
-use crate::metrics::{DB_QUERIES_SUCCESS, DB_QUERIES_FAILED, TRANSACTION_CREATION_FAILED, REWARDS_DISTRIBUTED, BLOCK_REWARDS};
+use crate::metrics::{DB_QUERIES_SUCCESS, DB_QUERIES_FAILED, TRANSACTION_CREATION_FAILED, REWARDS_DISTRIBUTED};
 use crate::stratum::protocol::PayoutNotification;
-use tokio::sync::broadcast::Sender; // Changed to broadcast::Sender
+use tokio::sync::broadcast::Sender;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// Helper function to strip worker suffix (e.g., .worker1) from address
 fn strip_worker_suffix(address: &str) -> &str {
     address.split('.').next().unwrap_or(address)
 }
 
-// Struct to hold balance data with Debug implementation
 #[derive(Debug)]
 #[allow(dead_code)]
 struct Balance {
@@ -106,27 +104,24 @@ pub async fn check_confirmations(db: Arc<Db>, client: &Client) -> Result<()> {
                 continue;
             }
 
-            let amount = block.amount as u64;
-            let pool_fee_percent = 2.0;
-            let miner_reward = ((amount as f64) * (1.0 - pool_fee_percent / 100.0)) as u64;
-            let pool_fee = amount - miner_reward;
+            let amount = block.amount as u64; // Fee already deducted in add_block_details
 
             for entry in share_counts.iter() {
                 let address = entry.key();
                 let miner_shares = *entry.value();
                 let share_percentage = miner_shares as f64 / total_shares as f64;
-                let miner_reward_share = ((miner_reward as f64) * share_percentage) as u64;
+                let miner_reward = ((amount as f64) * share_percentage) as u64;
 
-                let result = db.add_balance(&block.miner_id, address, miner_reward_share).await
+                let result = db.add_balance(&block.miner_id, address, miner_reward).await
                     .context(format!("Failed to add balance for address {} in block {}", address, block.reward_block_hash));
                 
                 match result {
                     Ok(_) => {
                         DB_QUERIES_SUCCESS.with_label_values(&["add_balance"]).inc();
-                        REWARDS_DISTRIBUTED.with_label_values(&[address, &block.reward_block_hash]).inc_by(miner_reward_share as f64 / 100_000_000.0);
+                        REWARDS_DISTRIBUTED.with_label_values(&[address, &block.reward_block_hash]).inc_by(miner_reward as f64 / 100_000_000.0);
                         info!(
                             "Added reward to balance: amount={} VE, address={}, block_hash={}, confirmations={}",
-                            miner_reward_share as f64 / 100_000_000.0, address, block.reward_block_hash, confirmations
+                            miner_reward as f64 / 100_000_000.0, address, block.reward_block_hash, confirmations
                         );
                     }
                     Err(e) => {
@@ -135,23 +130,17 @@ pub async fn check_confirmations(db: Arc<Db>, client: &Client) -> Result<()> {
                     }
                 }
             }
-
-            if pool_fee > 0 {
-                let pool_address = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
-                BLOCK_REWARDS.with_label_values(&[&pool_address]).inc_by(pool_fee as f64 / 100_000_000.0);
-            }
         }
     }
 
     Ok(())
 }
 
-pub async fn process_payouts(db: Arc<Db>, client: &Client, payout_notify: Sender<PayoutNotification>) -> Result<()> {
+pub async fn process_payouts(db: Arc<Db>, client: &Client, payout_notify: Sender<PayoutNotification>, pool_fee: f64) -> Result<()> {
     let pool_address = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
     let wasm_url = env::var("WASM_URL").unwrap_or("http://localhost:8181".to_string());
-    debug!("Starting process_payouts with WASM_URL: {}", wasm_url);
+    debug!("Starting process_payouts with WASM_URL: {}, pool fee: {}%", wasm_url, pool_fee);
 
-    // Check available balances before calling /processPayouts
     let balances = sqlx::query("SELECT address, available_balance FROM balances WHERE available_balance >= 100000000")
         .fetch_all(&db.pool)
         .await
@@ -167,7 +156,6 @@ pub async fn process_payouts(db: Arc<Db>, client: &Client, payout_notify: Sender
         .context("Failed to parse balance rows")?;
     debug!("Available balances: {:?}", balances);
 
-    // Send POST request to /processPayouts
     debug!("Sending POST request to: {}/processPayouts", wasm_url);
     let response = client
         .post(&format!("{}/processPayouts", wasm_url))
@@ -225,10 +213,8 @@ pub async fn process_payouts(db: Arc<Db>, client: &Client, payout_notify: Sender
             continue;
         }
 
-        // Log payout since run_vecno.js already recorded it
         info!("Payout processed by run_vecno.js: amount={} VE, address={}, tx_id={}", amount as f64 / 100_000_000.0, address, tx_id);
 
-        // Send payout notification to miners
         let notification = PayoutNotification {
             address: address.to_string(),
             amount,
@@ -239,7 +225,6 @@ pub async fn process_payouts(db: Arc<Db>, client: &Client, payout_notify: Sender
             warn!("Failed to send payout notification for address={}: {:?}", address, e);
         }
 
-        // Verify payment exists
         let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM payments WHERE tx_id = ?")
             .bind(tx_id)
             .fetch_one(&db.pool)
@@ -264,7 +249,6 @@ pub async fn process_payouts(db: Arc<Db>, client: &Client, payout_notify: Sender
             debug!("Payment already recorded for tx_id: {}", tx_id);
         }
 
-        // Verify balance reset
         let balance = sqlx::query_scalar::<_, i64>("SELECT available_balance FROM balances WHERE address = ?")
             .bind(address)
             .fetch_one(&db.pool)

@@ -27,16 +27,17 @@ impl Stratum {
         handle: VecnodHandle,
         pool_address: &str,
         _network_id: &str,
+        pool_fee: f64,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        info!("Listening on {}", addr);
+        info!("Listening on {}, pool fee: {}%", addr, pool_fee);
         let last_template = Arc::new(tokio::sync::RwLock::new(None));
         let jobs = Arc::new(Jobs::new(handle));
         let (pending, _) = mpsc::unbounded_channel();
         let (send, recv) = watch::channel(None);
         let (payout_notify, _) = broadcast::channel(100);
         let db = Arc::new(Db::new(std::path::Path::new("pool.db")).await?);
-        let share_handler = Arc::new(Sharehandler::new(db, 100, 30_000, pool_address.to_string()).await?);
+        let share_handler = Arc::new(Sharehandler::new(db, 100, 30_000, pool_address.to_string(), pool_fee).await?);
         let worker_counter = Arc::new(AtomicU16::new(0));
         
         let jobs_clone = jobs.clone();

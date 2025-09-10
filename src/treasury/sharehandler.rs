@@ -37,7 +37,7 @@ pub struct Sharehandler {
     pub worker_log_times: Arc<DashMap<String, Arc<AtomicU64>>>,
     pub worker_share_rates: Arc<DashMap<String, Arc<RwLock<VecDeque<(u64, u64)>>>>>,
     pub worker_last_difficulty_check: Arc<DashMap<String, Arc<AtomicU64>>>,
-    pub pool_fee: f64, // Store pool_fee
+    pub pool_fee: f64,
 }
 
 impl Sharehandler {
@@ -327,7 +327,7 @@ impl Sharehandler {
     }
 
     pub async fn get_dynamic_difficulty(&self, address: &str, base_difficulty: u64) -> u64 {
-        const ADJUSTMENT_FACTOR: f64 = 0.1;
+        const ADJUSTMENT_FACTOR: f64 = 0.2;
         const MAX_SHARE_RATE: f64 = 5.0;
         const MIN_SHARE_RATE: f64 = 1.0;
         const DIFFICULTY_CHECK_INTERVAL_MS: u64 = 10_000;
@@ -411,7 +411,7 @@ impl Sharehandler {
 
             let miner_shares = share_counts.get(address).map(|entry| *entry.value()).unwrap_or(0);
             let share_percentage = miner_shares as f64 / total_shares as f64;
-            let block_amount = block.amount as u64; // Fee already deducted
+            let block_amount = block.amount as u64;
             let miner_reward = ((block_amount as f64) * share_percentage) as u64;
             pending_balance += miner_reward;
         }

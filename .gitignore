@@ -2,3 +2,4 @@
 .idea
 pool.db
 package-lock.json
+.env

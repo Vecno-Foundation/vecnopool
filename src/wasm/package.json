@@ -16,5 +16,10 @@
     "vecno.d.ts"
   ],
   "main": "vecno.js",
-  "types": "vecno.d.ts"
+  "types": "vecno.d.ts",
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "sqlite3": "^5.1.7",
+    "websocket": "^1.0.34"
+  }
 }

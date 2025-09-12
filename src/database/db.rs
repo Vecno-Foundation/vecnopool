@@ -1,5 +1,3 @@
-//src/database/db.rs
-
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool};
@@ -8,7 +6,7 @@ use sqlx::Row;
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::treasury::sharehandler::Contribution;
-use log::debug;
+use log::{debug, warn};
 use crate::metrics::{DB_QUERIES_SUCCESS, DB_QUERIES_FAILED};
 use crate::treasury::reward_table::get_block_reward;
 
@@ -56,6 +54,15 @@ impl Db {
         .context("Failed to create shares table")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_shares_table"]).inc();
 
+        // Create index on daa_score and address for get_shares_in_window
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shares_daa_score_address ON shares (daa_score, address)"
+        )
+        .execute(&pool)
+        .await
+        .context("Failed to create index on shares table")?;
+        DB_QUERIES_SUCCESS.with_label_values(&["create_shares_index"]).inc();
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS balances (
                 id TEXT NOT NULL,
@@ -76,7 +83,8 @@ impl Db {
                 address TEXT NOT NULL,
                 amount INTEGER NOT NULL,
                 tx_id TEXT NOT NULL,
-                timestamp INTEGER NOT NULL
+                timestamp INTEGER NOT NULL,
+                notified BOOLEAN NOT NULL DEFAULT FALSE
             )"
         )
         .execute(&pool)
@@ -112,6 +120,28 @@ impl Db {
             }
         }
 
+        // Verify payments table has notified column
+        let columns: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('payments')"
+        )
+        .fetch_all(&pool)
+        .await
+        .context("Failed to verify payments table schema")?;
+        if !columns.iter().any(|(name,)| name == "notified") {
+            return Err(anyhow::anyhow!("Payments table missing 'notified' column"));
+        }
+
+        // Verify index exists
+        let indexes: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_shares_daa_score_address'"
+        )
+        .fetch_all(&pool)
+        .await
+        .context("Failed to verify indexes")?;
+        if indexes.is_empty() {
+            return Err(anyhow::anyhow!("Database schema missing index: idx_shares_daa_score_address"));
+        }
+
         debug!("Database initialized successfully");
         Ok(Db { pool })
     }
@@ -126,6 +156,7 @@ impl Db {
         extranonce: &str,
         nonce: &str,
     ) -> Result<()> {
+        let start_time = SystemTime::now();
         let result = sqlx::query(
             "INSERT INTO shares (address, difficulty, timestamp, job_id, daa_score, extranonce, nonce, reward_block_hash)
              VALUES (?, ?, ?, ?, ?, ?, ?, NULL)"
@@ -139,6 +170,9 @@ impl Db {
         .bind(nonce)
         .execute(&self.pool)
         .await;
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("record_share query took {} seconds for address={}", elapsed, address);
 
         match result {
             Ok(_) => {
@@ -160,6 +194,7 @@ impl Db {
     }
 
     pub async fn load_recent_shares(&self, share_window: &mut VecDeque<Contribution>, n: usize) -> Result<u64> {
+        let start_time = SystemTime::now();
         let result = sqlx::query_as::<_, Contribution>(
             "SELECT address, difficulty, timestamp, job_id, daa_score, extranonce, nonce, reward_block_hash
              FROM shares
@@ -170,6 +205,10 @@ impl Db {
         .fetch_all(&self.pool)
         .await
         .context("Failed to load recent shares");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("load_recent_shares query took {} seconds", elapsed);
+
         match result {
             Ok(rows) => {
                 let mut total_shares = 0;
@@ -188,6 +227,7 @@ impl Db {
     }
 
     pub async fn get_share_counts(&self, address: Option<&str>) -> Result<DashMap<String, u64>> {
+        let start_time = SystemTime::now();
         let query = if let Some(addr) = address {
             sqlx::query("SELECT address, COUNT(*) as count FROM shares WHERE address = ? GROUP BY address")
                 .bind(addr)
@@ -199,6 +239,10 @@ impl Db {
             .fetch_all(&self.pool)
             .await
             .context("Failed to get share counts");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("get_share_counts query took {} seconds", elapsed);
+
         match result {
             Ok(rows) => {
                 let sums = DashMap::new();
@@ -218,6 +262,7 @@ impl Db {
     }
 
     pub async fn get_shares_in_window(&self, daa_score: u64, window_size: u64) -> Result<DashMap<String, u64>> {
+        let start_time = SystemTime::now();
         let result = sqlx::query(
             "SELECT address, COUNT(*) as count 
              FROM shares 
@@ -229,6 +274,20 @@ impl Db {
         .fetch_all(&self.pool)
         .await
         .context("Failed to get shares in window");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        if elapsed > 1.0 {
+            warn!(
+                "get_shares_in_window query took {} seconds for daa_score={} and window_size={}",
+                elapsed, daa_score, window_size
+            );
+        } else {
+            debug!(
+                "get_shares_in_window query took {} seconds for daa_score={} and window_size={}",
+                elapsed, daa_score, window_size
+            );
+        }
+
         match result {
             Ok(rows) => {
                 let sums = DashMap::new();
@@ -248,6 +307,7 @@ impl Db {
     }
 
     pub async fn add_balance(&self, id: &str, address: &str, amount: u64) -> Result<()> {
+        let start_time = SystemTime::now();
         let result = sqlx::query(
             "INSERT OR REPLACE INTO balances (id, address, available_balance, total_earned_balance)
              VALUES (?, ?, COALESCE((SELECT available_balance FROM balances WHERE id = ? AND address = ?), 0) + ?,
@@ -264,6 +324,10 @@ impl Db {
         .execute(&self.pool)
         .await
         .context("Failed to add balance");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("add_balance query took {} seconds for address={}", elapsed, address);
+
         match result {
             Ok(_) => {
                 DB_QUERIES_SUCCESS.with_label_values(&["add_balance"]).inc();
@@ -271,47 +335,6 @@ impl Db {
             }
             Err(e) => {
                 DB_QUERIES_FAILED.with_label_values(&["add_balance"]).inc();
-                Err(e)
-            }
-        }
-    }
-
-    pub async fn reset_available_balance(&self, address: &str) -> Result<()> {
-        let result = sqlx::query("UPDATE balances SET available_balance = 0 WHERE address = ?")
-            .bind(address)
-            .execute(&self.pool)
-            .await
-            .context("Failed to reset available balance");
-        match result {
-            Ok(_) => {
-                DB_QUERIES_SUCCESS.with_label_values(&["reset_available_balance"]).inc();
-                Ok(())
-            }
-            Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["reset_available_balance"]).inc();
-                Err(e)
-            }
-        }
-    }
-
-    pub async fn add_payment(&self, address: &str, amount: u64, tx_id: &str) -> Result<()> {
-        let result = sqlx::query(
-            "INSERT INTO payments (address, amount, tx_id, timestamp) VALUES (?, ?, ?, ?)"
-        )
-        .bind(address)
-        .bind(amount as i64)
-        .bind(tx_id)
-        .bind(SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64)
-        .execute(&self.pool)
-        .await
-        .context("Failed to add payment");
-        match result {
-            Ok(_) => {
-                DB_QUERIES_SUCCESS.with_label_values(&["add_payment"]).inc();
-                Ok(())
-            }
-            Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["add_payment"]).inc();
                 Err(e)
             }
         }
@@ -328,6 +351,7 @@ impl Db {
         _amount: u64,
         pool_fee: f64,
     ) -> Result<()> {
+        let start_time = SystemTime::now();
         let mut amount = get_block_reward(daa_score)
             .context(format!("Failed to calculate block reward for daa_score {}", daa_score))?;
         amount = ((amount as f64) * (1.0 - pool_fee / 100.0)) as u64;
@@ -344,6 +368,10 @@ impl Db {
         .execute(&self.pool)
         .await
         .context("Failed to add block details");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("add_block_details query took {} seconds for reward_block_hash={}", elapsed, reward_block_hash);
+
         match result {
             Ok(_) => {
                 DB_QUERIES_SUCCESS.with_label_values(&["add_block_details"]).inc();
@@ -357,6 +385,7 @@ impl Db {
     }
 
     pub async fn get_unconfirmed_blocks(&self) -> Result<Vec<BlockDetails>> {
+        let start_time = SystemTime::now();
         let result = sqlx::query_as::<_, BlockDetails>(
             "SELECT miner_id, reward_block_hash, daa_score, amount, confirmations
              FROM blocks WHERE confirmations < 100 AND processed = 0"
@@ -364,6 +393,10 @@ impl Db {
         .fetch_all(&self.pool)
         .await
         .context("Failed to get unconfirmed blocks");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("get_unconfirmed_blocks query took {} seconds", elapsed);
+
         match result {
             Ok(rows) => {
                 DB_QUERIES_SUCCESS.with_label_values(&["get_unconfirmed_blocks"]).inc();
@@ -377,6 +410,7 @@ impl Db {
     }
 
     pub async fn update_block_confirmations(&self, reward_block_hash: &str, confirmations: u64) -> Result<()> {
+        let start_time = SystemTime::now();
         let result = sqlx::query(
             "UPDATE blocks SET confirmations = ? WHERE reward_block_hash = ?"
         )
@@ -385,6 +419,10 @@ impl Db {
         .execute(&self.pool)
         .await
         .context("Failed to update block confirmations");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("update_block_confirmations query took {} seconds for reward_block_hash={}", elapsed, reward_block_hash);
+
         match result {
             Ok(_) => {
                 DB_QUERIES_SUCCESS.with_label_values(&["update_block_confirmations"]).inc();
@@ -398,6 +436,7 @@ impl Db {
     }
 
     pub async fn mark_block_processed(&self, reward_block_hash: &str) -> Result<()> {
+        let start_time = SystemTime::now();
         let result = sqlx::query(
             "UPDATE blocks SET processed = 1 WHERE reward_block_hash = ?"
         )
@@ -405,6 +444,10 @@ impl Db {
         .execute(&self.pool)
         .await
         .context("Failed to mark block as processed");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("mark_block_processed query took {} seconds for reward_block_hash={}", elapsed, reward_block_hash);
+
         match result {
             Ok(_) => {
                 DB_QUERIES_SUCCESS.with_label_values(&["mark_block_processed"]).inc();
@@ -418,6 +461,7 @@ impl Db {
     }
 
     pub async fn check_duplicate_share_by_hash(&self, reward_block_hash: &str, nonce: &str) -> Result<i64> {
+        let start_time = SystemTime::now();
         let result = sqlx::query_scalar(
             "SELECT COUNT(*) FROM shares WHERE reward_block_hash = ? AND nonce = ?"
         )
@@ -426,6 +470,13 @@ impl Db {
         .fetch_one(&self.pool)
         .await
         .context("Failed to check for duplicate share by hash");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!(
+            "check_duplicate_share_by_hash query took {} seconds for reward_block_hash={}, nonce={}",
+            elapsed, reward_block_hash, nonce
+        );
+
         match result {
             Ok(count) => {
                 if count > 0 {
@@ -438,6 +489,68 @@ impl Db {
             }
             Err(e) => {
                 DB_QUERIES_FAILED.with_label_values(&["check_duplicate_share_by_hash"]).inc();
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn cleanup_old_shares(&self, retention_period_secs: i64) -> Result<()> {
+        let start_time = SystemTime::now();
+        let cutoff_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64 - retention_period_secs;
+
+        let result = sqlx::query(
+            "DELETE FROM shares WHERE timestamp < ?"
+        )
+        .bind(cutoff_time)
+        .execute(&self.pool)
+        .await
+        .context("Failed to clean up old shares");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("cleanup_old_shares query took {} seconds for cutoff_time={}", elapsed, cutoff_time);
+
+        match result {
+            Ok(res) => {
+                let rows_affected = res.rows_affected();
+                if rows_affected > 0 {
+                    debug!("Cleaned up {} old shares older than {} seconds", rows_affected, retention_period_secs);
+                }
+                DB_QUERIES_SUCCESS.with_label_values(&["cleanup_old_shares"]).inc();
+                Ok(())
+            }
+            Err(e) => {
+                DB_QUERIES_FAILED.with_label_values(&["cleanup_old_shares"]).inc();
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn cleanup_processed_blocks(&self) -> Result<()> {
+        let start_time = SystemTime::now();
+        let result = sqlx::query(
+            "DELETE FROM blocks WHERE processed = 1"
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to clean up processed blocks");
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("cleanup_processed_blocks query took {} seconds", elapsed);
+
+        match result {
+            Ok(res) => {
+                let rows_affected = res.rows_affected();
+                if rows_affected > 0 {
+                    debug!("Cleaned up {} processed blocks", rows_affected);
+                }
+                DB_QUERIES_SUCCESS.with_label_values(&["cleanup_processed_blocks"]).inc();
+                Ok(())
+            }
+            Err(e) => {
+                DB_QUERIES_FAILED.with_label_values(&["cleanup_processed_blocks"]).inc();
                 Err(e)
             }
         }

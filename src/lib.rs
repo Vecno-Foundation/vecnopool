@@ -6,4 +6,3 @@ pub mod vecnod;
 pub mod uint;
 pub mod api;
 pub mod metrics;
-pub mod wasm;

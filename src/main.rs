@@ -1,19 +1,15 @@
-// src/main.rs
-
 use anyhow::{Context, Result};
-use log::{debug, info, LevelFilter};
+use log::{debug, info, warn, LevelFilter};
 use std::env;
 use tokio::time::{self, Duration};
 use crate::metrics::start_metrics_server;
 use crate::treasury::payout::{check_confirmations, process_payouts};
 use crate::vecnod::{Client, Message, VecnodHandle};
 use crate::stratum::Stratum;
-use log::warn;
 
 mod vecnod;
 mod pow;
 mod stratum;
-mod wasm;
 mod treasury;
 mod database;
 mod uint;
@@ -55,7 +51,6 @@ async fn main() -> Result<()> {
         .init();
 
     let client = reqwest::Client::new();
-    wasm::initialize_wasm().await.context("Failed to initialize WASM module")?;
 
     tokio::spawn(start_metrics_server());
 
@@ -64,25 +59,44 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to initialize Stratum")?;
 
+    // Start cleanup task
+    tokio::spawn({
+        let db = stratum.share_handler.db.clone();
+        async move {
+            let mut cleanup_interval = time::interval(Duration::from_secs(3_600)); // Run hourly
+            cleanup_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            loop {
+                cleanup_interval.tick().await;
+                // Clean up shares older than 1 hour (3,600 seconds)
+                if let Err(e) = db.cleanup_old_shares(3_600).await {
+                    warn!("Failed to clean up old shares: {:?}", e);
+                }
+                // Clean up processed blocks
+                if let Err(e) = db.cleanup_processed_blocks().await {
+                    warn!("Failed to clean up processed blocks: {:?}", e);
+                }
+            }
+        }
+    });
+
     // Start payout task
     tokio::spawn({
         let db = stratum.share_handler.db.clone();
         let client = client.clone();
         let payout_notify = stratum.payout_notify.clone();
-        let pool_fee = pool_fee; // Capture pool_fee for the task
         async move {
             let mut confirmations_interval = time::interval(Duration::from_secs(30));
-            let mut payouts_interval = time::interval(Duration::from_secs(600));
+            let mut payouts_interval = time::interval(Duration::from_secs(10));
             loop {
                 tokio::select! {
                     _ = confirmations_interval.tick() => {
                         if let Err(e) = check_confirmations(db.clone(), &client).await {
-                            log::warn!("Failed to check confirmations: {:?}", e);
+                            warn!("Failed to check confirmations: {:?}", e);
                         }
                     }
                     _ = payouts_interval.tick() => {
-                        if let Err(e) = process_payouts(db.clone(), &client, payout_notify.clone(), pool_fee).await {
-                            log::warn!("Failed to process payouts: {:?}", e);
+                        if let Err(e) = process_payouts(db.clone(), payout_notify.clone()).await {
+                            warn!("Failed to process payouts: {:?}", e);
                         }
                     }
                 }

@@ -37,7 +37,7 @@ impl Stratum {
         let (send, recv) = watch::channel(None);
         let (payout_notify, _) = broadcast::channel(100);
         let db = Arc::new(Db::new(std::path::Path::new("pool.db")).await?);
-        let share_handler = Arc::new(Sharehandler::new(db, 10000, 600_000, pool_address.to_string(), pool_fee).await?);
+        let share_handler = Arc::new(Sharehandler::new(db, 10000, 30_000, pool_address.to_string(), pool_fee).await?);
         let worker_counter = Arc::new(AtomicU16::new(0));
         
         let jobs_clone = jobs.clone();

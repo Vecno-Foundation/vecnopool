@@ -23,6 +23,7 @@ pub struct BlockDetails {
     pub amount: i64,
     #[allow(dead_code)]
     pub confirmations: i64,
+    pub timestamp: Option<i64>,
 }
 
 impl Db {
@@ -54,14 +55,22 @@ impl Db {
         .context("Failed to create shares table")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_shares_table"]).inc();
 
-        // Create index on daa_score and address for get_shares_in_window
+        // Create index on daa_score, address, and timestamp
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_shares_daa_score_address ON shares (daa_score, address)"
         )
         .execute(&pool)
         .await
-        .context("Failed to create index on shares table")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_shares_index"]).inc();
+        .context("Failed to create index on shares table (daa_score, address)")?;
+        DB_QUERIES_SUCCESS.with_label_values(&["create_shares_index_daa_score"]).inc();
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shares_timestamp ON shares (timestamp)"
+        )
+        .execute(&pool)
+        .await
+        .context("Failed to create index on shares table (timestamp)")?;
+        DB_QUERIES_SUCCESS.with_label_values(&["create_shares_index_timestamp"]).inc();
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS balances (
@@ -100,7 +109,8 @@ impl Db {
                 pool_wallet TEXT NOT NULL,
                 amount INTEGER NOT NULL,
                 confirmations INTEGER NOT NULL DEFAULT 0,
-                processed INTEGER NOT NULL DEFAULT 0
+                processed INTEGER NOT NULL DEFAULT 0,
+                timestamp INTEGER
             )"
         )
         .execute(&pool)
@@ -129,6 +139,21 @@ impl Db {
         .context("Failed to verify payments table schema")?;
         if !columns.iter().any(|(name,)| name == "notified") {
             return Err(anyhow::anyhow!("Payments table missing 'notified' column"));
+        }
+
+        // Verify blocks table has timestamp column
+        let block_columns: Vec<(String,)> = sqlx::query_as(
+            "SELECT name FROM pragma_table_info('blocks')"
+        )
+        .fetch_all(&pool)
+        .await
+        .context("Failed to verify blocks table schema")?;
+        if !block_columns.iter().any(|(name,)| name == "timestamp") {
+            sqlx::query("ALTER TABLE blocks ADD COLUMN timestamp INTEGER")
+                .execute(&pool)
+                .await
+                .context("Failed to add timestamp column to blocks table")?;
+            DB_QUERIES_SUCCESS.with_label_values(&["alter_blocks_table"]).inc();
         }
 
         // Verify index exists
@@ -261,30 +286,31 @@ impl Db {
         }
     }
 
-    pub async fn get_shares_in_window(&self, daa_score: u64, window_size: u64) -> Result<DashMap<String, u64>> {
+    pub async fn get_shares_in_time_window(&self, timestamp: i64, window_duration_secs: u64) -> Result<DashMap<String, u64>> {
         let start_time = SystemTime::now();
+        let start_timestamp = timestamp.saturating_sub(window_duration_secs as i64);
         let result = sqlx::query(
-            "SELECT address, COUNT(*) as count 
-             FROM shares 
-             WHERE daa_score >= ? AND daa_score < ? 
+            "SELECT address, SUM(difficulty) as total_difficulty
+             FROM shares
+             WHERE timestamp >= ? AND timestamp < ?
              GROUP BY address"
         )
-        .bind((daa_score.saturating_sub(window_size)) as i64)
-        .bind(daa_score as i64)
+        .bind(start_timestamp)
+        .bind(timestamp)
         .fetch_all(&self.pool)
         .await
-        .context("Failed to get shares in window");
+        .context("Failed to get shares in time window");
 
         let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
         if elapsed > 1.0 {
             warn!(
-                "get_shares_in_window query took {} seconds for daa_score={} and window_size={}",
-                elapsed, daa_score, window_size
+                "get_shares_in_time_window query took {} seconds for timestamp={} and window_duration_secs={}",
+                elapsed, timestamp, window_duration_secs
             );
         } else {
             debug!(
-                "get_shares_in_window query took {} seconds for daa_score={} and window_size={}",
-                elapsed, daa_score, window_size
+                "get_shares_in_time_window query took {} seconds for timestamp={} and window_duration_secs={}",
+                elapsed, timestamp, window_duration_secs
             );
         }
 
@@ -293,14 +319,14 @@ impl Db {
                 let sums = DashMap::new();
                 for row in rows {
                     let address: String = row.get(0);
-                    let count: i64 = row.get(1);
-                    sums.insert(address, count as u64);
+                    let total_difficulty: i64 = row.get(1);
+                    sums.insert(address, total_difficulty as u64);
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["get_shares_in_window"]).inc();
+                DB_QUERIES_SUCCESS.with_label_values(&["get_shares_in_time_window"]).inc();
                 Ok(sums)
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["get_shares_in_window"]).inc();
+                DB_QUERIES_FAILED.with_label_values(&["get_shares_in_time_window"]).inc();
                 Err(e)
             }
         }
@@ -355,16 +381,21 @@ impl Db {
         let mut amount = get_block_reward(daa_score)
             .context(format!("Failed to calculate block reward for daa_score {}", daa_score))?;
         amount = ((amount as f64) * (1.0 - pool_fee / 100.0)) as u64;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs() as i64;
 
         let result = sqlx::query(
-            "INSERT OR REPLACE INTO blocks (reward_block_hash, miner_id, daa_score, pool_wallet, amount, confirmations, processed)
-             VALUES (?, ?, ?, ?, ?, 0, 0)"
+            "INSERT OR REPLACE INTO blocks (reward_block_hash, miner_id, daa_score, pool_wallet, amount, confirmations, processed, timestamp)
+             VALUES (?, ?, ?, ?, ?, 0, 0, ?)"
         )
         .bind(reward_block_hash)
         .bind(miner_id)
         .bind(daa_score as i64)
         .bind(pool_wallet)
         .bind(amount as i64)
+        .bind(timestamp)
         .execute(&self.pool)
         .await
         .context("Failed to add block details");
@@ -387,7 +418,7 @@ impl Db {
     pub async fn get_unconfirmed_blocks(&self) -> Result<Vec<BlockDetails>> {
         let start_time = SystemTime::now();
         let result = sqlx::query_as::<_, BlockDetails>(
-            "SELECT miner_id, reward_block_hash, daa_score, amount, confirmations
+            "SELECT miner_id, reward_block_hash, daa_score, amount, confirmations, timestamp
              FROM blocks WHERE confirmations < 100 AND processed = 0"
         )
         .fetch_all(&self.pool)

@@ -100,7 +100,7 @@ impl Sharehandler {
                             info!("Recording share: worker={}, total_submissions={}", share.address, count);
                             worker_log_times_clone.get(&share.address).unwrap().store(current_time, AtomicOrdering::Relaxed);
                         }
-                        if batch.len() >= 500 {
+                        if batch.len() >= 1000 { // Increased batch size to 1000
                             Self::process_batch(
                                 &db_clone,
                                 &share_window_clone,
@@ -224,7 +224,7 @@ impl Sharehandler {
             .clone();
         let mut rates = share_rates.write().await;
         rates.push_back((current_time_ms, miner_difficulty));
-        while rates.len() > 0 && current_time_ms - rates.front().map(|(ts, _)| ts).unwrap_or(&0) > 30_000 {
+        while rates.len() > 0 && current_time_ms - rates.front().map(|(ts, _)| ts).unwrap_or(&0) > 300_000 { // 5-minute window
             rates.pop_front();
         }
 
@@ -272,7 +272,7 @@ impl Sharehandler {
             .load(AtomicOrdering::Relaxed);
         if count % 100 == 0 || current_time >= last_log_time + 10 {
             let recent_shares = rates.len() as f64;
-            let share_rate = recent_shares / 30.0;
+            let share_rate = recent_shares / 300.0; // 5-minute window
             let average_difficulty = if recent_shares > 0.0 {
                 rates.iter().map(|(_, diff)| *diff as f64).sum::<f64>() / recent_shares
             } else {
@@ -311,25 +311,26 @@ impl Sharehandler {
 
     pub async fn get_share_counts(&self, address: &str) -> Result<(u64, u64)> {
         let share_window = self.share_window.read().await;
-        let window_submissions = share_window
+        let window_difficulty = share_window
             .iter()
             .filter(|share| share.address == address)
-            .count() as u64;
+            .map(|share| share.difficulty as u64)
+            .sum::<u64>();
         let total_submissions = self.worker_share_counts
             .get(address)
             .map(|count| count.load(AtomicOrdering::Relaxed))
             .unwrap_or(0);
         debug!(
-            "Share counts: total={}, window={} for address={}",
-            total_submissions, window_submissions, address
+            "Share counts: total={}, window_difficulty={} for address={}",
+            total_submissions, window_difficulty, address
         );
-        Ok((total_submissions, window_submissions))
+        Ok((total_submissions, window_difficulty))
     }
 
     pub async fn get_dynamic_difficulty(&self, address: &str, base_difficulty: u64) -> u64 {
-        const ADJUSTMENT_FACTOR: f64 = 0.2;
-        const MAX_SHARE_RATE: f64 = 5.0;
-        const MIN_SHARE_RATE: f64 = 1.0;
+        const TARGET_SHARE_RATE: f64 = 3.0; // Target 3 shares/s
+        const ADJUSTMENT_FACTOR: f64 = 0.1; // Smoother adjustment
+        const WINDOW_MS: u64 = 300_000; // 5-minute window
         const DIFFICULTY_CHECK_INTERVAL_MS: u64 = 10_000;
 
         let mut target_difficulty = base_difficulty;
@@ -348,9 +349,9 @@ impl Sharehandler {
                 .map(|entry| entry.clone())
                 .unwrap_or_else(|| Arc::new(RwLock::new(VecDeque::new())));
             let rates = share_rates.read().await;
-            let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= 30_000).count() as f64;
+            let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= WINDOW_MS).count() as f64;
             let average_difficulty = if recent_shares > 0.0 {
-                rates.iter().filter(|(ts, _)| current_time_ms - *ts <= 30_000)
+                rates.iter().filter(|(ts, _)| current_time_ms - *ts <= WINDOW_MS)
                     .map(|(_, diff)| *diff as f64)
                     .sum::<f64>() / recent_shares
             } else {
@@ -368,24 +369,18 @@ impl Sharehandler {
             .map(|entry| entry.clone())
             .unwrap_or_else(|| Arc::new(RwLock::new(VecDeque::new())));
         let rates = share_rates.read().await;
-        let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= 30_000).count() as f64;
-        let share_rate = recent_shares / 30.0;
+        let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= WINDOW_MS).count() as f64;
+        let share_rate = recent_shares / (WINDOW_MS as f64 / 1000.0);
 
-        if share_rate > MAX_SHARE_RATE {
-            target_difficulty = ((target_difficulty as f64) * (1.0 + ADJUSTMENT_FACTOR)) as u64;
-            debug!("Increasing difficulty for {}: share_rate={:.2} shares/s, new_difficulty={}", address, share_rate, target_difficulty);
-        } else if share_rate < MIN_SHARE_RATE && target_difficulty > base_difficulty {
-            target_difficulty = ((target_difficulty as f64) * (1.0 - ADJUSTMENT_FACTOR)).max(base_difficulty as f64) as u64;
-            debug!("Decreasing difficulty for {}: share_rate={:.2} shares/s, new_difficulty={}", address, share_rate, target_difficulty);
-        }
-
-        let final_difficulty = target_difficulty;
+        let error = TARGET_SHARE_RATE - share_rate;
+        let adjustment = (base_difficulty as f64 * ADJUSTMENT_FACTOR * error).max(-0.5 * base_difficulty as f64).min(0.5 * base_difficulty as f64);
+        target_difficulty = (target_difficulty as f64 + adjustment).max(base_difficulty as f64 * 0.5) as u64;
 
         debug!(
-            "Dynamic difficulty for {}: base_difficulty={}, share_rate={:.2}, final_difficulty={}",
-            address, base_difficulty, share_rate, final_difficulty
+            "Dynamic difficulty for {}: base_difficulty={}, share_rate={:.2}, adjustment={:.0}, final_difficulty={}",
+            address, base_difficulty, share_rate, adjustment, target_difficulty
         );
-        final_difficulty
+        target_difficulty
     }
 
     pub async fn get_balances_and_hashrate(&self, address: &str, stratum_conn: &StratumConn<'_>) -> Result<(u64, u64, f64)> {
@@ -402,15 +397,18 @@ impl Sharehandler {
         let mut pending_balance = 0;
 
         for block in unconfirmed_blocks {
-            let share_counts = self.db.get_shares_in_window(block.daa_score as u64, 1000).await
-                .context("Failed to get share counts for reward distribution")?;
-            let total_shares: u64 = share_counts.iter().map(|entry| *entry.value()).sum();
-            if total_shares == 0 {
+            let block_timestamp = block.timestamp.unwrap_or(
+                SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards").as_secs() as i64
+            );
+            let share_counts = self.db.get_shares_in_time_window(block_timestamp, 300).await
+                .context("Failed to get share difficulties for reward distribution")?;
+            let total_difficulty: u64 = share_counts.iter().map(|entry| *entry.value()).sum();
+            if total_difficulty == 0 {
                 continue;
             }
 
-            let miner_shares = share_counts.get(address).map(|entry| *entry.value()).unwrap_or(0);
-            let share_percentage = miner_shares as f64 / total_shares as f64;
+            let miner_difficulty = share_counts.get(address).map(|entry| *entry.value()).unwrap_or(0);
+            let share_percentage = miner_difficulty as f64 / total_difficulty as f64;
             let block_amount = block.amount as u64;
             let miner_reward = ((block_amount as f64) * share_percentage) as u64;
             pending_balance += miner_reward;
@@ -425,15 +423,15 @@ impl Sharehandler {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_millis() as u64;
-        let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= 30_000).count() as f64;
+        let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= 300_000).count() as f64;
         let average_difficulty = if recent_shares > 0.0 {
-            rates.iter().filter(|(ts, _)| current_time_ms - *ts <= 30_000)
+            rates.iter().filter(|(ts, _)| current_time_ms - *ts <= 300_000)
                 .map(|(_, diff)| *diff as f64)
                 .sum::<f64>() / recent_shares
         } else {
             stratum_conn.difficulty as f64
         };
-        let hashrate = (recent_shares / 30.0) * average_difficulty / 1_000_000.0;
+        let hashrate = (recent_shares / 300.0) * average_difficulty / 1_000_000.0;
 
         debug!(
             "Balances for address={}: available={} VE, pending={} VE, effective_hashrate={:.2} Mhash/s, recent_shares={}, average_difficulty={:.0}",

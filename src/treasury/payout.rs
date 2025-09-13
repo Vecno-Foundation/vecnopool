@@ -60,6 +60,13 @@ pub async fn check_confirmations(db: Arc<Db>, client: &Client) -> Result<()> {
         return Ok(());
     }
 
+    // PPLNS window: 5 minutes (300 seconds)
+    let window_duration_secs = 300;
+    let current_time_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards")
+        .as_secs() as i64;
+
     for block in unconfirmed_blocks {
         let confirmations = current_daa_score.saturating_sub(block.daa_score as u64);
 
@@ -88,22 +95,24 @@ pub async fn check_confirmations(db: Arc<Db>, client: &Client) -> Result<()> {
                 DB_QUERIES_SUCCESS.with_label_values(&["mark_block_processed"]).inc();
             }
 
-            let share_counts = db.get_shares_in_window(block.daa_score as u64, 1000).await
-                .context("Failed to get share counts for reward distribution")?;
-            let total_shares: u64 = share_counts.iter().map(|entry| *entry.value()).sum();
-            debug!("Share counts for block {}: {:?}", block.reward_block_hash, share_counts);
+            // Use PPLNS with a 5-minute window around block timestamp
+            let block_timestamp = block.timestamp.unwrap_or(current_time_secs);
+            let share_counts = db.get_shares_in_time_window(block_timestamp, window_duration_secs).await
+                .context("Failed to get share difficulties for reward distribution")?;
+            let total_difficulty: u64 = share_counts.iter().map(|entry| *entry.value()).sum();
+            debug!("Share difficulties for block {}: {:?}", block.reward_block_hash, share_counts);
             
-            if total_shares == 0 {
-                warn!("No shares found for block {} in daa_score window {}", block.reward_block_hash, block.daa_score);
+            if total_difficulty == 0 {
+                warn!("No valid shares found for block {} in time window {}", block.reward_block_hash, block_timestamp);
                 continue;
             }
 
-            let amount = block.amount as u64; // Fee already deducted in add_block_details
+            let amount = block.amount as u64;
 
             for entry in share_counts.iter() {
                 let address = entry.key();
-                let miner_shares = *entry.value();
-                let share_percentage = miner_shares as f64 / total_shares as f64;
+                let miner_difficulty = *entry.value();
+                let share_percentage = miner_difficulty as f64 / total_difficulty as f64;
                 let miner_reward = ((amount as f64) * share_percentage) as u64;
 
                 let result = db.add_balance(&block.miner_id, address, miner_reward).await
@@ -113,10 +122,6 @@ pub async fn check_confirmations(db: Arc<Db>, client: &Client) -> Result<()> {
                     Ok(_) => {
                         DB_QUERIES_SUCCESS.with_label_values(&["add_balance"]).inc();
                         REWARDS_DISTRIBUTED.with_label_values(&[address, &block.reward_block_hash]).inc_by(miner_reward as f64 / 100_000_000.0);
-                        info!(
-                            "Added reward to balance: amount={} VE, address={}, block_hash={}, confirmations={}",
-                            miner_reward as f64 / 100_000_000.0, address, block.reward_block_hash, confirmations
-                        );
                     }
                     Err(e) => {
                         DB_QUERIES_FAILED.with_label_values(&["add_balance"]).inc();

@@ -100,7 +100,7 @@ impl Sharehandler {
                             info!("Recording share: worker={}, total_submissions={}", share.address, count);
                             worker_log_times_clone.get(&share.address).unwrap().store(current_time, AtomicOrdering::Relaxed);
                         }
-                        if batch.len() >= 1000 { // Increased batch size to 1000
+                        if batch.len() >= 1000 {
                             Self::process_batch(
                                 &db_clone,
                                 &share_window_clone,
@@ -224,7 +224,7 @@ impl Sharehandler {
             .clone();
         let mut rates = share_rates.write().await;
         rates.push_back((current_time_ms, miner_difficulty));
-        while rates.len() > 0 && current_time_ms - rates.front().map(|(ts, _)| ts).unwrap_or(&0) > 300_000 { // 5-minute window
+        while rates.len() > 0 && current_time_ms - rates.front().map(|(ts, _)| ts).unwrap_or(&0) > 300_000 {
             rates.pop_front();
         }
 
@@ -328,12 +328,14 @@ impl Sharehandler {
     }
 
     pub async fn get_dynamic_difficulty(&self, address: &str, base_difficulty: u64) -> u64 {
-        const TARGET_SHARE_RATE: f64 = 3.0; // Target 3 shares/s
-        const ADJUSTMENT_FACTOR: f64 = 0.1; // Smoother adjustment
+        const ADJUSTMENT_FACTOR: f64 = 0.3; // 30% adjustment for fast convergence
         const WINDOW_MS: u64 = 300_000; // 5-minute window
-        const DIFFICULTY_CHECK_INTERVAL_MS: u64 = 10_000;
+        const INITIAL_WINDOW_MS: u64 = 5_000; // 5-second window for initial estimation
+        const DIFFICULTY_CHECK_INTERVAL_MS: u64 = 5_000; // Check every 5 seconds
+        const MINIMUM_DIFFICULTY: u64 = 250_000; // Minimum difficulty to reduce invalid shares
 
-        let mut target_difficulty = base_difficulty;
+        let mut target_difficulty = base_difficulty.max(MINIMUM_DIFFICULTY);
+        let mut estimated_hashrate = 0.0; // Initialize estimated_hashrate
 
         let current_time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -343,42 +345,60 @@ impl Sharehandler {
             .entry(address.to_string())
             .or_insert(Arc::new(AtomicU64::new(0)))
             .load(AtomicOrdering::Relaxed);
-        if current_time_ms - last_check > DIFFICULTY_CHECK_INTERVAL_MS {
+
+        if current_time_ms - last_check >= DIFFICULTY_CHECK_INTERVAL_MS {
             let share_rates = self.worker_share_rates
                 .get(address)
                 .map(|entry| entry.clone())
                 .unwrap_or_else(|| Arc::new(RwLock::new(VecDeque::new())));
             let rates = share_rates.read().await;
+
+            // Initial difficulty estimation for new or returning miners
+            let initial_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= INITIAL_WINDOW_MS).count() as f64;
+            let initial_share_rate = initial_shares / (INITIAL_WINDOW_MS as f64 / 1000.0);
+            let initial_difficulty = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= INITIAL_WINDOW_MS)
+                .map(|(_, diff)| *diff as f64)
+                .sum::<f64>() / initial_shares.max(1.0);
+            if initial_share_rate > 0.0 && initial_difficulty > 0.0 {
+                estimated_hashrate = initial_share_rate * initial_difficulty / 1_000_000.0; // Mhash/s
+                let target_share_rate = (10.0 * (5.0 / estimated_hashrate.max(0.1)).sqrt()).min(5.0).max(1.0);
+                target_difficulty = ((estimated_hashrate * 1_000_000.0) / target_share_rate).max(MINIMUM_DIFFICULTY as f64) as u64;
+                debug!(
+                    "Initial estimation for {}: share_rate={:.2} shares/s, estimated_hashrate={:.2} Mhash/s, target_share_rate={:.2}, initial_difficulty={}",
+                    address, initial_share_rate, estimated_hashrate, target_share_rate, target_difficulty
+                );
+            }
+
+            // Dynamic adjustment based on 5-minute window
             let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= WINDOW_MS).count() as f64;
             let average_difficulty = if recent_shares > 0.0 {
                 rates.iter().filter(|(ts, _)| current_time_ms - *ts <= WINDOW_MS)
                     .map(|(_, diff)| *diff as f64)
                     .sum::<f64>() / recent_shares
             } else {
-                base_difficulty as f64
+                target_difficulty as f64
             };
-            if average_difficulty > 0.0 && base_difficulty as f64 > average_difficulty * 1.1 {
-                target_difficulty = base_difficulty;
-                debug!("Resetting difficulty for {} to network base_difficulty={} due to network increase", address, base_difficulty);
-                self.worker_last_difficulty_check.get(address).unwrap().store(current_time_ms, AtomicOrdering::Relaxed);
+            let share_rate = recent_shares / (WINDOW_MS as f64 / 1000.0);
+            estimated_hashrate = share_rate * average_difficulty / 1_000_000.0;
+
+            if share_rate > 0.0 {
+                let target_share_rate = (10.0 * (5.0 / estimated_hashrate.max(0.1)).sqrt()).min(5.0).max(1.0);
+                let error = target_share_rate - share_rate;
+                let adjustment = (target_difficulty as f64 * ADJUSTMENT_FACTOR * error).max(-0.5 * target_difficulty as f64).min(0.5 * target_difficulty as f64);
+                target_difficulty = (target_difficulty as f64 + adjustment).max(base_difficulty.max(MINIMUM_DIFFICULTY) as f64) as u64;
+                debug!(
+                    "Dynamic adjustment for {}: share_rate={:.2} shares/s, estimated_hashrate={:.2} Mhash/s, target_share_rate={:.2}, adjustment={:.0}, final_difficulty={}",
+                    address, share_rate, estimated_hashrate, target_share_rate, adjustment, target_difficulty
+                );
             }
+
+            // Update last difficulty check time
+            self.worker_last_difficulty_check.get(address).unwrap().store(current_time_ms, AtomicOrdering::Relaxed);
         }
 
-        let share_rates = self.worker_share_rates
-            .get(address)
-            .map(|entry| entry.clone())
-            .unwrap_or_else(|| Arc::new(RwLock::new(VecDeque::new())));
-        let rates = share_rates.read().await;
-        let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= WINDOW_MS).count() as f64;
-        let share_rate = recent_shares / (WINDOW_MS as f64 / 1000.0);
-
-        let error = TARGET_SHARE_RATE - share_rate;
-        let adjustment = (base_difficulty as f64 * ADJUSTMENT_FACTOR * error).max(-0.5 * base_difficulty as f64).min(0.5 * base_difficulty as f64);
-        target_difficulty = (target_difficulty as f64 + adjustment).max(base_difficulty as f64 * 0.5) as u64;
-
         debug!(
-            "Dynamic difficulty for {}: base_difficulty={}, share_rate={:.2}, adjustment={:.0}, final_difficulty={}",
-            address, base_difficulty, share_rate, adjustment, target_difficulty
+            "Dynamic difficulty for {}: base_difficulty={}, estimated_hashrate={:.2} Mhash/s, final_difficulty={}",
+            address, base_difficulty, estimated_hashrate, target_difficulty
         );
         target_difficulty
     }

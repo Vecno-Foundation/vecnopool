@@ -2,10 +2,10 @@
 
 use anyhow::Result;
 use log::{debug, error, info, warn};
-use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use tokio::io::AsyncBufReadExt;
 use crate::stratum::protocol::{StratumConn, PayoutNotification};
 use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
@@ -38,23 +38,28 @@ impl Stratum {
         let (payout_notify, _) = broadcast::channel(100);
         let db = Arc::new(Db::new(std::path::Path::new("pool.db")).await?);
         let share_handler = Arc::new(Sharehandler::new(db, 10000, 30_000, pool_address.to_string(), pool_fee).await?);
-        let worker_counter = Arc::new(AtomicU16::new(0));
-        
+        let worker_counter = Arc::new(AtomicU32::new(1));
+
         let jobs_clone = jobs.clone();
         let share_handler_clone = share_handler.clone();
         let last_template_clone = last_template.clone();
         let pending_clone = pending.clone();
         let payout_notify_clone = payout_notify.clone();
         let pool_address_clone = pool_address.to_string();
-        
+
         tokio::spawn(async move {
             loop {
                 let worker_id = worker_counter.fetch_add(1, AtomicOrdering::SeqCst);
                 if worker_id == 0 {
                     worker_counter.fetch_add(1, AtomicOrdering::SeqCst);
+                    debug!("Skipped worker_id=0 to avoid zeroed extranonce");
                 }
-                let worker = worker_id.to_be_bytes();
-                debug!("Assigned worker ID: {:?}", worker);
+                let worker = worker_id.to_be_bytes(); // Produces [u8; 4]
+                let worker_hex = format!("{:08x}", worker_id); // Hex representation for debugging
+                debug!(
+                    "Assigned worker ID: raw={:?}, hex={}, worker_id={} for new connection",
+                    worker, worker_hex, worker_id
+                );
 
                 match listener.accept().await {
                     Ok((mut stream, addr)) => {
@@ -68,11 +73,12 @@ impl Stratum {
                         let mining_addr = pool_address_clone.clone();
                         let client = reqwest::Client::new();
                         let recv_clone = recv.clone();
+                        let worker_hex_clone = worker_hex.clone(); // For debug logging
                         tokio::spawn(async move {
                             let (reader, writer) = stream.split();
                             let mut conn = StratumConn {
                                 reader: tokio::io::BufReader::new(reader).lines(),
-                                writer,
+                                writer: Arc::new(Mutex::new(writer)),
                                 recv: recv_clone,
                                 jobs,
                                 pending_send: pending_send_inner,
@@ -88,10 +94,13 @@ impl Stratum {
                                 extranonce: String::new(),
                                 mining_addr,
                                 client,
-                                duplicate_share_count: 0,
+                                duplicate_share_count: Arc::new(AtomicU64::new(0)),
                                 payout_notify_recv,
                             };
-                            debug!("Initialized StratumConn for worker {:?}", addr);
+                            debug!(
+                                "Initialized StratumConn for worker: addr={}, worker_id={}, worker_bytes={:?}, worker_hex={}",
+                                addr, worker_id, conn.worker, worker_hex_clone
+                            );
                             if let Err(e) = conn.run().await {
                                 error!("Stratum connection error for {}: {}", addr, e);
                                 let result = PendingResult {

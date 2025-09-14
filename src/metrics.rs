@@ -1,4 +1,8 @@
-use prometheus::{CounterVec, Gauge, register_counter_vec, register_gauge, Counter, register_counter, Encoder, TextEncoder};
+use prometheus::{
+    CounterVec, Gauge, register_counter_vec, register_gauge, Counter, register_counter,
+    Histogram, register_histogram,
+    Encoder, TextEncoder,
+};
 use hyper::{Body, Request, Response, Server};
 use hyper::service::{make_service_fn, service_fn};
 use std::convert::Infallible;
@@ -103,6 +107,13 @@ lazy_static::lazy_static! {
     pub static ref BLOCKS_PURGED: Counter = register_counter!(
         "blocks_purged_total",
         "Total number of processed blocks purged from the database"
+    ).unwrap();
+
+    pub static ref SHARE_VALIDATION_LATENCY: Histogram = register_histogram!(
+        "share_validation_latency_seconds",
+        "Time to validate a share",
+        // Default buckets for latency in seconds (adjust as needed)
+        vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
     ).unwrap();
 }
 
@@ -230,7 +241,6 @@ fn generate_metrics_html(metric_families: &[prometheus::proto::MetricFamily]) ->
     for family in metric_families {
         let name = family.get_name();
         let help = family.get_help();
-        // Convert MetricType to string manually
         let metric_type = match family.get_field_type() {
             prometheus::proto::MetricType::COUNTER => "Counter",
             prometheus::proto::MetricType::GAUGE => "Gauge",
@@ -246,10 +256,28 @@ fn generate_metrics_html(metric_families: &[prometheus::proto::MetricFamily]) ->
                 .map(|l| format!("{}=\"{}\"", l.get_name(), l.get_value()))
                 .collect::<Vec<String>>()
                 .join(", ");
+            
             let value = match family.get_field_type() {
-                prometheus::proto::MetricType::COUNTER => metric.get_counter().get_value(),
-                prometheus::proto::MetricType::GAUGE => metric.get_gauge().get_value(),
-                _ => 0.0, // Handle other types if needed
+                prometheus::proto::MetricType::COUNTER => {
+                    format!("{:.2}", metric.get_counter().get_value())
+                }
+                prometheus::proto::MetricType::GAUGE => {
+                    format!("{:.2}", metric.get_gauge().get_value())
+                }
+                prometheus::proto::MetricType::HISTOGRAM => {
+                    let hist = metric.get_histogram();
+                    format!(
+                        "count: {}, sum: {:.2}s, buckets: [{}]",
+                        hist.get_sample_count(),
+                        hist.get_sample_sum(),
+                        hist.get_bucket()
+                            .iter()
+                            .map(|b| format!("≤{}s: {}", b.get_upper_bound(), b.get_cumulative_count()))
+                            .collect::<Vec<String>>()
+                            .join(", ")
+                    )
+                }
+                _ => "N/A".to_string(),
             };
 
             html.push_str(&format!(
@@ -258,7 +286,7 @@ fn generate_metrics_html(metric_families: &[prometheus::proto::MetricFamily]) ->
                     <td class="metric-name">{}</td>
                     <td class="metric-help">{}</td>
                     <td class="metric-labels">{}</td>
-                    <td>{:.2}</td>
+                    <td>{}</td>
                     <td>{}</td>
                 </tr>
                 "#,

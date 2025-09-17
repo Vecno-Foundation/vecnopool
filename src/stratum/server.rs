@@ -32,12 +32,19 @@ impl Stratum {
         let listener = TcpListener::bind(addr).await?;
         info!("Listening on {}, pool fee: {}%", addr, pool_fee);
         let last_template = Arc::new(tokio::sync::RwLock::new(None));
-        let jobs = Arc::new(Jobs::new(handle));
+        let db = Arc::new(Db::new().await?);
+        let jobs = Arc::new(Jobs::new(handle, db.clone(), pool_address.to_string(), pool_fee));
         let (pending, _) = mpsc::unbounded_channel();
         let (send, recv) = watch::channel(None);
         let (payout_notify, _) = broadcast::channel(100);
-        let db = Arc::new(Db::new(std::path::Path::new("pool.db")).await?);
-        let share_handler = Arc::new(Sharehandler::new(db, 10000, 30_000, pool_address.to_string(), pool_fee).await?);
+        let share_handler = Arc::new(Sharehandler::new(
+            db,
+            10000,           // n_window
+            30_000,         // window_time_ms
+            pool_address.to_string(),
+            pool_fee,
+            jobs.clone(),   // Added Jobs argument
+        ).await?);
         let worker_counter = Arc::new(AtomicU32::new(1));
 
         let jobs_clone = jobs.clone();
@@ -54,8 +61,8 @@ impl Stratum {
                     worker_counter.fetch_add(1, AtomicOrdering::SeqCst);
                     debug!("Skipped worker_id=0 to avoid zeroed extranonce");
                 }
-                let worker = worker_id.to_be_bytes(); // Produces [u8; 4]
-                let worker_hex = format!("{:08x}", worker_id); // Hex representation for debugging
+                let worker = worker_id.to_be_bytes();
+                let worker_hex = format!("{:08x}", worker_id);
                 debug!(
                     "Assigned worker ID: raw={:?}, hex={}, worker_id={} for new connection",
                     worker, worker_hex, worker_id
@@ -71,9 +78,7 @@ impl Stratum {
                         let payout_notify_recv = payout_notify_clone.subscribe();
                         let (pending_send_inner, pending_recv) = mpsc::unbounded_channel();
                         let mining_addr = pool_address_clone.clone();
-                        let client = reqwest::Client::new();
                         let recv_clone = recv.clone();
-                        let worker_hex_clone = worker_hex.clone(); // For debug logging
                         tokio::spawn(async move {
                             let (reader, writer) = stream.split();
                             let mut conn = StratumConn {
@@ -93,13 +98,12 @@ impl Stratum {
                                 last_template,
                                 extranonce: String::new(),
                                 mining_addr,
-                                client,
                                 duplicate_share_count: Arc::new(AtomicU64::new(0)),
                                 payout_notify_recv,
                             };
                             debug!(
                                 "Initialized StratumConn for worker: addr={}, worker_id={}, worker_bytes={:?}, worker_hex={}",
-                                addr, worker_id, conn.worker, worker_hex_clone
+                                addr, worker_id, conn.worker, worker_hex
                             );
                             if let Err(e) = conn.run().await {
                                 error!("Stratum connection error for {}: {}", addr, e);

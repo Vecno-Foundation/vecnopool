@@ -112,8 +112,13 @@ lazy_static::lazy_static! {
     pub static ref SHARE_VALIDATION_LATENCY: Histogram = register_histogram!(
         "share_validation_latency_seconds",
         "Time to validate a share",
-        // Default buckets for latency in seconds (adjust as needed)
         vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
+    ).unwrap();
+
+    pub static ref DIFFICULTY_ADJUSTMENTS: CounterVec = register_counter_vec!(
+        "difficulty_adjustments_total",
+        "Total number of difficulty adjustments by miner",
+        &["address"]
     ).unwrap();
 }
 
@@ -134,7 +139,6 @@ async fn metrics_handler(req: Request<Body>) -> Result<Response<Body>, Infallibl
     let path = req.uri().path();
 
     if path == "/metrics" {
-        // Serve raw Prometheus metrics for scraping
         let encoder = TextEncoder::new();
         let metric_families = prometheus::gather();
         let mut buffer = vec![];
@@ -144,7 +148,6 @@ async fn metrics_handler(req: Request<Body>) -> Result<Response<Body>, Infallibl
             .body(Body::from(buffer))
             .unwrap())
     } else {
-        // Serve styled HTML page for browser visits
         let metric_families = prometheus::gather();
         let html = generate_metrics_html(&metric_families);
         Ok(Response::builder()

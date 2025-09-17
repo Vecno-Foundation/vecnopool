@@ -1,11 +1,17 @@
+//src/main.rs
+
 use anyhow::{Context, Result};
 use log::{debug, info, warn, LevelFilter};
 use std::env;
+use std::sync::Arc;
 use tokio::time::{self, Duration};
+use tokio::sync::watch;
+use crate::database::db::Db;
 use crate::metrics::start_metrics_server;
 use crate::treasury::payout::{check_confirmations, process_payouts};
 use crate::vecnod::{Client, Message, VecnodHandle};
 use crate::stratum::Stratum;
+use crate::vecnod::proto::vecnod_message::Payload;
 
 mod vecnod;
 mod pow;
@@ -13,16 +19,16 @@ mod stratum;
 mod treasury;
 mod database;
 mod uint;
-mod api;
 mod metrics;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    debug!("Starting main function");
     dotenv::dotenv().context("Failed to load .env file")?;
 
     let rpc_url = env::var("RPC_URL").context("RPC_URL must be set in .env")?;
     let stratum_addr = env::var("STRATUM_ADDR").unwrap_or("localhost:6969".to_string());
-    let extra_data = env::var("EXTRA_DATA").unwrap_or("vecnod-stratum".to_string());
+    let extra_data = env::var("EXTRA_DATA").unwrap_or("Vecno Mining Pool".to_string());
     let pool_address = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
     let network_id = env::var("NETWORK_ID").unwrap_or("mainnet".to_string());
     let debug = env::var("DEBUG")
@@ -43,70 +49,105 @@ async fn main() -> Result<()> {
         return Err(anyhow::anyhow!("POOL_FEE_PERCENT must be between 0 and 100"));
     }
 
-    info!("Loaded pool fee: {}%", pool_fee); // Log to verify
+    info!("Loaded pool fee: {}%", pool_fee);
 
     env_logger::Builder::new()
         .filter_level(LevelFilter::Info)
         .filter_module("vecnod_stratum", if debug { LevelFilter::Debug } else { LevelFilter::Info })
         .init();
 
-    let client = reqwest::Client::new();
-
+    debug!("Spawning metrics server");
     tokio::spawn(start_metrics_server());
 
+    debug!("Creating VecnodHandle");
     let (handle, recv_cmd) = VecnodHandle::new();
+    debug!("Initializing database");
+    let _db = Arc::new(Db::new().await.context("Failed to initialize database")?);
+    debug!("Initializing Stratum server");
     let stratum = Stratum::new(&stratum_addr, handle.clone(), &pool_address, &network_id, pool_fee)
         .await
         .context("Failed to initialize Stratum")?;
 
+    // Create a watch channel for sharing the latest DAA score
+    let (daa_score_tx, daa_score_rx) = watch::channel::<Option<u64>>(None);
+
     // Start cleanup task
+    debug!("Spawning cleanup task");
     tokio::spawn({
         let db = stratum.share_handler.db.clone();
         async move {
-            let mut cleanup_interval = time::interval(Duration::from_secs(3_600)); // Run hourly
+            let mut cleanup_interval = time::interval(Duration::from_secs(600)); // Run every 10 minutes
             cleanup_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             loop {
+                debug!("Cleanup task loop iteration");
                 cleanup_interval.tick().await;
-                // Clean up shares older than 1 hour (3,600 seconds)
+                // Clean up shares older than 60 minutes (3600 seconds)
                 if let Err(e) = db.cleanup_old_shares(3_600).await {
                     warn!("Failed to clean up old shares: {:?}", e);
+                } else {
+                    debug!("Successfully cleaned up old shares (retention: 3600s)");
                 }
                 // Clean up processed blocks
                 if let Err(e) = db.cleanup_processed_blocks().await {
                     warn!("Failed to clean up processed blocks: {:?}", e);
+                } else {
+                    debug!("Successfully cleaned up processed blocks");
+                }
+            }
+        }
+    });
+
+    // Start confirmation task
+    debug!("Spawning confirmation task");
+    tokio::spawn({
+        let db = stratum.share_handler.db.clone();
+        let daa_score_rx = daa_score_rx.clone();
+        async move {
+            let mut confirmations_interval = time::interval(Duration::from_secs(60));
+            confirmations_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+            loop {
+                debug!("Confirmation task loop iteration");
+                confirmations_interval.tick().await;
+                debug!("Triggering check_confirmations");
+                if let Err(e) = check_confirmations(db.clone(), daa_score_rx.clone()).await {
+                    warn!("Failed to check confirmations: {:?}", e);
+                } else {
+                    debug!("check_confirmations completed successfully");
                 }
             }
         }
     });
 
     // Start payout task
+    debug!("Spawning payout task");
     tokio::spawn({
         let db = stratum.share_handler.db.clone();
-        let client = client.clone();
         let payout_notify = stratum.payout_notify.clone();
         async move {
-            let mut confirmations_interval = time::interval(Duration::from_secs(30));
-            let mut payouts_interval = time::interval(Duration::from_secs(10));
+            let mut payouts_interval = time::interval(Duration::from_secs(30));
+            payouts_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             loop {
-                tokio::select! {
-                    _ = confirmations_interval.tick() => {
-                        if let Err(e) = check_confirmations(db.clone(), &client).await {
-                            warn!("Failed to check confirmations: {:?}", e);
-                        }
-                    }
-                    _ = payouts_interval.tick() => {
-                        if let Err(e) = process_payouts(db.clone(), payout_notify.clone()).await {
-                            warn!("Failed to process payouts: {:?}", e);
-                        }
-                    }
+                debug!("Payout task loop iteration");
+                payouts_interval.tick().await;
+                debug!("Triggering process_payouts");
+                if let Err(e) = process_payouts(db.clone(), payout_notify.clone()).await {
+                    warn!("Failed to process payouts: {:?}", e);
+                } else {
+                    debug!("process_payouts completed successfully");
                 }
             }
         }
     });
 
-    let (client, mut msgs) = Client::new(&rpc_url, &pool_address, &extra_data, handle, recv_cmd);
+    debug!("Creating Vecnod client");
+    let (client, mut msgs) = Client::new(&rpc_url, &pool_address, &extra_data, handle.clone(), recv_cmd);
 
+    // Request initial DAA score
+    handle.send_cmd(Payload::get_block_dag_info());
+
+    debug!("Entering main message loop");
     while let Some(msg) = msgs.recv().await {
+        debug!("Received message: {:?}", msg);
         match msg {
             Message::Info { version, .. } => {
                 info!("Connected to Vecnod {version}");
@@ -119,6 +160,7 @@ async fn main() -> Result<()> {
                 }
             }
             Message::Template(template) => {
+                debug!("Received new template, broadcasting");
                 *stratum.last_template.write().await = Some(template.clone());
                 stratum.broadcast(template).await;
             }
@@ -129,9 +171,23 @@ async fn main() -> Result<()> {
                 }
                 stratum.resolve_pending_job(error.map(|e| anyhow::anyhow!(e.to_string()))).await;
             }
+            Message::BlockDagInfo { virtual_daa_score } => {
+                debug!("Received BlockDagInfo: virtual_daa_score={}", virtual_daa_score);
+                // Update the shared DAA score
+                let _ = daa_score_tx.send(Some(virtual_daa_score));
+            }
+            Message::NewBlock => {
+                debug!("New block detected in blockchain, requesting new template and DAA score");
+                if !client.request_template() {
+                    warn!("Failed to request template after new block: channel closed");
+                    break;
+                }
+                // Request updated DAA score
+                handle.send_cmd(Payload::get_block_dag_info());
+            }
         }
     }
 
-    println!("Main loop exited, shutting down...");
+    warn!("Main loop exited, shutting down...");
     Ok(())
 }

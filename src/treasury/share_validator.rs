@@ -1,16 +1,12 @@
 // src/treasury/share_validator.rs
 use anyhow::Result;
-use crate::database::db::Db;
 use crate::stratum::jobs::Jobs;
-use std::sync::Arc;
-use anyhow::Context;
 use crate::treasury::sharehandler::Contribution;
 use log::{debug, warn};
 
 pub async fn validate_share(
     contribution: &Contribution,
     jobs: &Jobs,
-    db: Arc<Db>,
     nonce: &str,
 ) -> Result<bool> {
     // Get the job to retrieve the block template
@@ -48,20 +44,6 @@ pub async fn validate_share(
             return Ok(false);
         }
     };
-
-    // Check for duplicate share based on block_hash and nonce
-    let is_duplicate = db
-        .check_duplicate_share_by_hash(&block_hash, nonce)
-        .await
-        .context("Failed to check for duplicate share")?;
-    
-    if is_duplicate > 0 {
-        warn!(
-            "Duplicate share detected for block_hash={} nonce={} address={}",
-            block_hash, nonce, contribution.address
-        );
-        return Ok(false);
-    }
 
     debug!(
         "Share validated for job_id={} block_hash={} nonce={} address={}",

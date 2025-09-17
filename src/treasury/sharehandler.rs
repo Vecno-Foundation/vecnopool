@@ -3,15 +3,19 @@
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use serde_json::json;
+use std::collections::{HashMap, VecDeque, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
-use log::{debug, info};
+use log::{debug, info, warn};
 use crate::database::db::Db;
-use crate::metrics::{TOTAL_SHARES_RECORDED, SHARE_WINDOW_SIZE, SHARE_PROCESSING_FAILED};
-use crate::stratum::protocol::StratumConn;
+use crate::metrics::{
+    TOTAL_SHARES_RECORDED, SHARE_WINDOW_SIZE, SHARE_PROCESSING_FAILED,
+    MINER_INVALID_SHARES, MINER_DUPLICATED_SHARES,
+};
+use crate::stratum::jobs::{Jobs};
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Contribution {
@@ -34,33 +38,49 @@ pub struct Sharehandler {
     pub window_time_ms: u64,
     pub share_batch: mpsc::Sender<Contribution>,
     pub worker_share_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
+    pub worker_invalid_shares: Arc<DashMap<String, Arc<AtomicU64>>>,
+    pub worker_duplicate_shares: Arc<DashMap<String, Arc<AtomicU64>>>,
     pub worker_log_times: Arc<DashMap<String, Arc<AtomicU64>>>,
-    pub worker_share_rates: Arc<DashMap<String, Arc<RwLock<VecDeque<(u64, u64)>>>>>,
-    pub worker_last_difficulty_check: Arc<DashMap<String, Arc<AtomicU64>>>,
+    pub worker_submitted_shares: Arc<DashMap<String, Arc<RwLock<HashSet<(String, String)>>>>>,
     pub pool_fee: f64,
+    pub jobs: Arc<Jobs>,
 }
 
 impl Sharehandler {
-    pub async fn new(db: Arc<Db>, n_window: usize, window_time_ms: u64, _mining_addr: String, pool_fee: f64) -> Result<Self> {
+    pub async fn new(
+        db: Arc<Db>,
+        n_window: usize,
+        window_time_ms: u64,
+        _mining_addr: String,
+        pool_fee: f64,
+        jobs: Arc<Jobs>,
+    ) -> Result<Self> {
         let mut share_window = VecDeque::new();
         let total_shares = db.load_recent_shares(&mut share_window, n_window)
             .await
             .context("Failed to load recent shares")?;
         let share_window = Arc::new(RwLock::new(share_window));
         let total_shares = Arc::new(AtomicU64::new(total_shares));
-        let (share_batch, mut share_batch_rx) = mpsc::channel::<Contribution>(10000);
+        let (share_batch, mut share_batch_rx) = mpsc::channel::<Contribution>(500);
         let worker_share_counts = Arc::new(DashMap::new());
+        let worker_invalid_shares = Arc::new(DashMap::new());
+        let worker_duplicate_shares = Arc::new(DashMap::new());
         let worker_log_times = Arc::new(DashMap::new());
-        let worker_share_rates = Arc::new(DashMap::new());
-        let worker_last_difficulty_check = Arc::new(DashMap::new());
+        let worker_submitted_shares = Arc::new(DashMap::new());
 
         if let Ok(sums) = db.get_share_counts(None).await {
             for entry in sums.iter() {
                 worker_share_counts.insert(entry.key().clone(), Arc::new(AtomicU64::new(*entry.value())));
+                worker_invalid_shares.insert(entry.key().clone(), Arc::new(AtomicU64::new(0)));
+                worker_duplicate_shares.insert(entry.key().clone(), Arc::new(AtomicU64::new(0)));
+                worker_submitted_shares.insert(entry.key().clone(), Arc::new(RwLock::new(HashSet::new())));
             }
         }
 
-        debug!("Initialized sharehandler: n_window={n_window}, window_time_ms={window_time_ms}, pool_fee={pool_fee}");
+        debug!(target: "sharehandler",
+            "Initialized sharehandler: n_window={}, window_time_ms={}, pool_fee={}",
+            n_window, window_time_ms, pool_fee
+        );
 
         let db_clone = db.clone();
         let share_window_clone = share_window.clone();
@@ -96,11 +116,14 @@ impl Sharehandler {
                             .entry(share.address.clone())
                             .or_insert(Arc::new(AtomicU64::new(0)))
                             .load(AtomicOrdering::Relaxed);
-                        if count % 100 == 0 || current_time >= last_log_time + 10 {
-                            info!("Recording share: worker={}, total_submissions={}", share.address, count);
+                        if count % 500 == 0 || current_time >= last_log_time + 30 {
+                            info!(target: "sharehandler",
+                                "Recording batched share: worker={}, total_submissions={}",
+                                share.address, count
+                            );
                             worker_log_times_clone.get(&share.address).unwrap().store(current_time, AtomicOrdering::Relaxed);
                         }
-                        if batch.len() >= 1000 {
+                        if batch.len() >= 500 {
                             Self::process_batch(
                                 &db_clone,
                                 &share_window_clone,
@@ -112,7 +135,7 @@ impl Sharehandler {
                             ).await;
                         }
                     }
-                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(50)) => {
+                    _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
                         if !batch.is_empty() {
                             Self::process_batch(
                                 &db_clone,
@@ -137,10 +160,12 @@ impl Sharehandler {
             window_time_ms,
             share_batch,
             worker_share_counts,
+            worker_invalid_shares,
+            worker_duplicate_shares,
             worker_log_times,
-            worker_share_rates,
-            worker_last_difficulty_check,
+            worker_submitted_shares,
             pool_fee,
+            jobs,
         })
     }
 
@@ -153,15 +178,25 @@ impl Sharehandler {
         n_window: usize,
         window_time_ms: u64,
     ) {
+        let mut valid_shares = HashMap::new();
+        let mut failed_shares = HashMap::new();
+
         let current_time_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_millis() as u64;
+
+        let mut share_window = share_window.write().await;
         for share in batch.drain(..) {
             if current_time_ms < (share.timestamp as u64) * 1000 || current_time_ms - (share.timestamp as u64) * 1000 > window_time_ms {
-                info!("Skipping invalid share timestamp for worker={}: timestamp={}", share.address, share.timestamp);
+                info!(target: "sharehandler",
+                    "Skipping invalid share timestamp for worker={}: timestamp={}",
+                    share.address, share.timestamp
+                );
+                *failed_shares.entry(share.address.clone()).or_insert(0) += 1;
                 continue;
             }
+
             if let Err(e) = db.record_share(
                 &share.address,
                 share.difficulty,
@@ -171,43 +206,129 @@ impl Sharehandler {
                 &share.extranonce,
                 &share.nonce,
             ).await {
-                info!("Failed to record batched share for worker={}: {:?}", share.address, e);
-                SHARE_PROCESSING_FAILED.with_label_values(&[&share.address]).inc();
+                info!(target: "sharehandler",
+                    "Failed to record batched share for worker={}: {:?}", share.address, e
+                );
+                *failed_shares.entry(share.address.clone()).or_insert(0) += 1;
             } else {
-                TOTAL_SHARES_RECORDED.with_label_values(&[&share.address]).inc();
-                info!("Recorded batched share for worker={}", share.address);
+                *valid_shares.entry(share.address.clone()).or_insert(0) += 1;
+                share_window.push_back(share.clone());
+                total_shares.fetch_add(1, AtomicOrdering::Relaxed);
+                *window_submission_counts.entry(share.address.clone()).or_insert(0) += 1;
             }
-            let mut share_window = share_window.write().await;
-            share_window.push_back(share.clone());
-            total_shares.fetch_add(1, AtomicOrdering::Relaxed);
-            while share_window.len() > n_window {
-                if let Some(old_share) = share_window.pop_front() {
-                    total_shares.fetch_sub(1, AtomicOrdering::Relaxed);
-                    if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            window_submission_counts.remove(&old_share.address);
-                        }
-                    }
-                }
-            }
-            while share_window.len() > 0 && current_time_ms - share_window.front().map(|s| (s.timestamp as u64) * 1000).unwrap_or(0) > window_time_ms {
-                if let Some(old_share) = share_window.pop_front() {
-                    total_shares.fetch_sub(1, AtomicOrdering::Relaxed);
-                    if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
-                        *count = count.saturating_sub(1);
-                        if *count == 0 {
-                            window_submission_counts.remove(&old_share.address);
-                        }
-                    }
-                }
-            }
-            debug!("Share window size: {}, oldest timestamp: {:?}", share_window.len(), share_window.front().map(|s| s.timestamp));
-            SHARE_WINDOW_SIZE.set(share_window.len() as f64);
         }
+
+        for (address, count) in valid_shares {
+            TOTAL_SHARES_RECORDED.with_label_values(&[&address]).inc_by(count as f64);
+            info!(target: "sharehandler", "Recorded {} batched shares for worker={}", count, address);
+        }
+        for (address, count) in failed_shares {
+            SHARE_PROCESSING_FAILED.with_label_values(&[&address]).inc_by(count as f64);
+        }
+
+        while share_window.len() > n_window || (share_window.len() > 0 && current_time_ms - share_window.front().map(|s| (s.timestamp as u64) * 1000).unwrap_or(0) > window_time_ms) {
+            if let Some(old_share) = share_window.pop_front() {
+                total_shares.fetch_sub(1, AtomicOrdering::Relaxed);
+                if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        window_submission_counts.remove(&old_share.address);
+                    }
+                }
+            }
+        }
+
+        debug!(target: "sharehandler",
+            "Share window size: {}, oldest timestamp: {:?}", share_window.len(), share_window.front().map(|s| s.timestamp)
+        );
+        SHARE_WINDOW_SIZE.set(share_window.len() as f64);
     }
 
-    pub async fn record_share(&self, contribution: &Contribution, miner_difficulty: u64) -> Result<()> {
+    pub async fn record_share(&self, contribution: &Contribution, miner_difficulty: u64, is_valid: bool, is_duplicate: bool) -> Result<()> {
+        // Check if job_id exists
+        if contribution.job_id.parse::<u8>().is_ok() {
+            let job_id_u8 = contribution.job_id.parse::<u8>().unwrap();
+            if self.jobs.get_job(job_id_u8).await.is_none() {
+                warn!(target: "sharehandler",
+                    "Invalid job_id for worker={}: job_id={}", contribution.address, contribution.job_id
+                );
+                return Err(anyhow::anyhow!("Invalid job_id: {}", contribution.job_id));
+            }
+        } else {
+            warn!(target: "sharehandler",
+                "Invalid job_id format for worker={}: job_id={}", contribution.address, contribution.job_id
+            );
+            return Err(anyhow::anyhow!("Invalid job_id format: {}", contribution.job_id));
+        }
+
+        let network_difficulty = match contribution.job_id.parse::<u8>() {
+            Ok(job_id_u8) => self.jobs
+                .get_job_params(job_id_u8)
+                .await
+                .map(|params| params.difficulty())
+                .unwrap_or(miner_difficulty),
+            Err(_) => {
+                warn!(target: "sharehandler",
+                    "Invalid job_id format for worker={}: job_id={}", contribution.address, contribution.job_id
+                );
+                miner_difficulty
+            }
+        };
+
+        debug!(target: "sharehandler",
+            "Validating share for worker={}: miner_difficulty={}, contribution_difficulty={}, network_difficulty={}, job_id={}",
+            contribution.address, miner_difficulty, contribution.difficulty, network_difficulty, contribution.job_id
+        );
+
+        // Check for duplicate shares using reward_block_hash and nonce
+        let block_hash = match contribution.reward_block_hash.as_ref() {
+            Some(hash) => hash.clone(),
+            None => {
+                warn!(target: "sharehandler",
+                    "Missing reward_block_hash for worker={}: job_id={}, extranonce={}, nonce={}",
+                    contribution.address, contribution.job_id, contribution.extranonce, contribution.nonce
+                );
+                return Err(anyhow::anyhow!("Missing reward_block_hash"));
+            }
+        };
+        let share_key = (block_hash, contribution.nonce.clone());
+
+        let submitted_shares_entry = self.worker_submitted_shares
+            .entry(contribution.address.clone())
+            .or_insert(Arc::new(RwLock::new(HashSet::new())))
+            .clone();
+
+        let (mut share_window, mut submitted_shares) = tokio::join!(
+            self.share_window.write(),
+            submitted_shares_entry.write()
+        );
+
+        if submitted_shares.contains(&share_key) || is_duplicate {
+            self.worker_duplicate_shares
+                .entry(contribution.address.clone())
+                .or_insert(Arc::new(AtomicU64::new(0)))
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            MINER_DUPLICATED_SHARES.with_label_values(&[&contribution.address]).inc();
+            warn!(target: "sharehandler",
+                "Duplicate share detected for address={}: block_hash={}, nonce={}",
+                contribution.address, share_key.0, share_key.1
+            );
+            return Err(anyhow::anyhow!("Duplicate share"));
+        }
+        if !is_valid {
+            self.worker_invalid_shares
+                .entry(contribution.address.clone())
+                .or_insert(Arc::new(AtomicU64::new(0)))
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            MINER_INVALID_SHARES.with_label_values(&[&contribution.address]).inc();
+            warn!(target: "sharehandler",
+                "Invalid share for address={}: difficulty={}", contribution.address, contribution.difficulty
+            );
+            return Err(anyhow::anyhow!("Invalid share"));
+        }
+
+        submitted_shares.insert(share_key);
+
         let share_count = self.worker_share_counts
             .entry(contribution.address.clone())
             .or_insert(Arc::new(AtomicU64::new(0)))
@@ -218,17 +339,7 @@ impl Sharehandler {
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_millis() as u64;
-        let share_rates = self.worker_share_rates
-            .entry(contribution.address.clone())
-            .or_insert(Arc::new(RwLock::new(VecDeque::new())))
-            .clone();
-        let mut rates = share_rates.write().await;
-        rates.push_back((current_time_ms, miner_difficulty));
-        while rates.len() > 0 && current_time_ms - rates.front().map(|(ts, _)| ts).unwrap_or(&0) > 300_000 {
-            rates.pop_front();
-        }
 
-        let mut share_window = self.share_window.write().await;
         share_window.push_back(contribution.clone());
         self.total_shares.fetch_add(1, AtomicOrdering::Relaxed);
 
@@ -237,7 +348,7 @@ impl Sharehandler {
             *window_submission_counts.entry(share.address.clone()).or_insert(0) += 1;
         }
 
-        while share_window.len() > self.n_window {
+        while share_window.len() > self.n_window || (share_window.len() > 0 && current_time_ms - share_window.front().map(|s| (s.timestamp as u64) * 1000).unwrap_or(0) > self.window_time_ms) {
             if let Some(old_share) = share_window.pop_front() {
                 self.total_shares.fetch_sub(1, AtomicOrdering::Relaxed);
                 if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
@@ -248,18 +359,10 @@ impl Sharehandler {
                 }
             }
         }
-        while share_window.len() > 0 && current_time_ms - share_window.front().map(|s| (s.timestamp as u64) * 1000).unwrap_or(0) > self.window_time_ms {
-            if let Some(old_share) = share_window.pop_front() {
-                self.total_shares.fetch_sub(1, AtomicOrdering::Relaxed);
-                if let Some(count) = window_submission_counts.get_mut(&old_share.address) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        window_submission_counts.remove(&old_share.address);
-                    }
-                }
-            }
-        }
-        debug!("Share window size: {}, window_submissions: {:?}", share_window.len(), window_submission_counts.get(&contribution.address));
+
+        debug!(target: "sharehandler",
+            "Share window size: {}, window_submissions: {:?}", share_window.len(), window_submission_counts.get(&contribution.address)
+        );
         SHARE_WINDOW_SIZE.set(share_window.len() as f64);
 
         let current_time = SystemTime::now()
@@ -270,18 +373,27 @@ impl Sharehandler {
             .entry(contribution.address.clone())
             .or_insert(Arc::new(AtomicU64::new(0)))
             .load(AtomicOrdering::Relaxed);
-        if count % 100 == 0 || current_time >= last_log_time + 10 {
-            let recent_shares = rates.len() as f64;
-            let share_rate = recent_shares / 300.0; // 5-minute window
-            let average_difficulty = if recent_shares > 0.0 {
-                rates.iter().map(|(_, diff)| *diff as f64).sum::<f64>() / recent_shares
+        if count % 500 == 0 || current_time >= last_log_time + 30 {
+            let invalid_shares = self.worker_invalid_shares
+                .get(&contribution.address)
+                .map(|c| c.load(AtomicOrdering::Relaxed))
+                .unwrap_or(0);
+            let total_shares = count + invalid_shares;
+            let rejection_rate = if total_shares > 0 {
+                (invalid_shares as f64 / total_shares as f64) * 100.0
             } else {
-                miner_difficulty as f64
+                0.0
             };
-            let effective_hashrate = (share_rate * average_difficulty) / 1_000_000.0;
-            info!(
-                "Recording share: worker={}, total_submissions={}, share_rate={:.2} shares/s, effective_hashrate={:.2} Mhash/s, average_difficulty={:.0}",
-                contribution.address, count, share_rate, effective_hashrate, average_difficulty
+            info!(target: "sharehandler",
+                "{}",
+                json!({
+                    "event": "share_recorded",
+                    "worker": contribution.address,
+                    "total_submissions": count,
+                    "rejection_rate_percent": format!("{:.2}", rejection_rate),
+                    "pool_fee_percent": self.pool_fee,
+                    "network_difficulty": network_difficulty
+                })
             );
             self.worker_log_times.get(&contribution.address).unwrap().store(current_time, AtomicOrdering::Relaxed);
         }
@@ -295,14 +407,18 @@ impl Sharehandler {
             &contribution.extranonce,
             &contribution.nonce,
         ).await {
-            info!("Failed to record share for worker={}: {:?}", contribution.address, e);
+            info!(target: "sharehandler",
+                "Failed to record share for worker={}: {:?}", contribution.address, e
+            );
             SHARE_PROCESSING_FAILED.with_label_values(&[&contribution.address]).inc();
             Err(e)
         } else {
             TOTAL_SHARES_RECORDED.with_label_values(&[&contribution.address]).inc();
-            info!("Recorded share for worker={}", contribution.address);
+            info!(target: "sharehandler", "Recorded share for worker={}", contribution.address);
             if let Err(e) = self.share_batch.send(contribution.clone()).await {
-                info!("Failed to send share to batch for worker={}: {:?}", contribution.address, e);
+                info!(target: "sharehandler",
+                    "Failed to send share to batch for worker={}: {:?}", contribution.address, e
+                );
                 SHARE_PROCESSING_FAILED.with_label_values(&[&contribution.address]).inc();
             }
             Ok(())
@@ -320,144 +436,11 @@ impl Sharehandler {
             .get(address)
             .map(|count| count.load(AtomicOrdering::Relaxed))
             .unwrap_or(0);
-        debug!(
+        debug!(target: "sharehandler",
             "Share counts: total={}, window_difficulty={} for address={}",
             total_submissions, window_difficulty, address
         );
         Ok((total_submissions, window_difficulty))
-    }
-
-    pub async fn get_dynamic_difficulty(&self, address: &str, base_difficulty: u64) -> u64 {
-        const ADJUSTMENT_FACTOR: f64 = 0.3; // 30% adjustment for fast convergence
-        const WINDOW_MS: u64 = 300_000; // 5-minute window
-        const INITIAL_WINDOW_MS: u64 = 5_000; // 5-second window for initial estimation
-        const DIFFICULTY_CHECK_INTERVAL_MS: u64 = 5_000; // Check every 5 seconds
-        const MINIMUM_DIFFICULTY: u64 = 250_000; // Minimum difficulty to reduce invalid shares
-
-        let mut target_difficulty = base_difficulty.max(MINIMUM_DIFFICULTY);
-        let mut estimated_hashrate = 0.0; // Initialize estimated_hashrate
-
-        let current_time_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as u64;
-        let last_check = self.worker_last_difficulty_check
-            .entry(address.to_string())
-            .or_insert(Arc::new(AtomicU64::new(0)))
-            .load(AtomicOrdering::Relaxed);
-
-        if current_time_ms - last_check >= DIFFICULTY_CHECK_INTERVAL_MS {
-            let share_rates = self.worker_share_rates
-                .get(address)
-                .map(|entry| entry.clone())
-                .unwrap_or_else(|| Arc::new(RwLock::new(VecDeque::new())));
-            let rates = share_rates.read().await;
-
-            // Initial difficulty estimation for new or returning miners
-            let initial_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= INITIAL_WINDOW_MS).count() as f64;
-            let initial_share_rate = initial_shares / (INITIAL_WINDOW_MS as f64 / 1000.0);
-            let initial_difficulty = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= INITIAL_WINDOW_MS)
-                .map(|(_, diff)| *diff as f64)
-                .sum::<f64>() / initial_shares.max(1.0);
-            if initial_share_rate > 0.0 && initial_difficulty > 0.0 {
-                estimated_hashrate = initial_share_rate * initial_difficulty / 1_000_000.0; // Mhash/s
-                let target_share_rate = (10.0 * (5.0 / estimated_hashrate.max(0.1)).sqrt()).min(5.0).max(1.0);
-                target_difficulty = ((estimated_hashrate * 1_000_000.0) / target_share_rate).max(MINIMUM_DIFFICULTY as f64) as u64;
-                debug!(
-                    "Initial estimation for {}: share_rate={:.2} shares/s, estimated_hashrate={:.2} Mhash/s, target_share_rate={:.2}, initial_difficulty={}",
-                    address, initial_share_rate, estimated_hashrate, target_share_rate, target_difficulty
-                );
-            }
-
-            // Dynamic adjustment based on 5-minute window
-            let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= WINDOW_MS).count() as f64;
-            let average_difficulty = if recent_shares > 0.0 {
-                rates.iter().filter(|(ts, _)| current_time_ms - *ts <= WINDOW_MS)
-                    .map(|(_, diff)| *diff as f64)
-                    .sum::<f64>() / recent_shares
-            } else {
-                target_difficulty as f64
-            };
-            let share_rate = recent_shares / (WINDOW_MS as f64 / 1000.0);
-            estimated_hashrate = share_rate * average_difficulty / 1_000_000.0;
-
-            if share_rate > 0.0 {
-                let target_share_rate = (10.0 * (5.0 / estimated_hashrate.max(0.1)).sqrt()).min(5.0).max(1.0);
-                let error = target_share_rate - share_rate;
-                let adjustment = (target_difficulty as f64 * ADJUSTMENT_FACTOR * error).max(-0.5 * target_difficulty as f64).min(0.5 * target_difficulty as f64);
-                target_difficulty = (target_difficulty as f64 + adjustment).max(base_difficulty.max(MINIMUM_DIFFICULTY) as f64) as u64;
-                debug!(
-                    "Dynamic adjustment for {}: share_rate={:.2} shares/s, estimated_hashrate={:.2} Mhash/s, target_share_rate={:.2}, adjustment={:.0}, final_difficulty={}",
-                    address, share_rate, estimated_hashrate, target_share_rate, adjustment, target_difficulty
-                );
-            }
-
-            // Update last difficulty check time
-            self.worker_last_difficulty_check.get(address).unwrap().store(current_time_ms, AtomicOrdering::Relaxed);
-        }
-
-        debug!(
-            "Dynamic difficulty for {}: base_difficulty={}, estimated_hashrate={:.2} Mhash/s, final_difficulty={}",
-            address, base_difficulty, estimated_hashrate, target_difficulty
-        );
-        target_difficulty
-    }
-
-    pub async fn get_balances_and_hashrate(&self, address: &str, stratum_conn: &StratumConn<'_>) -> Result<(u64, u64, f64)> {
-        let available_balance = sqlx::query_scalar::<_, i64>("SELECT available_balance FROM balances WHERE address = ?")
-            .bind(address)
-            .fetch_optional(&self.db.pool)
-            .await
-            .context("Failed to fetch available balance")?
-            .unwrap_or(0) as u64;
-
-        let unconfirmed_blocks = self.db.get_unconfirmed_blocks().await
-            .context("Failed to get unconfirmed blocks")?;
-
-        let mut pending_balance = 0;
-
-        for block in unconfirmed_blocks {
-            let block_timestamp = block.timestamp.unwrap_or(
-                SystemTime::now().duration_since(UNIX_EPOCH).expect("Time went backwards").as_secs() as i64
-            );
-            let share_counts = self.db.get_shares_in_time_window(block_timestamp, 300).await
-                .context("Failed to get share difficulties for reward distribution")?;
-            let total_difficulty: u64 = share_counts.iter().map(|entry| *entry.value()).sum();
-            if total_difficulty == 0 {
-                continue;
-            }
-
-            let miner_difficulty = share_counts.get(address).map(|entry| *entry.value()).unwrap_or(0);
-            let share_percentage = miner_difficulty as f64 / total_difficulty as f64;
-            let block_amount = block.amount as u64;
-            let miner_reward = ((block_amount as f64) * share_percentage) as u64;
-            pending_balance += miner_reward;
-        }
-
-        let share_rates = self.worker_share_rates
-            .get(address)
-            .map(|entry| entry.clone())
-            .unwrap_or_else(|| Arc::new(RwLock::new(VecDeque::new())));
-        let rates = share_rates.read().await;
-        let current_time_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as u64;
-        let recent_shares = rates.iter().filter(|(ts, _)| current_time_ms - *ts <= 300_000).count() as f64;
-        let average_difficulty = if recent_shares > 0.0 {
-            rates.iter().filter(|(ts, _)| current_time_ms - *ts <= 300_000)
-                .map(|(_, diff)| *diff as f64)
-                .sum::<f64>() / recent_shares
-        } else {
-            stratum_conn.difficulty as f64
-        };
-        let hashrate = (recent_shares / 300.0) * average_difficulty / 1_000_000.0;
-
-        debug!(
-            "Balances for address={}: available={} VE, pending={} VE, effective_hashrate={:.2} Mhash/s, recent_shares={}, average_difficulty={:.0}",
-            address, available_balance as f64 / 100_000_000.0, pending_balance as f64 / 100_000_000.0, hashrate, recent_shares, average_difficulty
-        );
-        Ok((available_balance, pending_balance, hashrate))
     }
 
     pub async fn should_log_share(&self, address: &str, count: u64) -> bool {
@@ -469,7 +452,7 @@ impl Sharehandler {
             .entry(address.to_string())
             .or_insert(Arc::new(AtomicU64::new(0)))
             .load(AtomicOrdering::Relaxed);
-        count % 100 == 0 || current_time >= last_log_time + 10
+        count % 500 == 0 || current_time >= last_log_time + 30
     }
 
     pub async fn update_log_time(&self, address: &str) {

@@ -22,7 +22,7 @@ rand = "0.8.5"
 http = "1.1.0"
 chrono = "0.4.38"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
-sqlx = { version = "0.8.2", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8.2", features = ["runtime-tokio-rustls", "postgres"] }
 dashmap = "6.1.0"
 clap = { version = "4.5.18", features = ["derive"] }
 dotenv = "0.15.0"

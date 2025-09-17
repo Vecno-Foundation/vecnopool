@@ -1,7 +1,7 @@
 //src/vecnod.rs
 
 use anyhow::Result;
-use log::{debug, warn};
+use log::warn;
 use proto::vecnod_message::Payload;
 use proto::submit_block_response_message::RejectReason;
 pub use proto::RpcBlock;
@@ -16,9 +16,9 @@ use std::convert::TryFrom;
 pub type Send<T> = mpsc::UnboundedSender<T>;
 type Recv<T> = mpsc::UnboundedReceiver<T>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct VecnodHandle {
-    send: Send<Payload>,
+    pub send: Send<Payload>,
 }
 
 impl VecnodHandle {
@@ -30,14 +30,20 @@ impl VecnodHandle {
     pub fn submit_block(&self, block: RpcBlock) {
         let _ = self.send.send(Payload::submit_block(block, false));
     }
+
+    pub fn send_cmd(&self, payload: Payload) {
+        let _ = self.send.send(payload);
+    }
 }
 
 #[derive(Debug)]
 pub enum Message {
     Info { version: String },
+    BlockDagInfo { virtual_daa_score: u64 },
     Template(RpcBlock),
     NewTemplate,
     SubmitBlockResult(Option<Box<str>>),
+    NewBlock,
 }
 
 struct ClientTask {
@@ -48,7 +54,6 @@ struct ClientTask {
 
 impl ClientTask {
     async fn run(self) -> Result<()> {
-        // Convert String to Uri
         let uri: Uri = self.url.parse().map_err(|e| anyhow::anyhow!("Invalid URL: {}", e))?;
         let mut client = RpcClient::connect(uri).await?;
         let mut stream = client
@@ -64,6 +69,9 @@ impl ClientTask {
                 Some(Payload::GetInfoResponse(info)) => Message::Info {
                     version: info.server_version,
                 },
+                Some(Payload::GetBlockDagInfoResponse(info)) => Message::BlockDagInfo {
+                    virtual_daa_score: info.virtual_daa_score,
+                },
                 Some(Payload::SubmitBlockResponse(res)) => {
                     let res = match (RejectReason::try_from(res.reject_reason), res.error) {
                         (Ok(RejectReason::None), None) => None,
@@ -72,10 +80,10 @@ impl ClientTask {
                         _ => Some(Box::from("Unknown error")),
                     };
                     Message::SubmitBlockResult(res)
-                }
+                },
                 Some(Payload::GetBlockTemplateResponse(res)) => {
                     if let Some(e) = res.error {
-                        warn!("Error: {}", e.message);
+                        warn!("Error in GetBlockTemplateResponse: {}", e.message);
                         continue;
                     }
                     if let Some(block) = res.block {
@@ -87,26 +95,44 @@ impl ClientTask {
                     } else {
                         continue;
                     }
-                }
-                Some(Payload::NewBlockTemplateNotification(_)) => Message::NewTemplate,
+                },
                 Some(Payload::NotifyNewBlockTemplateResponse(res)) => match res.error {
                     Some(e) => {
                         warn!("Unable to subscribe to new templates: {}", e.message);
-                        break;
+                        Message::NewTemplate
                     }
                     None => {
-                        debug!("Subscribed to new templates");
-                        continue;
+                        Message::NewTemplate
                     }
                 },
-                _ => {
-                    debug!("Received unknown message");
+                Some(Payload::NewBlockTemplateNotification(_)) => {
+                    Message::NewTemplate
+                },
+                Some(Payload::NotifyBlockAddedResponse(res)) => match res.error {
+                    Some(e) => {
+                        warn!("Error in NotifyBlockAddedResponse: {}", e.message);
+                        continue;
+                    }
+                    None => {
+                        Message::NewBlock
+                    }
+                },
+                Some(Payload::BlockAddedNotification(_)) => {
+                    Message::NewBlock
+                },
+                Some(payload) => {
+                    warn!("Received unhandled message type: {:?}", payload);
                     continue;
-                }
+                },
+                None => {
+                    warn!("Received empty payload");
+                    continue;
+                },
             };
             self.send_msg.send(msg)?;
         }
 
+        warn!("Vecnod connection closed, attempting to reconnect");
         Ok(())
     }
 }
@@ -155,6 +181,7 @@ impl Client {
         let send_cmd = handle.send.clone();
         send_cmd.send(Payload::get_info()).unwrap();
         send_cmd.send(Payload::notify_new_block_template()).unwrap();
+        send_cmd.send(Payload::notify_block_added()).unwrap();
 
         let client = Client {
             pay_address,
@@ -175,13 +202,13 @@ impl Client {
     }
 }
 
-mod proto {
+pub mod proto {
     use crate::pow;
     use crate::uint::U256;
+    use crate::vecnod::Payload;
     use anyhow::Result;
     use blake3::Hash as Blake3Hash;
     use blake3::Hasher as Blake3State;
-    use vecnod_message::Payload;
 
     const BLOCK_HASH_DOMAIN: &[u8; 32] = b"BlockHash\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
@@ -190,6 +217,10 @@ mod proto {
     impl Payload {
         pub fn get_info() -> Self {
             Payload::GetInfoRequest(GetInfoRequestMessage {})
+        }
+
+        pub fn get_block_dag_info() -> Self {
+            Payload::GetBlockDagInfoRequest(GetBlockDagInfoRequestMessage {})
         }
 
         pub fn submit_block(block: RpcBlock, allow_non_daa_blocks: bool) -> Self {
@@ -208,6 +239,10 @@ mod proto {
 
         pub fn notify_new_block_template() -> Self {
             Payload::NotifyNewBlockTemplateRequest(NotifyNewBlockTemplateRequestMessage {})
+        }
+
+        pub fn notify_block_added() -> Self {
+            Payload::NotifyBlockAddedRequest(NotifyBlockAddedRequestMessage {})
         }
     }
 

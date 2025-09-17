@@ -2,14 +2,14 @@ const fs = require('fs').promises;
 const path = require('path');
 const dotenv = require('dotenv');
 const { w3cwebsocket } = require('websocket');
-const sqlite3 = require('sqlite3').verbose();
+const { Client } = require('pg');
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 const RPC_URL = process.env.WRPC_URL;
 const MNEMONIC = process.env.MNEMONIC;
 const MINING_ADDR = process.env.MINING_ADDR;
-const DB_PATH = process.env.DB_PATH;
+const SQL_URI = process.env.SQL_URI;
 const NETWORK_ID = process.env.NETWORK_ID;
 
 // Set WebSocket for vecno
@@ -46,7 +46,6 @@ function serializeBigInt(obj) {
   );
 }
 
-
 // Strip worker suffix from address
 function stripWorkerSuffix(address) {
   return address.split('.')[0];
@@ -54,105 +53,107 @@ function stripWorkerSuffix(address) {
 
 // Database connection with indexing
 async function getDbConnection() {
-  const resolvedPath = path.resolve(DB_PATH);
-  return new Promise((resolve, reject) => {
-    const db = new sqlite3.Database(resolvedPath, sqlite3.OPEN_READWRITE | sqlite3.OPEN_CREATE, (err) => {
-      if (err) return reject(new Error(`Failed to connect to database: ${err.message}`));
-      db.run(
-        `CREATE TABLE IF NOT EXISTS balances (
-          id TEXT NOT NULL,
-          address TEXT NOT NULL,
-          available_balance INTEGER NOT NULL DEFAULT 0,
-          total_earned_balance INTEGER NOT NULL DEFAULT 0,
-          UNIQUE(id, address)
-        )`,
-        (err) => {
-          if (err) return reject(new Error(`Failed to create balances table: ${err.message}`));
-          db.run(
-            `CREATE INDEX IF NOT EXISTS idx_balances_available_balance ON balances (available_balance)`,
-            (err) => {
-              if (err) console.warn(`Failed to create index: ${err.message}`);
-            }
-          );
-          db.run(
-            `CREATE TABLE IF NOT EXISTS payments (
-              id INTEGER PRIMARY KEY AUTOINCREMENT,
-              address TEXT NOT NULL,
-              amount INTEGER NOT NULL,
-              tx_id TEXT NOT NULL,
-              timestamp INTEGER NOT NULL
-            )`,
-            (err) => {
-              if (err) return reject(new Error(`Failed to create payments table: ${err.message}`));
-              db.all('PRAGMA table_info(payments)', (err, rows) => {
-                if (err) return reject(err);
-                if (!rows.some((row) => row.name === 'tx_id')) {
-                  db.run('ALTER TABLE payments ADD COLUMN tx_id TEXT', (err) => {
-                    if (err) console.warn(`Failed to add tx_id column: ${err.message}`);
-                  });
-                }
-                resolve(db);
-              });
-            }
-          );
-        }
-      );
-    });
+  const client = new Client({
+    connectionString: SQL_URI.replace('postgresql+psycopg2', 'postgresql'), // Replace psycopg2 scheme for node-postgres
   });
+
+  try {
+    await client.connect();
+
+    // Create the balances table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS balances (
+        id TEXT NOT NULL,
+        address TEXT NOT NULL,
+        available_balance BIGINT NOT NULL DEFAULT 0,
+        total_earned_balance BIGINT NOT NULL DEFAULT 0,
+        CONSTRAINT unique_id_address UNIQUE (id, address)
+      )
+    `);
+
+    // Create index for balances table
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_balances_available_balance ON balances (available_balance)
+    `).catch((err) => {
+      console.warn(`Failed to create index: ${err.message}`);
+    });
+
+    // Create the payments table
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS payments (
+        id BIGSERIAL PRIMARY KEY,
+        address TEXT NOT NULL,
+        amount BIGINT NOT NULL,
+        tx_id TEXT NOT NULL,
+        timestamp BIGINT NOT NULL
+      )
+    `);
+
+    // Check if tx_id column exists (for schema migration compatibility)
+    const { rows } = await client.query(`
+      SELECT column_name FROM information_schema.columns 
+      WHERE table_name = 'payments' AND column_name = 'tx_id'
+    `);
+    if (rows.length === 0) {
+      await client.query('ALTER TABLE payments ADD COLUMN tx_id TEXT')
+        .catch((err) => console.warn(`Failed to add tx_id column: ${err.message}`));
+    }
+
+    return client;
+  } catch (err) {
+    await client.end().catch(() => {}); // Ensure client closes on error
+    throw new Error(`Failed to connect to database: ${err.message}`);
+  }
 }
 
 // Fetch balances from database
 async function fetchBalances(db) {
   const query = 'SELECT id, address, available_balance FROM balances WHERE available_balance >= 1000000000';
-  return new Promise((resolve, reject) => {
-    db.all(query, [], (err, rows) => {
-      if (err) return reject(new Error(`Failed to fetch balances: ${err.message}`));
-      const balances = rows.map((row) => ({
-        id: row.id,
-        address: row.address,
-        balance: BigInt(row.available_balance),
-      }));
-      if (balances.length === 0) console.warn('No eligible balances for payout (min_balance = 10 VE)');
-      resolve(balances);
-    });
-  });
+  try {
+    const { rows } = await db.query(query);
+    const balances = rows.map((row) => ({
+      id: row.id,
+      address: row.address,
+      balance: BigInt(row.available_balance),
+    }));
+    if (balances.length === 0) console.warn('No eligible balances for payout (min_balance = 10 VE)');
+    return balances;
+  } catch (err) {
+    throw new Error(`Failed to fetch balances: ${err.message}`);
+  }
 }
 
 // Reset balance in database
 async function resetBalance(db, address) {
-  return new Promise((resolve, reject) => {
-    db.run('UPDATE balances SET available_balance = 0 WHERE address = ?', [address], (err) => {
-      if (err) return reject(new Error(`Failed to reset balance for ${address}: ${err.message}`));
-      resolve();
-    });
-  });
+  try {
+    await db.query('UPDATE balances SET available_balance = 0 WHERE address = $1', [address]);
+  } catch (err) {
+    throw new Error(`Failed to reset balance for ${address}: ${err.message}`);
+  }
 }
 
 // Record payment in database
 async function recordPayment(db, vecno, address, amount, tx_id, NETWORK_ID) {
-  return new Promise((resolve, reject) => {
-    const timestamp = Math.floor(Date.now() / 1000);
-    db.run(
-      'INSERT INTO payments (address, amount, tx_id, timestamp) VALUES (?, ?, ?, ?)',
-      [address, amount.toString(), tx_id, timestamp],
-      (err) => {
-        if (err) return reject(new Error(`Failed to record payment for ${address}: ${err.message}`));
-        console.log(`Payment recorded: address=${address}, amount=${vecno.sompiToVecnoStringWithSuffix(BigInt(amount), NETWORK_ID)}, tx_id=${tx_id}`);
-        resolve();
-      }
+  const timestamp = Math.floor(Date.now() / 1000);
+  try {
+    await db.query(
+      'INSERT INTO payments (address, amount, tx_id, timestamp) VALUES ($1, $2, $3, $4)',
+      [address, amount.toString(), tx_id, timestamp]
     );
-  });
+    console.log(`Payment recorded: address=${address}, amount=${vecno.sompiToVecnoStringWithSuffix(BigInt(amount), NETWORK_ID)}, tx_id=${tx_id}`);
+  } catch (err) {
+    throw new Error(`Failed to record payment for ${address}: ${err.message}`);
+  }
 }
 
 // Clean up old payments
 async function cleanupOldPayments(db, retentionPeriodDays = 30) {
   const cutoffTimestamp = Math.floor(Date.now() / 1000) - retentionPeriodDays * 24 * 60 * 60;
-  return new Promise((resolve, reject) => {
-    db.run('DELETE FROM payments WHERE timestamp < ?', [cutoffTimestamp], (err) => {
-      if (err) return reject(new Error(`Failed to clean up old payments: ${err.message}`));
-      resolve();
-    });
-  });
+  try {
+    await db.query('DELETE FROM payments WHERE timestamp < $1', [cutoffTimestamp]);
+  } catch (err) {
+    throw new Error(`Failed to clean up old payments: ${err.message}`);
+  }
 }
 
 // Process payouts
@@ -330,13 +331,13 @@ async function init() {
     await processor.start();
     await new Promise((resolve) => setTimeout(resolve, 5000));
 
-    // Schedule payouts every 10 minutes
+    // Schedule payouts every 4 minutes
     setInterval(
       async () => {
         const result = await processPayouts(rpcClient, vecno, createTransactions, db, context, privateKey, MINING_ADDR, NETWORK_ID, processor);
         console.log('Scheduled payout result:', serializeBigInt(result));
       },
-      10 * 60 * 1000
+      4 * 60 * 1000
     );
 
     // Initial payout
@@ -348,9 +349,7 @@ async function init() {
       try {
         await processor?.stop();
         await rpcClient?.disconnect();
-        await new Promise((resolve, reject) =>
-          db.close((err) => (err ? reject(err) : resolve()))
-        );
+        await db.end();
         console.log('Shutdown complete');
       } catch (err) {
         console.error(`Shutdown error: ${err.message}`);

@@ -1,5 +1,18 @@
+# Rust-specific ignores
 /target
-.idea
-pool.db
+**/*.rs.bk
+Cargo.lock  # Optional: Include if you don't want to track Cargo.lock in a binary project
+
+# Node.js-related ignores (if applicable)
+node_modules
 package-lock.json
+
+# Environment files
 .env
+.env.*
+!.env.example  # Allow .env.example for template purposes
+
+# Other common ignores
+*.log
+*.tmp
+.DS_Store

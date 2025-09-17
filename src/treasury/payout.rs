@@ -1,148 +1,274 @@
+//src/treasury/payout.rs
+
 use anyhow::{Context, Result};
-use reqwest::Client;
-use serde_json::Value;
-use tokio_retry::{Retry, strategy::ExponentialBackoff};
-use crate::database::db::Db;
-use log::{debug, warn, info};
-use std::env;
 use std::sync::Arc;
 use sqlx::Row;
-use crate::metrics::{DB_QUERIES_SUCCESS, DB_QUERIES_FAILED, REWARDS_DISTRIBUTED};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
+use crate::database::db::{Db};
 use crate::stratum::protocol::PayoutNotification;
 use tokio::sync::broadcast::Sender;
-use std::time::{SystemTime, UNIX_EPOCH};
+use log::{debug, warn, info};
+use crate::metrics::{DB_QUERIES_SUCCESS, DB_QUERIES_FAILED, REWARDS_DISTRIBUTED};
 
-#[derive(Debug)]
-#[allow(dead_code)]
-struct Balance {
-    address: String,
-    available_balance: i64,
-}
+pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<Option<u64>>) -> Result<()> {
+    debug!("Starting check_confirmations task");
 
-pub async fn check_confirmations(db: Arc<Db>, client: &Client) -> Result<()> {
-    let vecnoscan_url = env::var("VECNOSCAN_URL").context("VECNOSCAN_URL must be set in .env")?;
-    debug!("Checking confirmations with VECNOSCAN_URL: {}", vecnoscan_url);
-    let retry_strategy = ExponentialBackoff::from_millis(200)
-        .factor(2)
-        .max_delay(std::time::Duration::from_secs(5))
-        .take(5);
-
-    let current_daa_score = Retry::spawn(retry_strategy.clone(), || async {
-        debug!("Fetching network info from: {}/info/network", vecnoscan_url);
-        let response = client
-            .get(&format!("{}/info/network", vecnoscan_url))
-            .send()
-            .await
-            .context("Failed to fetch Vecnoscan network info")?;
-        
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!("Vecnoscan info request failed: {}", response.status()));
+    // Wait for a fresh DAA score
+    let current_daa_score = match daa_score_rx.changed().await {
+        Ok(()) => match daa_score_rx.borrow_and_update().as_ref() {
+            Some(daa_score) => {
+                debug!("Using latest DAA score: {}", daa_score);
+                *daa_score
+            }
+            None => {
+                warn!("No DAA score available after change, skipping confirmation check");
+                return Err(anyhow::anyhow!("No DAA score available"));
+            }
+        },
+        Err(e) => {
+            warn!("DAA score channel closed: {:?}", e);
+            return Err(anyhow::anyhow!("DAA score channel closed"));
         }
+    };
 
-        let info: Value = response.json().await.context("Failed to parse Vecnoscan info response")?;
-        let daa_score = info["virtualDaaScore"]
-            .as_str()
-            .and_then(|s| s.parse::<u64>().ok())
-            .context("Failed to parse virtualDaaScore")?;
+    debug!("Fetched current virtual DAA score: {}", current_daa_score);
 
-        Ok(daa_score)
-    })
-    .await
-    .context("Failed to get current DAA score after retries")?;
+    let unconfirmed_blocks = match db.get_unconfirmed_blocks().await {
+        Ok(blocks) => {
+            debug!("Fetched {} unconfirmed blocks", blocks.len());
+            blocks
+        }
+        Err(e) => {
+            warn!("Failed to get unconfirmed blocks: {:?}", e);
+            DB_QUERIES_FAILED.with_label_values(&["get_unconfirmed_blocks"]).inc();
+            return Err(e).context("Failed to get unconfirmed blocks");
+        }
+    };
 
-    debug!("Fetched current DAA score: {}", current_daa_score);
-
-    let unconfirmed_blocks = db.get_unconfirmed_blocks().await
-        .context("Failed to get unconfirmed blocks")?;
-    
     if unconfirmed_blocks.is_empty() {
         debug!("No unconfirmed blocks to process");
+        // Still run cleanup for unaccepted blocks
+        if let Err(e) = db.cleanup_unaccepted_blocks().await {
+            warn!("Failed to clean up unaccepted blocks: {:?}", e);
+        } else {
+            debug!("Successfully cleaned up unaccepted blocks");
+        }
         return Ok(());
     }
 
-    // PPLNS window: 5 minutes (300 seconds)
-    let window_duration_secs = 300;
+    debug!("Processing {} unconfirmed blocks", unconfirmed_blocks.len());
+
+    // Batch update confirmations
+    let mut updates = Vec::new();
+    for block in unconfirmed_blocks {
+        debug!("Examining block: reward_block_hash={}, daa_score={}, accepted={}, confirmations={}", 
+               block.reward_block_hash, block.daa_score, block.accepted, block.confirmations);
+        if block.accepted == 0 {
+            debug!("Skipping unaccepted block: {}", block.reward_block_hash);
+            continue;
+        }
+
+        let confirmations = current_daa_score.saturating_sub(block.daa_score as u64);
+        debug!("Processing block: {}, new_confirmations={}", block.reward_block_hash, confirmations);
+        updates.push((block.reward_block_hash.clone(), confirmations as i64));
+    }
+
+    if !updates.is_empty() {
+        let start_time = SystemTime::now();
+        let mut transaction = db.pool.begin().await.context("Failed to start transaction for batch confirmations update")?;
+        for (reward_block_hash, confirmations) in &updates {
+            let result = sqlx::query(
+                "UPDATE blocks SET confirmations = $1 WHERE reward_block_hash = $2"
+            )
+            .bind(*confirmations)
+            .bind(&reward_block_hash)
+            .execute(&mut *transaction)
+            .await
+            .context(format!("Failed to update confirmations for block {}", reward_block_hash));
+
+            match result {
+                Ok(_) => {
+                    DB_QUERIES_SUCCESS.with_label_values(&["update_block_confirmations"]).inc();
+                    debug!("Updated confirmations: block_hash={}, confirmations={}", reward_block_hash, confirmations);
+                }
+                Err(e) => {
+                    DB_QUERIES_FAILED.with_label_values(&["update_block_confirmations"]).inc();
+                    warn!("Failed to update confirmations for block_hash={}: {:?}", reward_block_hash, e);
+                }
+            }
+        }
+        transaction.commit().await.context("Failed to commit batch confirmations update")?;
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("Batch update_block_confirmations took {} seconds for {} blocks", elapsed, updates.len());
+    }
+
+    // Clean up unaccepted blocks
+    if let Err(e) = db.cleanup_unaccepted_blocks().await {
+        warn!("Failed to clean up unaccepted blocks: {:?}", e);
+    } else {
+        debug!("Successfully cleaned up unaccepted blocks");
+    }
+
+    // Processną rewards after updating confirmations
+    if let Err(e) = process_rewards(db.clone()).await {
+        warn!("Failed to process rewards: {:?}", e);
+    }
+
+    debug!("Completed check_confirmations task");
+    Ok(())
+}
+
+pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
+    debug!("Starting process_rewards task");
+
+    const WINDOW_DURATION_SECS: u64 = 300; // Fixed 5-minute window for PPLNS
+
     let current_time_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_secs() as i64;
 
-    for block in unconfirmed_blocks {
-        let confirmations = current_daa_score.saturating_sub(block.daa_score as u64);
+    // Fetch unprocessed blocks with sufficient confirmations
+    let blocks = match db.get_blocks_for_rewards().await {
+        Ok(blocks) => {
+            debug!("Fetched {} blocks for reward processing", blocks.len());
+            blocks
+        }
+        Err(e) => {
+            warn!("Failed to fetch blocks for reward processing: {:?}", e);
+            DB_QUERIES_FAILED.with_label_values(&["fetch_blocks_for_rewards"]).inc();
+            return Err(e).context("Failed to fetch blocks for reward processing");
+        }
+    };
 
-        let result = db.update_block_confirmations(&block.reward_block_hash, confirmations).await
-            .context(format!("Failed to update confirmations for block {}", block.reward_block_hash));
-        
-        match result {
-            Ok(_) => {
-                DB_QUERIES_SUCCESS.with_label_values(&["update_block_confirmations"]).inc();
-                debug!("Updated confirmations: block_hash={}, confirmations={}", block.reward_block_hash, confirmations);
-            }
-            Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["update_block_confirmations"]).inc();
-                warn!("Failed to update confirmations for block_hash={}: {:?}", block.reward_block_hash, e);
-                continue;
-            }
+    if blocks.is_empty() {
+        debug!("No blocks eligible for reward processing");
+        return Ok(());
+    }
+
+    let mut processed_blocks = Vec::new();
+
+    for block in blocks {
+        // Check if block is within the PPLNS window
+        let block_timestamp = block.timestamp.unwrap_or(current_time_secs);
+        if current_time_secs < block_timestamp + WINDOW_DURATION_SECS as i64 {
+            continue;
         }
 
-        if confirmations >= 100 {
-            debug!("Block {} reached 100 confirmations, marked as valid, daa_score={}", block.reward_block_hash, block.daa_score);
-            if let Err(e) = db.mark_block_processed(&block.reward_block_hash).await {
-                warn!("Failed to mark block {} as processed: {:?}", block.reward_block_hash, e);
-                DB_QUERIES_FAILED.with_label_values(&["mark_block_processed"]).inc();
-                continue;
-            } else {
-                DB_QUERIES_SUCCESS.with_label_values(&["mark_block_processed"]).inc();
-            }
+        debug!("Block {} reached 100 confirmations and PPLNS window, processing: daa_score={}", 
+               block.reward_block_hash, block.daa_score);
+        processed_blocks.push(block.reward_block_hash.clone());
 
-            // Use PPLNS with a 5-minute window around block timestamp
-            let block_timestamp = block.timestamp.unwrap_or(current_time_secs);
-            let share_counts = db.get_shares_in_time_window(block_timestamp, window_duration_secs).await
-                .context("Failed to get share difficulties for reward distribution")?;
-            let total_difficulty: u64 = share_counts.iter().map(|entry| *entry.value()).sum();
-            debug!("Share difficulties for block {}: {:?}", block.reward_block_hash, share_counts);
-            
-            if total_difficulty == 0 {
-                warn!("No valid shares found for block {} in time window {}", block.reward_block_hash, block_timestamp);
+        // Use PPLNS with a 5-minute window around block timestamp
+        let share_counts = match db.get_shares_in_time_window(block_timestamp, WINDOW_DURATION_SECS).await {
+            Ok(counts) => counts,
+            Err(e) => {
+                warn!("Failed to get share difficulties for block {}: {:?}", block.reward_block_hash, e);
+                DB_QUERIES_FAILED.with_label_values(&["get_shares_in_time_window"]).inc();
                 continue;
             }
+        };
+        let total_difficulty: u64 = share_counts.iter().map(|entry| *entry.value()).sum();
+        debug!("Share difficulties for block {}: total_difficulty={}, shares={:?}", 
+               block.reward_block_hash, total_difficulty, share_counts);
 
-            let amount = block.amount as u64;
+        if total_difficulty == 0 {
+            warn!("No valid shares found for block {} in time window {}", block.reward_block_hash, block_timestamp);
+            continue;
+        }
 
-            for entry in share_counts.iter() {
-                let address = entry.key();
-                let miner_difficulty = *entry.value();
-                let share_percentage = miner_difficulty as f64 / total_difficulty as f64;
-                let miner_reward = ((amount as f64) * share_percentage) as u64;
+        let amount = block.amount as u64;
 
-                let result = db.add_balance(&block.miner_id, address, miner_reward).await
-                    .context(format!("Failed to add balance for address {} in block {}", address, block.reward_block_hash));
-                
-                match result {
-                    Ok(_) => {
-                        DB_QUERIES_SUCCESS.with_label_values(&["add_balance"]).inc();
-                        REWARDS_DISTRIBUTED.with_label_values(&[address, &block.reward_block_hash]).inc_by(miner_reward as f64 / 100_000_000.0);
-                    }
-                    Err(e) => {
-                        DB_QUERIES_FAILED.with_label_values(&["add_balance"]).inc();
-                        warn!("Failed to add balance for address={}: {:?}", address, e);
-                    }
+        for entry in share_counts.iter() {
+            let address = entry.key();
+            let miner_difficulty = *entry.value();
+            let share_percentage = miner_difficulty as f64 / total_difficulty as f64;
+            let miner_reward = ((amount as f64) * share_percentage) as u64;
+            info!("Distributing reward for block {}: address={}, reward={} sompi, share_percentage={:.2}%", 
+                  block.reward_block_hash, address, miner_reward, share_percentage * 100.0);
+
+            let result = db.add_balance(&block.miner_id, address, miner_reward).await
+                .context(format!("Failed to add balance for address {} in block {}", address, block.reward_block_hash));
+
+            match result {
+                Ok(_) => {
+                    DB_QUERIES_SUCCESS.with_label_values(&["add_balance"]).inc();
+                    REWARDS_DISTRIBUTED.with_label_values(&[address, &block.reward_block_hash]).inc_by(miner_reward as f64 / 100_000_000.0);
+                    info!("Added balance: address={}, reward={} VE, block={}", 
+                         address, miner_reward as f64 / 100_000_000.0, block.reward_block_hash);
+                }
+                Err(e) => {
+                    DB_QUERIES_FAILED.with_label_values(&["add_balance"]).inc();
+                    warn!("Failed to add balance for address={}: {:?}", address, e);
                 }
             }
         }
     }
 
+    // Batch mark processed blocks
+    if !processed_blocks.is_empty() {
+        let start_time = SystemTime::now();
+        let mut transaction = db.pool.begin().await.context("Failed to start transaction for batch mark processed")?;
+        for reward_block_hash in &processed_blocks {
+            let result = sqlx::query(
+                "UPDATE blocks SET processed = $1 WHERE reward_block_hash = $2"
+            )
+            .bind(1_i64)
+            .bind(&reward_block_hash)
+            .execute(&mut *transaction)
+            .await
+            .context(format!("Failed to mark block {} as processed", reward_block_hash));
+
+            match result {
+                Ok(_) => {
+                    DB_QUERIES_SUCCESS.with_label_values(&["mark_block_processed"]).inc();
+                    debug!("Marked block as processed: {}", reward_block_hash);
+                }
+                Err(e) => {
+                    DB_QUERIES_FAILED.with_label_values(&["mark_block_processed"]).inc();
+                    warn!("Failed to mark block {} as processed: {:?}", reward_block_hash, e);
+                }
+            }
+        }
+        transaction.commit().await.context("Failed to commit batch mark processed")?;
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        debug!("Batch mark_block_processed took {} seconds for {} blocks", elapsed, processed_blocks.len());
+    }
+
+    debug!("Completed process_rewards task");
     Ok(())
 }
 
 pub async fn process_payouts(db: Arc<Db>, payout_notify: Sender<PayoutNotification>) -> Result<()> {
-    debug!("Starting process_payouts to check for new payments");
+    debug!("Starting process_payouts task");
 
     // Fetch payments where notified = false
-    let payments = sqlx::query("SELECT address, amount, tx_id FROM payments WHERE notified = false")
+    let payments = match sqlx::query("SELECT address, amount, tx_id FROM payments WHERE notified = $1")
+        .bind(false)
         .fetch_all(&db.pool)
         .await
-        .context("Failed to fetch new payments")?
+        .context("Failed to fetch new payments")
+    {
+        Ok(rows) => {
+            debug!("Fetched {} payments from database", rows.len());
+            rows
+        }
+        Err(e) => {
+            warn!("Failed to fetch payments: {:?}", e);
+            DB_QUERIES_FAILED.with_label_values(&["fetch_payments"]).inc();
+            return Err(e);
+        }
+    };
+
+    debug!("Found {} new payments in database", payments.len());
+
+    if payments.is_empty() {
+        debug!("No new payments found in database");
+        return Ok(());
+    }
+
+    let payments = payments
         .into_iter()
         .map(|row| {
             Ok::<_, sqlx::Error>((
@@ -153,14 +279,9 @@ pub async fn process_payouts(db: Arc<Db>, payout_notify: Sender<PayoutNotificati
         })
         .collect::<Result<Vec<(String, i64, String)>, sqlx::Error>>()
         .context("Failed to parse payment rows")?;
-    debug!("Found {} new payments in database", payments.len());
-
-    if payments.is_empty() {
-        debug!("No new payments found in database");
-        return Ok(());
-    }
 
     for (address, amount, tx_id) in &payments {
+        debug!("Processing payout: address={}, amount={}, tx_id={}", address, amount, tx_id);
         // Send notification for new payment
         let notification = PayoutNotification {
             address: address.to_string(),
@@ -180,7 +301,8 @@ pub async fn process_payouts(db: Arc<Db>, payout_notify: Sender<PayoutNotificati
             );
 
             // Update the payment to mark it as notified
-            let result = sqlx::query("UPDATE payments SET notified = true WHERE tx_id = ?")
+            let result = sqlx::query("UPDATE payments SET notified = $1 WHERE tx_id = $2")
+                .bind(true)
                 .bind(tx_id)
                 .execute(&db.pool)
                 .await

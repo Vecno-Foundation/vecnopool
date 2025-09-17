@@ -1,4 +1,6 @@
-use anyhow::{Result, anyhow};
+//src/stratum/protocol.rs
+
+use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
 use serde::Serialize;
 use serde_json::json;
@@ -14,7 +16,6 @@ use crate::treasury::share_validator::validate_share;
 use crate::pow;
 use crate::vecnod::RpcBlock;
 use crate::uint::{U256, u256_to_hex};
-use crate::api::fetch_block_details;
 use crate::metrics::{
     MINER_ADDED_SHARES, MINER_INVALID_SHARES, MINER_DUPLICATED_SHARES, MINER_ADDRESS_MISMATCH,
     SHARE_VALIDATION_LATENCY,
@@ -39,7 +40,6 @@ pub struct StratumConn<'a> {
     pub last_template: Arc<RwLock<Option<RpcBlock>>>,
     pub extranonce: String,
     pub mining_addr: String,
-    pub client: reqwest::Client,
     pub duplicate_share_count: Arc<AtomicU64>,
     pub payout_notify_recv: broadcast::Receiver<PayoutNotification>,
 }
@@ -52,7 +52,6 @@ pub struct PayoutNotification {
     pub timestamp: i64,
 }
 
-// Helper function to handle share validation and submission
 async fn validate_and_submit_share(
     writer: &Arc<Mutex<WriteHalf<'_>>>,
     i: Id,
@@ -65,13 +64,11 @@ async fn validate_and_submit_share(
     pending_send: &mpsc::UnboundedSender<PendingResult>,
     extranonce: String,
     difficulty: u64,
-    client: &reqwest::Client,
-    mining_addr: &str,
+    _mining_addr: &str,
     duplicate_share_count: &Arc<AtomicU64>,
 ) -> Result<()> {
-    let timer = SHARE_VALIDATION_LATENCY.start_timer(); // Start latency timer
+    let timer = SHARE_VALIDATION_LATENCY.start_timer();
 
-    // Compute block hash with nonce
     let block_hash = {
         let mut header = template.header.clone().unwrap();
         header.nonce = nonce;
@@ -82,7 +79,7 @@ async fn validate_and_submit_share(
     let nonce_hex = format!("{:016x}", nonce);
     let contribution = Contribution {
         address: address.clone(),
-        difficulty: 1,
+        difficulty: difficulty as i64,
         timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("Time went backwards")
@@ -98,13 +95,22 @@ async fn validate_and_submit_share(
         reward_block_hash: Some(block_hash.clone()),
     };
 
-    // Validate share
-    if !validate_share(&contribution, jobs, share_handler.db.clone(), &nonce_hex).await? {
+    let is_valid = validate_share(&contribution, jobs, &nonce_hex).await?;
+    let is_duplicate = if is_valid {
+        share_handler.db
+            .check_duplicate_share(&block_hash, &nonce_hex)
+            .await
+            .context("Failed to check for duplicate share")? > 0
+    } else {
+        false
+    };
+
+    if is_duplicate {
         let count = duplicate_share_count.fetch_add(1, Ordering::SeqCst) + 1;
         MINER_DUPLICATED_SHARES.with_label_values(&[&address]).inc();
-        write_error_response(writer, i, 22, "Invalid or duplicate share".into()).await?;
+        write_error_response(writer, i, 22, "Duplicate share".into()).await?;
         debug!(
-            "Share rejected: job_id={}, block_hash={}, nonce={} for worker={}",
+            "Share rejected (duplicate): job_id={}, block_hash={}, nonce={} for worker={}",
             job_id, block_hash, nonce_hex, address
         );
         if count > 100 {
@@ -118,7 +124,17 @@ async fn validate_and_submit_share(
         return Ok(());
     }
 
-    // Log diagnostic information
+    if !is_valid {
+        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
+        write_error_response(writer, i, 22, "Invalid share".into()).await?;
+        debug!(
+            "Share rejected (invalid): job_id={}, block_hash={}, nonce={} for worker={}",
+            job_id, block_hash, nonce_hex, address
+        );
+        timer.stop_and_record();
+        return Ok(());
+    }
+
     let log_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut header = template.header.clone().unwrap();
         header.nonce = nonce;
@@ -145,30 +161,13 @@ async fn validate_and_submit_share(
         return Ok(());
     }
 
-    // Submit share to jobs
     debug!("Submitting share to jobs: job_id={}, nonce={:016x}, block_hash={}", job_id, nonce, block_hash);
-    if jobs.submit(i.clone(), job_id, nonce, pending_send.clone()).await {
+    if jobs.submit(i.clone(), job_id, nonce, address.clone(), extranonce.clone(), pending_send.clone()).await {
         MINER_ADDED_SHARES.with_label_values(&[&address]).inc();
         info!("Share accepted: job_id={} for worker={}", job_id, address);
-        if let Err(e) = share_handler.record_share(&contribution, difficulty).await {
+        if let Err(e) = share_handler.record_share(&contribution, difficulty, is_valid, is_duplicate).await {
             info!("Failed to record share for worker={}: {:?}", address, e);
         }
-
-        // Sleep to simulate network delay (reduced for Vecno's fast blockchain)
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let pool_fee = share_handler.pool_fee;
-        info!("Using pool fee {}% for block {}", pool_fee, block_hash);
-        let (_reward_block_hash, _daa_score) = match fetch_block_details(
-            share_handler.db.clone(),
-            client,
-            &block_hash,
-            mining_addr,
-            pool_fee,
-        ).await {
-            Ok(result) => result,
-            Err(_e) => (block_hash.clone(), contribution.daa_score as u64),
-        };
 
         let (total_submissions, window_submissions) = share_handler.get_share_counts(&address).await
             .map_err(|e| anyhow!("Failed to get share counts: {}", e))?;
@@ -188,11 +187,10 @@ async fn validate_and_submit_share(
         write_error_response(writer, i, 20, "Unable to submit share".into()).await?;
     }
 
-    timer.stop_and_record(); // Record latency
+    timer.stop_and_record();
     Ok(())
 }
 
-// Helper functions for writing to the socket
 async fn write_response<T: Serialize>(writer: &Arc<Mutex<WriteHalf<'_>>>, id: Id, result: Option<T>) -> Result<()> {
     let res = Response::ok(id, result)?;
     write(writer, &res).await
@@ -223,28 +221,40 @@ async fn write<T: Serialize>(writer: &Arc<Mutex<WriteHalf<'_>>>, data: &T) -> Re
 impl<'a> StratumConn<'a> {
     pub async fn write_template(&mut self) -> Result<()> {
         debug!("Sending template to worker: {:?}", self.payout_addr);
-        let (base_difficulty, params) = {
+        let params = {
             let borrow = self.recv.borrow();
             match borrow.as_ref() {
-                Some(j) => (j.difficulty(), j.to_value()),
+                Some(j) => j.to_value(),
                 None => {
                     debug!("No job template available for worker: {:?}", self.payout_addr);
                     return Ok(());
                 }
             }
         };
-        debug!("Base difficulty for job: {}", base_difficulty);
         self.write_request("mining.notify", Some(params)).await?;
 
         let address = self.payout_addr.as_ref().unwrap_or(&String::new()).clone();
         if !address.is_empty() && self.authorized {
-            let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(&address, base_difficulty).await;
-            let difficulty_f64 = (adjusted_difficulty as f64) / ((1u64 << 32) as f64);
-            if self.difficulty != adjusted_difficulty {
-                self.difficulty = adjusted_difficulty;
+            let job_id = self.recv.borrow().as_ref().map(|j| j.id.to_string()).unwrap_or_default();
+            let network_difficulty = match job_id.parse::<u8>() {
+                Ok(job_id_u8) => self.jobs
+                    .get_job_params(job_id_u8)
+                    .await
+                    .map(|params| params.difficulty())
+                    .unwrap_or(1000),
+                Err(_) => {
+                    warn!(target: "stratum::protocol",
+                        "Invalid job_id format for worker={}: job_id={}", address, job_id
+                    );
+                    1000
+                }
+            };
+            if self.difficulty != network_difficulty {
+                self.difficulty = network_difficulty;
+                let difficulty_f64 = (network_difficulty as f64) / ((1u64 << 32) as f64);
                 info!(
-                    "Sending difficulty {} (raw: {}) to worker: {}",
-                    difficulty_f64, adjusted_difficulty, address
+                    "Sending network difficulty {} (raw: {}) to worker: {} (source: network, job_id: {})",
+                    difficulty_f64, network_difficulty, address, job_id
                 );
                 self.write_request("mining.set_difficulty", Some(json!([difficulty_f64])))
                     .await?;
@@ -373,13 +383,25 @@ impl<'a> StratumConn<'a> {
                                 self.payout_addr = Some(params[0].clone());
                                 self.authorized = true;
                                 let address = self.payout_addr.as_ref().unwrap();
-                                let base_difficulty = self.recv.borrow().as_ref().map_or(0, |j| j.difficulty());
-                                let adjusted_difficulty = self.share_handler.get_dynamic_difficulty(address, base_difficulty).await;
-                                self.difficulty = adjusted_difficulty;
-                                let difficulty_f64 = (adjusted_difficulty as f64) / ((1u64 << 32) as f64);
+                                let job_id = self.recv.borrow().as_ref().map(|j| j.id.to_string()).unwrap_or_default();
+                                let network_difficulty = match job_id.parse::<u8>() {
+                                    Ok(job_id_u8) => self.jobs
+                                        .get_job_params(job_id_u8)
+                                        .await
+                                        .map(|params| params.difficulty())
+                                        .unwrap_or(1000),
+                                    Err(_) => {
+                                        warn!(target: "stratum::protocol",
+                                            "Invalid job_id format for worker={}: job_id={}", address, job_id
+                                        );
+                                        1000
+                                    }
+                                };
+                                self.difficulty = network_difficulty;
+                                let difficulty_f64 = (network_difficulty as f64) / ((1u64 << 32) as f64);
                                 info!(
-                                    "Sending initial difficulty {} (raw: {}) to worker: {}",
-                                    difficulty_f64, adjusted_difficulty, address
+                                    "Sending network difficulty {} (raw: {}) to worker: {} (source: network)",
+                                    difficulty_f64, network_difficulty, address
                                 );
                                 self.write_request("mining.set_difficulty", Some(json!([difficulty_f64])))
                                     .await?;
@@ -405,33 +427,6 @@ impl<'a> StratumConn<'a> {
                                     total_submissions, window_submissions, address
                                 );
                                 self.write_response(id, Some(json!([total_submissions, window_submissions]))).await?;
-                            }
-                            (Some(id), "mining.get_balance", Some(p)) => {
-                                if !self.authorized {
-                                    self.write_error_response(id, 24, "Unauthorized worker".into()).await?;
-                                    continue;
-                                }
-                                let params: Vec<String> = serde_json::from_value(p)?;
-                                let address = params.get(0).cloned().unwrap_or_default();
-                                if address != *self.payout_addr.as_ref().unwrap_or(&String::new()) {
-                                    MINER_ADDRESS_MISMATCH.with_label_values(&[&address]).inc();
-                                    self.write_error_response(id, 23, "Unknown worker".into()).await?;
-                                    continue;
-                                }
-                                let (available_balance, pending_balance, effective_hashrate) = self.share_handler.get_balances_and_hashrate(&address, self).await
-                                    .map_err(|e| anyhow!("Failed to get balances: {}", e))?;
-                                debug!(
-                                    "Sending balance: available={} VE, pending={} VE, effective_hashrate={} Mhash/s for address={}",
-                                    available_balance as f64 / 100_000_000.0,
-                                    pending_balance as f64 / 100_000_000.0,
-                                    effective_hashrate,
-                                    address
-                                );
-                                self.write_response(id, Some(json!({
-                                    "available_balance": available_balance as f64 / 100_000_000.0,
-                                    "pending_balance": pending_balance as f64 / 100_000_000.0,
-                                    "effective_hashrate": effective_hashrate
-                                }))).await?;
                             }
                             (Some(id), "mining.configure", Some(_)) => {
                                 debug!("Received mining.configure for worker: {:?}", self.payout_addr);
@@ -478,7 +473,6 @@ impl<'a> StratumConn<'a> {
                                     }
                                 };
 
-                                // Call validate_and_submit_share directly
                                 if let Err(e) = validate_and_submit_share(
                                     &self.writer,
                                     i,
@@ -491,7 +485,6 @@ impl<'a> StratumConn<'a> {
                                     &self.pending_send,
                                     self.extranonce.clone(),
                                     self.difficulty,
-                                    &self.client,
                                     &self.mining_addr,
                                     &self.duplicate_share_count,
                                 ).await {

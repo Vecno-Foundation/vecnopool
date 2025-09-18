@@ -28,22 +28,18 @@ pub struct Block {
 
 impl Db {
     pub async fn new() -> Result<Self> {
-        // Read the PostgreSQL connection URI from environment variables
         let sql_uri = std::env::var("SQL_URI").context("SQL_URI must be set in .env")?;
-
-        // Create the connection pool with performance optimizations
         let pool = PgPoolOptions::new()
-            .max_connections(20) // Suitable for high concurrency
-            .min_connections(5)  // Maintain a few idle connections
-            .idle_timeout(std::time::Duration::from_secs(600)) // Close idle connections after 10 minutes
-            .max_lifetime(std::time::Duration::from_secs(1800)) // Recycle connections after 30 minutes
+            .max_connections(20)
+            .min_connections(5)
+            .idle_timeout(std::time::Duration::from_secs(600))
+            .max_lifetime(std::time::Duration::from_secs(1800))
             .connect(&sql_uri)
             .await
             .context("Failed to connect to PostgreSQL database")?;
 
         debug!("Initializing database tables");
 
-        // Create the shares table
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS shares (
@@ -65,7 +61,6 @@ impl Db {
         .context("Failed to create shares table")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_shares_table"]).inc();
 
-        // Create indexes for shares table (optimized for fast fetching)
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_shares_daa_score_address ON shares (daa_score, address)"
         )
@@ -98,15 +93,12 @@ impl Db {
         .context("Failed to create index on shares table (address)")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_shares_index_address"]).inc();
 
-        // Create the balances table
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS balances (
-                id TEXT NOT NULL,
-                address TEXT NOT NULL,
+                address TEXT PRIMARY KEY,
                 available_balance BIGINT NOT NULL DEFAULT 0,
-                total_earned_balance BIGINT NOT NULL DEFAULT 0,
-                CONSTRAINT unique_id_address UNIQUE (id, address)
+                total_earned_balance BIGINT NOT NULL DEFAULT 0
             )
             "#,
         )
@@ -115,7 +107,6 @@ impl Db {
         .context("Failed to create balances table")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_balances_table"]).inc();
 
-        // Create the payments table
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS payments (
@@ -133,7 +124,6 @@ impl Db {
         .context("Failed to create payments table")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_payments_table"]).inc();
 
-        // Create index for payments table (optimize cleanupOldPayments)
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_payments_timestamp ON payments (timestamp)"
         )
@@ -142,7 +132,6 @@ impl Db {
         .context("Failed to create index on payments table (timestamp)")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_payments_index_timestamp"]).inc();
 
-        // Create the blocks table
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS blocks (
@@ -166,7 +155,6 @@ impl Db {
         .context("Failed to create blocks table")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_blocks_table"]).inc();
 
-        // Create indexes for blocks table
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_blocks_confirmations_processed ON blocks (confirmations, processed)"
         )
@@ -191,7 +179,6 @@ impl Db {
         .context("Failed to create index on blocks table (miner_id)")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_blocks_index_miner_id"]).inc();
 
-        // Create index for unaccepted blocks cleanup
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_blocks_accepted ON blocks (accepted)"
         )
@@ -200,7 +187,6 @@ impl Db {
         .context("Failed to create index on blocks table (accepted)")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_blocks_index_accepted"]).inc();
 
-        // Verify database schema
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
         )
@@ -214,7 +200,6 @@ impl Db {
             }
         }
 
-        // Verify payments table schema
         let columns: Vec<(String,)> = sqlx::query_as(
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'payments'"
         )
@@ -225,7 +210,6 @@ impl Db {
             return Err(anyhow::anyhow!("Payments table missing 'notified' column"));
         }
 
-        // Verify blocks table schema
         let block_columns: Vec<(String,)> = sqlx::query_as(
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'blocks'"
         )
@@ -242,7 +226,6 @@ impl Db {
             }
         }
 
-        // Verify indexes
         let indexes: Vec<(String,)> = sqlx::query_as(
             r#"
             SELECT indexname FROM pg_indexes
@@ -464,34 +447,29 @@ impl Db {
         }
     }
 
-    pub async fn add_balance(&self, id: &str, address: &str, amount: u64) -> Result<()> {
+    pub async fn add_balance(&self, _id: &str, address: &str, amount: u64) -> Result<()> {
         let start_time = SystemTime::now();
+        // Strip worker suffix from address
+        let base_address = address.split('.').next().unwrap_or(address);
         let result = sqlx::query(
             r#"
-            INSERT INTO balances (id, address, available_balance, total_earned_balance)
-            VALUES ($1, $2,
-                COALESCE((SELECT available_balance FROM balances WHERE id = $3 AND address = $4), 0) + $5,
-                COALESCE((SELECT total_earned_balance FROM balances WHERE id = $6 AND address = $7), 0) + $8)
-            ON CONFLICT ON CONSTRAINT unique_id_address
+            INSERT INTO balances (address, available_balance, total_earned_balance)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (address)
             DO UPDATE SET
-                available_balance = EXCLUDED.available_balance,
-                total_earned_balance = EXCLUDED.total_earned_balance
+                available_balance = balances.available_balance + EXCLUDED.available_balance,
+                total_earned_balance = balances.total_earned_balance + EXCLUDED.total_earned_balance
             "#,
         )
-        .bind(id)
-        .bind(address)
-        .bind(id)
-        .bind(address)
+        .bind(base_address)
         .bind(amount as i64)
-        .bind(id)
-        .bind(address)
         .bind(amount as i64)
         .execute(&self.pool)
         .await
         .context("Failed to add balance");
 
         let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
-        debug!("add_balance query took {} seconds for address={}", elapsed, address);
+        debug!("add_balance query took {} seconds for address={}", elapsed, base_address);
 
         match result {
             Ok(_) => {

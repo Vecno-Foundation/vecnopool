@@ -14,7 +14,6 @@ use crate::metrics::{DB_QUERIES_SUCCESS, DB_QUERIES_FAILED, REWARDS_DISTRIBUTED}
 pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<Option<u64>>) -> Result<()> {
     debug!("Starting check_confirmations task");
 
-    // Wait for a fresh DAA score
     let current_daa_score = match daa_score_rx.changed().await {
         Ok(()) => match daa_score_rx.borrow_and_update().as_ref() {
             Some(daa_score) => {
@@ -48,7 +47,6 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
 
     if unconfirmed_blocks.is_empty() {
         debug!("No unconfirmed blocks to process");
-        // Still run cleanup for unaccepted blocks
         if let Err(e) = db.cleanup_unaccepted_blocks().await {
             warn!("Failed to clean up unaccepted blocks: {:?}", e);
         } else {
@@ -59,7 +57,6 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
 
     debug!("Processing {} unconfirmed blocks", unconfirmed_blocks.len());
 
-    // Batch update confirmations
     let mut updates = Vec::new();
     for block in unconfirmed_blocks {
         debug!("Examining block: reward_block_hash={}, daa_score={}, accepted={}, confirmations={}", 
@@ -103,14 +100,12 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
         debug!("Batch update_block_confirmations took {} seconds for {} blocks", elapsed, updates.len());
     }
 
-    // Clean up unaccepted blocks
     if let Err(e) = db.cleanup_unaccepted_blocks().await {
         warn!("Failed to clean up unaccepted blocks: {:?}", e);
     } else {
         debug!("Successfully cleaned up unaccepted blocks");
     }
 
-    // Processną rewards after updating confirmations
     if let Err(e) = process_rewards(db.clone()).await {
         warn!("Failed to process rewards: {:?}", e);
     }
@@ -122,14 +117,13 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
 pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
     debug!("Starting process_rewards task");
 
-    const WINDOW_DURATION_SECS: u64 = 300; // Fixed 5-minute window for PPLNS
+    const WINDOW_DURATION_SECS: u64 = 300;
 
     let current_time_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
         .as_secs() as i64;
 
-    // Fetch unprocessed blocks with sufficient confirmations
     let blocks = match db.get_blocks_for_rewards().await {
         Ok(blocks) => {
             debug!("Fetched {} blocks for reward processing", blocks.len());
@@ -150,7 +144,6 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
     let mut processed_blocks = Vec::new();
 
     for block in blocks {
-        // Check if block is within the PPLNS window
         let block_timestamp = block.timestamp.unwrap_or(current_time_secs);
         if current_time_secs < block_timestamp + WINDOW_DURATION_SECS as i64 {
             continue;
@@ -160,7 +153,6 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
                block.reward_block_hash, block.daa_score);
         processed_blocks.push(block.reward_block_hash.clone());
 
-        // Use PPLNS with a 5-minute window around block timestamp
         let share_counts = match db.get_shares_in_time_window(block_timestamp, WINDOW_DURATION_SECS).await {
             Ok(counts) => counts,
             Err(e) => {
@@ -182,31 +174,32 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
 
         for entry in share_counts.iter() {
             let address = entry.key();
+            let base_address = address.split('.').next().unwrap_or(address);
             let miner_difficulty = *entry.value();
             let share_percentage = miner_difficulty as f64 / total_difficulty as f64;
             let miner_reward = ((amount as f64) * share_percentage) as u64;
             info!("Distributing reward for block {}: address={}, reward={} sompi, share_percentage={:.2}%", 
-                  block.reward_block_hash, address, miner_reward, share_percentage * 100.0);
+                  block.reward_block_hash, base_address, miner_reward, share_percentage * 100.0);
 
-            let result = db.add_balance(&block.miner_id, address, miner_reward).await
-                .context(format!("Failed to add balance for address {} in block {}", address, block.reward_block_hash));
+            // Note: The miner_id is not used in the balance update, as balances are now keyed by address only
+            let result = db.add_balance("", base_address, miner_reward).await
+                .context(format!("Failed to add balance for address {} in block {}", base_address, block.reward_block_hash));
 
             match result {
                 Ok(_) => {
                     DB_QUERIES_SUCCESS.with_label_values(&["add_balance"]).inc();
-                    REWARDS_DISTRIBUTED.with_label_values(&[address, &block.reward_block_hash]).inc_by(miner_reward as f64 / 100_000_000.0);
+                    REWARDS_DISTRIBUTED.with_label_values(&[base_address, &block.reward_block_hash]).inc_by(miner_reward as f64 / 100_000_000.0);
                     info!("Added balance: address={}, reward={} VE, block={}", 
-                         address, miner_reward as f64 / 100_000_000.0, block.reward_block_hash);
+                         base_address, miner_reward as f64 / 100_000_000.0, block.reward_block_hash);
                 }
                 Err(e) => {
                     DB_QUERIES_FAILED.with_label_values(&["add_balance"]).inc();
-                    warn!("Failed to add balance for address={}: {:?}", address, e);
+                    warn!("Failed to add balance for address={}: {:?}", base_address, e);
                 }
             }
         }
     }
 
-    // Batch mark processed blocks
     if !processed_blocks.is_empty() {
         let start_time = SystemTime::now();
         let mut transaction = db.pool.begin().await.context("Failed to start transaction for batch mark processed")?;
@@ -243,7 +236,6 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
 pub async fn process_payouts(db: Arc<Db>, payout_notify: Sender<PayoutNotification>) -> Result<()> {
     debug!("Starting process_payouts task");
 
-    // Fetch payments where notified = false
     let payments = match sqlx::query("SELECT address, amount, tx_id FROM payments WHERE notified = $1")
         .bind(false)
         .fetch_all(&db.pool)
@@ -282,7 +274,6 @@ pub async fn process_payouts(db: Arc<Db>, payout_notify: Sender<PayoutNotificati
 
     for (address, amount, tx_id) in &payments {
         debug!("Processing payout: address={}, amount={}, tx_id={}", address, amount, tx_id);
-        // Send notification for new payment
         let notification = PayoutNotification {
             address: address.to_string(),
             amount: *amount as u64,
@@ -300,7 +291,6 @@ pub async fn process_payouts(db: Arc<Db>, payout_notify: Sender<PayoutNotificati
                 tx_id
             );
 
-            // Update the payment to mark it as notified
             let result = sqlx::query("UPDATE payments SET notified = $1 WHERE tx_id = $2")
                 .bind(true)
                 .bind(tx_id)

@@ -73,7 +73,6 @@ async function getDbConnection() {
   });
 
   try {
-    // Test connection with retry
     await retry(
       async () => {
         const client = await pool.connect();
@@ -88,7 +87,6 @@ async function getDbConnection() {
       }
     );
 
-    // Verify required tables
     const tables = await pool.query(
       "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('balances', 'payments')"
     );
@@ -97,7 +95,6 @@ async function getDbConnection() {
       throw new Error('Required tables (balances, payments) not found. Ensure database initialization.');
     }
 
-    // Verify payments table columns
     const columns = await pool.query(
       "SELECT column_name FROM information_schema.columns WHERE table_name = 'payments'"
     );
@@ -109,7 +106,6 @@ async function getDbConnection() {
       }
     }
 
-    // Verify idx_payments_timestamp index
     const indexes = await pool.query(
       "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_payments_timestamp'"
     );
@@ -124,16 +120,29 @@ async function getDbConnection() {
   }
 }
 
-// Fetch balances from database
+// Fetch and aggregate balances by base address
 async function fetchBalances(db) {
-  const query = 'SELECT id, address, available_balance FROM balances WHERE available_balance >= 1000000000';
+  const query = 'SELECT address, available_balance FROM balances WHERE available_balance >= 1000000000';
   try {
     const { rows } = await db.query(query);
-    const balances = rows.map((row) => ({
-      id: row.id,
-      address: row.address,
-      balance: BigInt(row.available_balance),
-    }));
+    // Aggregate balances by base address
+    const balanceMap = new Map();
+    for (const row of rows) {
+      const baseAddress = stripWorkerSuffix(row.address);
+      const balance = BigInt(row.available_balance);
+      if (balanceMap.has(baseAddress)) {
+        balanceMap.set(baseAddress, {
+          address: baseAddress,
+          balance: balanceMap.get(baseAddress).balance + balance,
+        });
+      } else {
+        balanceMap.set(baseAddress, {
+          address: baseAddress,
+          balance,
+        });
+      }
+    }
+    const balances = Array.from(balanceMap.values());
     if (balances.length === 0) console.warn('No eligible balances for payout (min_balance = 10 VE)');
     return balances;
   } catch (err) {
@@ -141,12 +150,13 @@ async function fetchBalances(db) {
   }
 }
 
-// Reset balance in database
+// Reset balance in database for all entries with the same base address
 async function resetBalance(db, address) {
+  const baseAddress = stripWorkerSuffix(address);
   try {
-    await db.query('UPDATE balances SET available_balance = 0 WHERE address = $1', [address]);
+    await db.query('UPDATE balances SET available_balance = 0 WHERE address LIKE $1', [`${baseAddress}%`]);
   } catch (err) {
-    throw new Error(`Failed to reset balance for ${address}: ${err.message || 'Unknown update error'}, stack: ${err.stack || 'No stack trace'}`);
+    throw new Error(`Failed to reset balance for ${baseAddress}: ${err.message || 'Unknown update error'}, stack: ${err.stack || 'No stack trace'}`);
   }
 }
 
@@ -221,7 +231,7 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
       throw new Error('Node not synced; cannot process payouts');
     }
 
-    // Fetch and validate balances
+    // Fetch and aggregate balances
     const balances = await fetchBalances(db);
     if (!balances.length) {
       console.warn('No eligible balances for payout (min_balance = 10 VE)');
@@ -229,10 +239,9 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
     }
 
     const payments = balances
-      .filter(({ address }) => stripWorkerSuffix(address) !== MINING_ADDR)
+      .filter(({ address }) => address !== MINING_ADDR)
       .map(({ address, balance }, index) => ({
         address,
-        cleanAddress: stripWorkerSuffix(address),
         amount: balance,
         paymentId: index,
       }));
@@ -278,7 +287,7 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
 
     // Create transactions
     const transactionOutputs = payments.map((p) => ({
-      address: p.cleanAddress,
+      address: p.address,
       amount: p.amount,
       paymentId: p.paymentId,
     }));

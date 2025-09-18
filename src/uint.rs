@@ -6,6 +6,7 @@ pub trait BitArray {
     fn bit(&self, idx: usize) -> bool;
     #[allow(dead_code)]
     fn bit_slice(&self, start: usize, end: usize) -> Self;
+    #[allow(dead_code)]
     fn mask(&self, n: usize) -> Self;
     #[allow(dead_code)]
     fn trailing_zeros(&self) -> usize;

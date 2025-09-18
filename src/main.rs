@@ -81,8 +81,8 @@ async fn main() -> Result<()> {
             loop {
                 debug!("Cleanup task loop iteration");
                 cleanup_interval.tick().await;
-                // Clean up shares older than 60 minutes (3600 seconds)
-                if let Err(e) = db.cleanup_old_shares(3_600).await {
+                // Clean up shares older than 1 day (86400 seconds)
+                if let Err(e) = db.cleanup_old_shares(86_400).await {
                     warn!("Failed to clean up old shares: {:?}", e);
                 } else {
                     debug!("Successfully cleaned up old shares (retention: 3600s)");

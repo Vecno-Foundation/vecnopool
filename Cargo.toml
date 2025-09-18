@@ -1,5 +1,5 @@
 [package]
-name = "vecnod-stratum"
+name = "vecnopool"
 authors = ["yooshikii <yooshikii@vecnofoundation.org>"]
 license = "MIT"
 version = "0.1.0"

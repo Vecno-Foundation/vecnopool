@@ -35,7 +35,7 @@ impl Db {
         let pool = PgPoolOptions::new()
             .max_connections(20) // Suitable for high concurrency
             .min_connections(5)  // Maintain a few idle connections
-            .idle_timeout(std::time::Duration::from_secs(300)) // Close idle connections after 5 minutes
+            .idle_timeout(std::time::Duration::from_secs(600)) // Close idle connections after 10 minutes
             .max_lifetime(std::time::Duration::from_secs(1800)) // Recycle connections after 30 minutes
             .connect(&sql_uri)
             .await
@@ -132,6 +132,15 @@ impl Db {
         .await
         .context("Failed to create payments table")?;
         DB_QUERIES_SUCCESS.with_label_values(&["create_payments_table"]).inc();
+
+        // Create index for payments table (optimize cleanupOldPayments)
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_payments_timestamp ON payments (timestamp)"
+        )
+        .execute(&pool)
+        .await
+        .context("Failed to create index on payments table (timestamp)")?;
+        DB_QUERIES_SUCCESS.with_label_values(&["create_payments_index_timestamp"]).inc();
 
         // Create the blocks table
         sqlx::query(
@@ -245,7 +254,8 @@ impl Db {
                 'idx_blocks_confirmations_processed',
                 'idx_blocks_processed',
                 'idx_blocks_miner_id',
-                'idx_blocks_accepted'
+                'idx_blocks_accepted',
+                'idx_payments_timestamp'
             )
             "#,
         )
@@ -261,6 +271,7 @@ impl Db {
             "idx_blocks_processed",
             "idx_blocks_miner_id",
             "idx_blocks_accepted",
+            "idx_payments_timestamp",
         ];
         for index in expected_indexes {
             if !indexes.iter().any(|(name,)| name == index) {

@@ -2,7 +2,8 @@ const fs = require('fs').promises;
 const path = require('path');
 const dotenv = require('dotenv');
 const { w3cwebsocket } = require('websocket');
-const { Client } = require('pg');
+const { Pool } = require('pg');
+const retry = require('async-retry');
 
 // Load environment variables
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
@@ -11,6 +12,12 @@ const MNEMONIC = process.env.MNEMONIC;
 const MINING_ADDR = process.env.MINING_ADDR;
 const SQL_URI = process.env.SQL_URI;
 const NETWORK_ID = process.env.NETWORK_ID;
+
+// Validate environment variables
+const requiredEnv = ['WRPC_URL', 'MNEMONIC', 'MINING_ADDR', 'SQL_URI', 'NETWORK_ID'];
+for (const env of requiredEnv) {
+  if (!process.env[env]) throw new Error(`Missing environment variable: ${env}`);
+}
 
 // Set WebSocket for vecno
 globalThis.WebSocket = w3cwebsocket;
@@ -51,58 +58,69 @@ function stripWorkerSuffix(address) {
   return address.split('.')[0];
 }
 
-// Database connection with indexing
+// Database connection with pooling and schema verification
 async function getDbConnection() {
-  const client = new Client({
-    connectionString: SQL_URI.replace('postgresql+psycopg2', 'postgresql'), // Replace psycopg2 scheme for node-postgres
+  const pool = new Pool({
+    connectionString: SQL_URI.replace('postgresql+psycopg2', 'postgresql'),
+    max: 20,
+    min: 5,
+    idleTimeoutMillis: 600000,
+    connectionTimeoutMillis: 30000,
+  });
+
+  pool.on('error', (err) => {
+    console.error(`Database pool error: ${err.message || 'Unknown pool error'}, stack: ${err.stack || 'No stack trace'}`);
   });
 
   try {
-    await client.connect();
+    // Test connection with retry
+    await retry(
+      async () => {
+        const client = await pool.connect();
+        client.release();
+      },
+      {
+        retries: 5,
+        factor: 2,
+        minTimeout: 1000,
+        maxTimeout: 5000,
+        onRetry: (err) => console.warn(`Database connection retry: ${err.message || 'Unknown connection error'}`),
+      }
+    );
 
-    // Create the balances table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS balances (
-        id TEXT NOT NULL,
-        address TEXT NOT NULL,
-        available_balance BIGINT NOT NULL DEFAULT 0,
-        total_earned_balance BIGINT NOT NULL DEFAULT 0,
-        CONSTRAINT unique_id_address UNIQUE (id, address)
-      )
-    `);
-
-    // Create index for balances table
-    await client.query(`
-      CREATE INDEX IF NOT EXISTS idx_balances_available_balance ON balances (available_balance)
-    `).catch((err) => {
-      console.warn(`Failed to create index: ${err.message}`);
-    });
-
-    // Create the payments table
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS payments (
-        id BIGSERIAL PRIMARY KEY,
-        address TEXT NOT NULL,
-        amount BIGINT NOT NULL,
-        tx_id TEXT NOT NULL,
-        timestamp BIGINT NOT NULL
-      )
-    `);
-
-    // Check if tx_id column exists (for schema migration compatibility)
-    const { rows } = await client.query(`
-      SELECT column_name FROM information_schema.columns 
-      WHERE table_name = 'payments' AND column_name = 'tx_id'
-    `);
-    if (rows.length === 0) {
-      await client.query('ALTER TABLE payments ADD COLUMN tx_id TEXT')
-        .catch((err) => console.warn(`Failed to add tx_id column: ${err.message}`));
+    // Verify required tables
+    const tables = await pool.query(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('balances', 'payments')"
+    );
+    const tableNames = tables.rows.map((row) => row.table_name);
+    if (!tableNames.includes('balances') || !tableNames.includes('payments')) {
+      throw new Error('Required tables (balances, payments) not found. Ensure database initialization.');
     }
 
-    return client;
+    // Verify payments table columns
+    const columns = await pool.query(
+      "SELECT column_name FROM information_schema.columns WHERE table_name = 'payments'"
+    );
+    const columnNames = columns.rows.map((row) => row.column_name);
+    const requiredColumns = ['id', 'address', 'amount', 'tx_id', 'timestamp', 'notified'];
+    for (const col of requiredColumns) {
+      if (!columnNames.includes(col)) {
+        throw new Error(`Payments table missing required column: ${col}`);
+      }
+    }
+
+    // Verify idx_payments_timestamp index
+    const indexes = await pool.query(
+      "SELECT indexname FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_payments_timestamp'"
+    );
+    if (!indexes.rows.some((row) => row.indexname === 'idx_payments_timestamp')) {
+      console.warn('Missing idx_payments_timestamp index; cleanupOldPayments performance may be suboptimal');
+    }
+
+    return pool;
   } catch (err) {
-    await client.end().catch(() => {}); // Ensure client closes on error
-    throw new Error(`Failed to connect to database: ${err.message}`);
+    await pool.end().catch(() => {});
+    throw new Error(`Failed to connect to database or verify schema: ${err.message || 'Unknown database error'}, stack: ${err.stack || 'No stack trace'}`);
   }
 }
 
@@ -119,7 +137,7 @@ async function fetchBalances(db) {
     if (balances.length === 0) console.warn('No eligible balances for payout (min_balance = 10 VE)');
     return balances;
   } catch (err) {
-    throw new Error(`Failed to fetch balances: ${err.message}`);
+    throw new Error(`Failed to fetch balances: ${err.message || 'Unknown query error'}, stack: ${err.stack || 'No stack trace'}`);
   }
 }
 
@@ -128,7 +146,7 @@ async function resetBalance(db, address) {
   try {
     await db.query('UPDATE balances SET available_balance = 0 WHERE address = $1', [address]);
   } catch (err) {
-    throw new Error(`Failed to reset balance for ${address}: ${err.message}`);
+    throw new Error(`Failed to reset balance for ${address}: ${err.message || 'Unknown update error'}, stack: ${err.stack || 'No stack trace'}`);
   }
 }
 
@@ -137,12 +155,12 @@ async function recordPayment(db, vecno, address, amount, tx_id, NETWORK_ID) {
   const timestamp = Math.floor(Date.now() / 1000);
   try {
     await db.query(
-      'INSERT INTO payments (address, amount, tx_id, timestamp) VALUES ($1, $2, $3, $4)',
-      [address, amount.toString(), tx_id, timestamp]
+      'INSERT INTO payments (address, amount, tx_id, timestamp, notified) VALUES ($1, $2, $3, $4, $5)',
+      [address, amount.toString(), tx_id, timestamp, false]
     );
     console.log(`Payment recorded: address=${address}, amount=${vecno.sompiToVecnoStringWithSuffix(BigInt(amount), NETWORK_ID)}, tx_id=${tx_id}`);
   } catch (err) {
-    throw new Error(`Failed to record payment for ${address}: ${err.message}`);
+    throw new Error(`Failed to record payment for ${address}: ${err.message || 'Unknown insert error'}, stack: ${err.stack || 'No stack trace'}`);
   }
 }
 
@@ -150,24 +168,63 @@ async function recordPayment(db, vecno, address, amount, tx_id, NETWORK_ID) {
 async function cleanupOldPayments(db, retentionPeriodDays = 30) {
   const cutoffTimestamp = Math.floor(Date.now() / 1000) - retentionPeriodDays * 24 * 60 * 60;
   try {
-    await db.query('DELETE FROM payments WHERE timestamp < $1', [cutoffTimestamp]);
+    const result = await db.query('DELETE FROM payments WHERE timestamp < $1', [cutoffTimestamp]);
+    if (result.rowCount > 0) {
+      console.log(`Cleaned up ${result.rowCount} old payments older than ${retentionPeriodDays} days`);
+    }
   } catch (err) {
-    throw new Error(`Failed to clean up old payments: ${err.message}`);
+    throw new Error(`Failed to clean up old payments: ${err.message || 'Unknown cleanup error'}, stack: ${err.stack || 'No stack trace'}`);
   }
 }
 
-// Process payouts
+// Process payouts with transaction isolation
 async function processPayouts(rpcClient, vecno, createTransactions, db, context, privateKey, MINING_ADDR, NETWORK_ID, processor) {
-  try {
-    if (!vecno || !createTransactions) throw new Error('Required modules undefined');
+  let isProcessing = false;
+  if (isProcessing) {
+    console.warn('Payout processing already in progress; skipping');
+    return [];
+  }
+  isProcessing = true;
 
-    const serverInfo = await rpcClient.getServerInfo();
-    if (!serverInfo.isSynced) {
-      throw new Error('Node not synced');
+  try {
+    // Validate inputs
+    if (!rpcClient || !vecno || !createTransactions || !db || !context || !privateKey || !MINING_ADDR || !NETWORK_ID || !processor) {
+      throw new Error(`Missing required dependencies: ${JSON.stringify({
+        rpcClient: !!rpcClient,
+        vecno: !!vecno,
+        createTransactions: !!createTransactions,
+        db: !!db,
+        context: !!context,
+        privateKey: !!privateKey,
+        MINING_ADDR: !!MINING_ADDR,
+        NETWORK_ID: !!NETWORK_ID,
+        processor: !!processor,
+      })}`);
     }
 
+    // Check node sync status
+    const serverInfo = await retry(
+      async () => {
+        const info = await rpcClient.getServerInfo();
+        if (!info) throw new Error('Failed to retrieve server info');
+        return info;
+      },
+      {
+        retries: 3,
+        factor: 2,
+        minTimeout: 1000,
+        maxTimeout: 5000,
+        onRetry: (err) => console.warn(`RPC server info retry: ${err.message || 'Unknown RPC error'}`),
+      }
+    );
+    if (!serverInfo.isSynced) {
+      throw new Error('Node not synced; cannot process payouts');
+    }
+
+    // Fetch and validate balances
     const balances = await fetchBalances(db);
     if (!balances.length) {
+      console.warn('No eligible balances for payout (min_balance = 10 VE)');
       return [];
     }
 
@@ -185,47 +242,41 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
       return [];
     }
 
-    // Wait for UTXO processor
-    await new Promise((resolve, reject) => {
-      const maxWaitTime = 30000;
-      let elapsed = 0;
-      const checkUtxoReady = async () => {
-        try {
-          const utxos = (await rpcClient.getUtxosByAddresses({ addresses: [MINING_ADDR] })).entries || [];
-          if (utxos.length) {
-            resolve();
-          } else if (elapsed >= maxWaitTime) {
-            reject(new Error('No UTXOs available after timeout'));
-          } else {
-            elapsed += 1000;
-            setTimeout(checkUtxoReady, 1000);
-          }
-        } catch (err) {
-          reject(new Error(`UTXO check failed: ${err.message}`));
+    // Wait for UTXOs
+    await retry(
+      async () => {
+        const utxos = (await rpcClient.getUtxosByAddresses({ addresses: [MINING_ADDR] })).entries || [];
+        if (!utxos.length) {
+          throw new Error(`No UTXOs available for ${MINING_ADDR}`);
         }
-      };
-      checkUtxoReady();
-    });
+      },
+      {
+        retries: 3,
+        factor: 2,
+        minTimeout: 1000,
+        maxTimeout: 5000,
+        onRetry: (err) => console.warn(`UTXO fetch retry: ${err.message || 'Unknown UTXO error'}`),
+      }
+    );
 
     const utxos = (await rpcClient.getUtxosByAddresses({ addresses: [MINING_ADDR] })).entries || [];
     if (!utxos.length) {
-      console.error(`No UTXOs found for ${MINING_ADDR}`);
+      console.error(`No UTXOs found for ${MINING_ADDR} after retries`);
       try {
         await processor.stop();
         await processor.start();
         await context.clear();
         await context.trackAddresses([MINING_ADDR]);
+        const retryUtxos = (await rpcClient.getUtxosByAddresses({ addresses: [MINING_ADDR] })).entries || [];
+        if (!retryUtxos.length) {
+          throw new Error('Still no UTXOs available after processor restart');
+        }
       } catch (err) {
-        console.error(`Failed to restart UtxoProcessor: ${err.message}`);
-        return [];
-      }
-      const retryUtxos = (await rpcClient.getUtxosByAddresses({ addresses: [MINING_ADDR] })).entries || [];
-      if (!retryUtxos.length) {
-        console.error('Still no UTXOs available after restart');
-        return [];
+        throw new Error(`Failed to restart UtxoProcessor: ${err.message || 'Unknown processor error'}, stack: ${err.stack || 'No stack trace'}`);
       }
     }
 
+    // Create transactions
     const transactionOutputs = payments.map((p) => ({
       address: p.cleanAddress,
       amount: p.amount,
@@ -239,58 +290,87 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
       priorityFee: 0n,
     });
 
-    if (!transactions.length) {
-      console.error('No transactions created');
-      return [];
+    if (!transactions?.length) {
+      throw new Error('No transactions created; check UTXO or output configuration');
     }
 
     const processedPayments = [];
     const processedPaymentIds = new Set();
+    const client = await db.connect();
 
-    for (const transaction of transactions) {
-      if (!transaction.transaction?.inputs?.length) {
-        console.error(`Invalid transaction structure for ID ${transaction.id}`);
-        continue;
-      }
+    try {
+      await client.query('BEGIN');
 
-      await transaction.sign([privateKey]);
-      if (!transaction.transaction.inputs.every((input) => input.signatureScript?.length)) {
-        console.error(`Signature script empty for transaction ${transaction.id}`);
-        continue;
-      }
+      for (const transaction of transactions) {
+        if (!transaction?.transaction?.inputs?.length) {
+          console.error(`Invalid transaction structure for ID ${transaction.id || 'unknown'}`);
+          continue;
+        }
 
-      const submissionResponse = await transaction.submit(rpcClient);
-      console.log(`Transaction ${transaction.id} submitted: ${submissionResponse}`);
+        // Sign transaction
+        await transaction.sign([privateKey]);
+        if (!transaction.transaction.inputs.every((input) => input.signatureScript?.length)) {
+          throw new Error(`Signature script empty for transaction ${transaction.id || 'unknown'}`);
+        }
 
-      for (const output of transaction.transaction.outputs || []) {
-        const outputAmount = BigInt(output.value);
-        const matchingPayment = payments.find(
-          (p) => p.amount === outputAmount && !processedPaymentIds.has(p.paymentId)
+        // Submit transaction
+        const submissionResponse = await retry(
+          async () => {
+            const response = await transaction.submit(rpcClient);
+            if (!response) throw new Error('Transaction submission returned no response');
+            return response;
+          },
+          {
+            retries: 3,
+            factor: 2,
+            minTimeout: 1000,
+            maxTimeout: 5000,
+            onRetry: (err) => console.warn(`Transaction submission retry for ${transaction.id || 'unknown'}: ${err.message || 'Unknown submission error'}`),
+          }
         );
+        console.log(`Transaction ${transaction.id} submitted: ${JSON.stringify(submissionResponse)}`);
 
-        if (matchingPayment) {
-          await recordPayment(db, vecno, matchingPayment.address, matchingPayment.amount, transaction.id, NETWORK_ID);
-          await resetBalance(db, matchingPayment.address);
-          processedPayments.push({
-            address: matchingPayment.address,
-            amount: matchingPayment.amount.toString(),
-            txId: transaction.id,
-          });
-          processedPaymentIds.add(matchingPayment.paymentId);
+        // Record payments
+        for (const output of transaction.transaction.outputs || []) {
+          const outputAmount = BigInt(output.value);
+          const matchingPayment = payments.find(
+            (p) => p.amount === outputAmount && !processedPaymentIds.has(p.paymentId)
+          );
+
+          if (matchingPayment) {
+            await recordPayment(client, vecno, matchingPayment.address, matchingPayment.amount, transaction.id, NETWORK_ID);
+            await resetBalance(client, matchingPayment.address);
+            processedPayments.push({
+              address: matchingPayment.address,
+              amount: matchingPayment.amount.toString(),
+              txId: transaction.id,
+            });
+            processedPaymentIds.add(matchingPayment.paymentId);
+          }
         }
       }
+
+      await client.query('COMMIT');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw new Error(`Payout transaction failed: ${err.message || 'Unknown transaction error'}, stack: ${err.stack || 'No stack trace'}`);
+    } finally {
+      client.release();
     }
 
     return processedPayments;
   } catch (err) {
-    console.error(`Payout processing failed: ${err.message || 'Unknown error'}`);
+    console.error(`Payout processing failed: ${err.message || 'Unknown error'}, stack: ${err.stack || 'No stack trace'}`);
     return [];
+  } finally {
+    isProcessing = false;
   }
 }
 
 // Initialize
 async function init() {
   let vecno, RpcClient, PrivateKey, Mnemonic, XPrv, UtxoProcessor, UtxoContext, createTransactions;
+  let db, rpcClient, processor;
   try {
     vecno = require('.');
     if (!vecno) throw new Error('vecno module undefined');
@@ -309,23 +389,36 @@ async function init() {
       throw new Error('Derived address does not match MINING_ADDR');
     }
 
-    const rpcClient = new RpcClient({ url: RPC_URL, encoding: 'borsh', networkId: NETWORK_ID });
-    await rpcClient.connect();
-    if (!(await rpcClient.getServerInfo()).isSynced) {
-      throw new Error('Node not synced');
-    }
+    // Initialize RPC with retry
+    rpcClient = new RpcClient({ url: RPC_URL, encoding: 'borsh', networkId: NETWORK_ID });
+    await retry(
+      async () => {
+        await rpcClient.connect();
+        const serverInfo = await rpcClient.getServerInfo();
+        if (!serverInfo?.isSynced) {
+          throw new Error('Node not synced');
+        }
+      },
+      {
+        retries: 5,
+        factor: 2,
+        minTimeout: 1000,
+        maxTimeout: 5000,
+        onRetry: (err) => console.warn(`RPC connection retry: ${err.message || 'Unknown RPC error'}`),
+      }
+    );
 
-    const db = await getDbConnection();
+    db = await getDbConnection();
     await cleanupOldPayments(db);
 
-    const processor = new UtxoProcessor({ rpc: rpcClient, networkId: NETWORK_ID });
+    processor = new UtxoProcessor({ rpc: rpcClient, networkId: NETWORK_ID });
     const context = new UtxoContext({ processor });
     processor.addEventListener('utxo-proc-start', async () => {
       try {
         await context.clear();
         await context.trackAddresses([MINING_ADDR]);
       } catch (err) {
-        console.error(`Failed to initialize UtxoContext: ${err.message}`);
+        console.error(`Failed to initialize UtxoContext: ${err.message || 'Unknown context error'}, stack: ${err.stack || 'No stack trace'}`);
       }
     });
     await processor.start();
@@ -334,8 +427,12 @@ async function init() {
     // Schedule payouts every 4 minutes
     setInterval(
       async () => {
-        const result = await processPayouts(rpcClient, vecno, createTransactions, db, context, privateKey, MINING_ADDR, NETWORK_ID, processor);
-        console.log('Scheduled payout result:', serializeBigInt(result));
+        try {
+          const result = await processPayouts(rpcClient, vecno, createTransactions, db, context, privateKey, MINING_ADDR, NETWORK_ID, processor);
+          console.log('Scheduled payout result:', serializeBigInt(result));
+        } catch (err) {
+          console.error(`Scheduled payout failed: ${err.message || 'Unknown error'}, stack: ${err.stack || 'No stack trace'}`);
+        }
       },
       4 * 60 * 1000
     );
@@ -345,19 +442,37 @@ async function init() {
     console.log('Initial payout result:', serializeBigInt(initialResult));
 
     // Cleanup on exit
-    process.on('SIGINT', async () => {
+    const cleanup = async () => {
       try {
         await processor?.stop();
         await rpcClient?.disconnect();
-        await db.end();
+        await db?.end();
         console.log('Shutdown complete');
       } catch (err) {
-        console.error(`Shutdown error: ${err.message}`);
+        console.error(`Shutdown error: ${err.message || 'Unknown shutdown error'}, stack: ${err.stack || 'No stack trace'}`);
       }
       process.exit(0);
+    };
+
+    process.on('SIGINT', cleanup);
+    process.on('SIGTERM', cleanup);
+
+    process.on('uncaughtException', async (err) => {
+      console.error(`Uncaught exception: ${err.message || 'Unknown error'}, stack: ${err.stack || 'No stack trace'}`);
+      await cleanup();
+      process.exit(1);
+    });
+
+    process.on('unhandledRejection', async (err) => {
+      console.error(`Unhandled rejection: ${err.message || 'Unknown error'}, stack: ${err.stack || 'No stack trace'}`);
+      await cleanup();
+      process.exit(1);
     });
   } catch (err) {
-    console.error(`Initialization failed: ${err.message}`);
+    console.error(`Initialization failed: ${err.message || 'Unknown error'}, stack: ${err.stack || 'No stack trace'}`);
+    await processor?.stop();
+    await rpcClient?.disconnect();
+    await db?.end();
     process.exit(1);
   }
 }

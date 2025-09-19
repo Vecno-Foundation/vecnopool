@@ -10,7 +10,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use crate::database::db::Db;
-use crate::treasury::reward_table::get_block_reward;
 use hex;
 use dashmap::DashMap;
 use std::time::{Instant, Duration};
@@ -145,10 +144,27 @@ impl Jobs {
             // Clean up old entries to prevent memory growth
             self.submitted_hashes.retain(|_, v| now.duration_since(*v) < Duration::from_secs(60));
 
+            // Calculate reward from coinbase transaction
+            let reward = match block.transactions.get(0) {
+                Some(coinbase_tx) if coinbase_tx.inputs.is_empty() => {
+                    // Sum the amounts in the coinbase transaction outputs
+                    let total_reward: u64 = coinbase_tx
+                        .outputs
+                        .iter()
+                        .map(|output| output.amount)
+                        .sum();
+                    // Apply pool fee
+                    ((total_reward as f64) * (1.0 - self.pool_fee / 100.0)) as u64
+                }
+                _ => {
+                    debug!(target: "stratum::jobs", "No valid coinbase transaction found for job_id={}", job_id);
+                    // Remove from submitted_hashes to allow retry
+                    self.submitted_hashes.remove(&reward_block_hash);
+                    return false;
+                }
+            };
+
             let daa_score = header.daa_score;
-            let reward = get_block_reward(daa_score)
-                .map(|r| ((r as f64) * (1.0 - self.pool_fee / 100.0)) as u64)
-                .unwrap_or(0);
 
             // Add block details to database only if not a duplicate
             if let Err(e) = self.db.add_block_details(

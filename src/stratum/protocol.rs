@@ -157,15 +157,15 @@ async fn validate_and_submit_share(
             info!("Failed to record share for worker={}: {:?}", address, e);
         }
 
-        let (total_submissions, window_submissions) = share_handler.get_share_counts(&address).await
+        let (total_submissions, window_difficulty) = share_handler.get_share_counts(&address).await
             .map_err(|e| anyhow!("Failed to get share counts: {}", e))?;
         if share_handler.should_log_share(&address, total_submissions).await {
             info!(
-                "Share accepted: job_id={}, worker={}, total_submissions={}, window_submissions={}",
-                job_id, address, total_submissions, window_submissions
+                "Share accepted: job_id={}, worker={}, total_submissions={}, window_difficulty={}",
+                job_id, address, total_submissions, window_difficulty
             );
             share_handler.update_log_time(&address).await;
-            let params = json!([address.clone(), total_submissions, window_submissions]);
+            let params = json!([address.clone(), total_submissions, window_difficulty]);
             write_notification(writer, "mining.share_update", Some(params)).await?;
         }
         write_response(writer, i, Some(true)).await?;
@@ -405,13 +405,13 @@ impl<'a> StratumConn<'a> {
                                     self.write_error_response(id, 23, "Unknown worker".into()).await?;
                                     continue;
                                 }
-                                let (total_submissions, window_submissions) = self.share_handler.get_share_counts(&address).await
+                                let (total_submissions, window_difficulty) = self.share_handler.get_share_counts(&address).await
                                     .map_err(|e| anyhow!("Failed to get share counts: {}", e))?;
                                 debug!(
-                                    "Sending share counts: total={}, window={} for address={}",
-                                    total_submissions, window_submissions, address
+                                    "Sending share counts: total={}, window_difficulty={} for address={}",
+                                    total_submissions, window_difficulty, address
                                 );
-                                self.write_response(id, Some(json!([total_submissions, window_submissions]))).await?;
+                                self.write_response(id, Some(json!([total_submissions, window_difficulty]))).await?;
                             }
                             (Some(id), "mining.configure", Some(_)) => {
                                 debug!("Received mining.configure for worker: {:?}", self.payout_addr);

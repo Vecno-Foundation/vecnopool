@@ -10,7 +10,7 @@ use crate::stratum::protocol::PayoutNotification;
 use tokio::sync::broadcast::Sender;
 use log::{debug, warn, info};
 
-pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<Option<u64>>) -> Result<()> {
+pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<Option<u64>>, window_time_ms: u64) -> Result<()> {
     debug!("Starting check_confirmations task");
 
     let current_daa_score = match daa_score_rx.changed().await {
@@ -102,7 +102,7 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
         debug!("Successfully cleaned up unaccepted blocks");
     }
 
-    if let Err(e) = process_rewards(db.clone()).await {
+    if let Err(e) = process_rewards(db.clone(), window_time_ms).await {
         warn!("Failed to process rewards: {:?}", e);
     }
 
@@ -110,10 +110,10 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
     Ok(())
 }
 
-pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
+pub async fn process_rewards(db: Arc<Db>, window_time_ms: u64) -> Result<()> {
     debug!("Starting process_rewards task");
 
-    const WINDOW_DURATION_SECS: u64 = 300;
+    let window_duration_secs = window_time_ms / 1000;
 
     let current_time_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -140,7 +140,7 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
 
     for block in blocks {
         let block_timestamp = block.timestamp.unwrap_or(current_time_secs);
-        if current_time_secs < block_timestamp + WINDOW_DURATION_SECS as i64 {
+        if current_time_secs < block_timestamp + window_duration_secs as i64 {
             continue;
         }
 
@@ -148,14 +148,14 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
                block.reward_block_hash, block.daa_score);
         processed_blocks.push(block.reward_block_hash.clone());
 
-        let share_counts = match db.get_shares_in_time_window(block_timestamp, WINDOW_DURATION_SECS).await {
+        let share_counts = match db.get_shares_in_time_window(block_timestamp, window_duration_secs).await {
             Ok(counts) => counts,
             Err(e) => {
                 warn!("Failed to get share difficulties for block {}: {:?}", block.reward_block_hash, e);
                 continue;
             }
         };
-        let total_difficulty: u64 = share_counts.iter().map(|entry| *entry.value()).sum();
+        let total_difficulty: u64 = share_counts.iter().map(|(_address, difficulty)| *difficulty).sum();
         debug!("Share difficulties for block {}: total_difficulty={}, shares={:?}", 
                block.reward_block_hash, total_difficulty, share_counts);
 
@@ -166,11 +166,9 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
 
         let amount = block.amount as u64;
 
-        for entry in share_counts.iter() {
-            let address = entry.key();
+        for (address, miner_difficulty) in share_counts.iter() {
             let base_address = address.split('.').next().unwrap_or(address);
-            let miner_difficulty = *entry.value();
-            let share_percentage = miner_difficulty as f64 / total_difficulty as f64;
+            let share_percentage = *miner_difficulty as f64 / total_difficulty as f64;
             let miner_reward = ((amount as f64) * share_percentage) as u64;
             info!("Distributing reward for block {}: address={}, reward={} sompi, share_percentage={:.2}%", 
                   block.reward_block_hash, base_address, miner_reward, share_percentage * 100.0);

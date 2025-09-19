@@ -3,10 +3,8 @@
 use anyhow::{Context, Result};
 use log::{debug, info, warn, LevelFilter};
 use std::env;
-use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tokio::sync::watch;
-use crate::database::db::Db;
 use crate::treasury::payout::{check_confirmations, process_payouts};
 use crate::vecnod::{Client, Message, VecnodHandle};
 use crate::stratum::Stratum;
@@ -23,6 +21,21 @@ mod uint;
 async fn main() -> Result<()> {
     debug!("Starting main function");
     dotenv::dotenv().context("Failed to load .env file")?;
+
+    let window_time_ms: u64 = env::var("WINDOW_TIME_MS")
+        .map(|val| {
+            val.parse::<u64>()
+                .map_err(|e| anyhow::anyhow!("Invalid WINDOW_TIME_MS: {}", e))
+        })
+        .unwrap_or(Ok(300_000))
+        .context("Failed to parse WINDOW_TIME_MS")?;
+
+    // Validate window_time_ms
+    if window_time_ms < 30000 {
+        return Err(anyhow::anyhow!("WINDOW_TIME_MS must be at least 1000 milliseconds"));
+    }
+
+    debug!("Loaded WINDOW_TIME_MS: {}ms ({}s)", window_time_ms, window_time_ms / 1000);
 
     let rpc_url = env::var("RPC_URL").context("RPC_URL must be set in .env")?;
     let stratum_addr = env::var("STRATUM_ADDR").unwrap_or("localhost:6969".to_string());
@@ -57,9 +70,8 @@ async fn main() -> Result<()> {
     debug!("Creating VecnodHandle");
     let (handle, recv_cmd) = VecnodHandle::new();
     debug!("Initializing database");
-    let _db = Arc::new(Db::new().await.context("Failed to initialize database")?);
-    debug!("Initializing Stratum server");
-    let stratum = Stratum::new(&stratum_addr, handle.clone(), &pool_address, &network_id, pool_fee)
+
+    let stratum = Stratum::new(&stratum_addr, handle.clone(), &pool_address, &network_id, pool_fee, window_time_ms)
         .await
         .context("Failed to initialize Stratum")?;
 
@@ -71,16 +83,16 @@ async fn main() -> Result<()> {
     tokio::spawn({
         let db = stratum.share_handler.db.clone();
         async move {
-            let mut cleanup_interval = time::interval(Duration::from_secs(600)); // Run every 10 minutes
+            let mut cleanup_interval = time::interval(Duration::from_secs(6000)); // Run every 60 minutes
             cleanup_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             loop {
                 debug!("Cleanup task loop iteration");
                 cleanup_interval.tick().await;
-                // Clean up shares older than 1 day (86400 seconds)
+                // Clean up shares older than 24 hours (86400 seconds)
                 if let Err(e) = db.cleanup_old_shares(86_400).await {
                     warn!("Failed to clean up old shares: {:?}", e);
                 } else {
-                    debug!("Successfully cleaned up old shares (retention: 3600s)");
+                    debug!("Successfully cleaned up old shares (retention: 86400s)");
                 }
                 // Clean up processed blocks
                 if let Err(e) = db.cleanup_processed_blocks().await {
@@ -104,7 +116,7 @@ async fn main() -> Result<()> {
                 debug!("Confirmation task loop iteration");
                 confirmations_interval.tick().await;
                 debug!("Triggering check_confirmations");
-                if let Err(e) = check_confirmations(db.clone(), daa_score_rx.clone()).await {
+                if let Err(e) = check_confirmations(db.clone(), daa_score_rx.clone(), window_time_ms).await {
                     warn!("Failed to check confirmations: {:?}", e);
                 } else {
                     debug!("check_confirmations completed successfully");

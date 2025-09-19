@@ -1,12 +1,10 @@
 //src/database/db.rs
 
 use anyhow::{Context, Result};
-use dashmap::DashMap;
 use sqlx::postgres::{PgPoolOptions, PgPool};
 use sqlx::Row;
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::treasury::sharehandler::Contribution;
 use log::{debug, warn};
 
 #[derive(Debug)]
@@ -86,6 +84,13 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on shares table (address)")?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shares_job_id ON shares (job_id)"
+        )
+        .execute(&pool)
+        .await
+        .context("Failed to create index on shares table (job_id)")?;
 
         sqlx::query(
             r#"
@@ -220,6 +225,7 @@ impl Db {
                 'idx_shares_timestamp',
                 'idx_shares_timestamp_address',
                 'idx_shares_address',
+                'idx_shares_job_id',
                 'idx_blocks_confirmations_processed',
                 'idx_blocks_processed',
                 'idx_blocks_miner_id',
@@ -236,6 +242,7 @@ impl Db {
             "idx_shares_timestamp",
             "idx_shares_timestamp_address",
             "idx_shares_address",
+            "idx_shares_job_id",
             "idx_blocks_confirmations_processed",
             "idx_blocks_processed",
             "idx_blocks_miner_id",
@@ -294,61 +301,53 @@ impl Db {
                 }
                 Ok(())
             }
-            Err(e) => {
-                Err(e.into())
-            }
+            Err(e) => Err(e.into())
         }
     }
 
-    pub async fn load_recent_shares(&self, share_window: &mut VecDeque<Contribution>, n: usize) -> Result<u64> {
+    pub async fn get_total_shares(&self, window_secs: u64) -> Result<u64> {
         let start_time = SystemTime::now();
-        let result = sqlx::query_as::<_, Contribution>(
-            r#"
-            SELECT address, difficulty, timestamp, job_id, daa_score, extranonce, nonce, reward_block_hash
-            FROM shares
-            ORDER BY timestamp DESC
-            LIMIT $1
-            "#,
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs() as i64;
+        let result: Result<i64, _> = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM shares WHERE timestamp >= $1"
         )
-        .bind(n as i64)
-        .fetch_all(&self.pool)
+        .bind(current_time - window_secs as i64)
+        .fetch_one(&self.pool)
         .await
-        .context("Failed to load recent shares");
+        .context("Failed to query total shares");
 
         let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
-        debug!("load_recent_shares query took {} seconds", elapsed);
+        debug!("get_total_shares query took {} seconds for window_secs={}", elapsed, window_secs);
 
         match result {
-            Ok(rows) => {
-                let mut total_shares = 0;
-                for contribution in rows {
-                    total_shares += 1;
-                    share_window.push_front(contribution);
-                }
-                Ok(total_shares)
-            }
-            Err(e) => {
-                Err(e)
-            }
+            Ok(count) => Ok(count as u64),
+            Err(e) => Err(e)
         }
     }
 
-    pub async fn get_share_counts(&self, address: Option<&str>) -> Result<DashMap<String, u64>> {
+    pub async fn get_share_counts(&self, window_secs: Option<u64>) -> Result<HashMap<String, u64>> {
         let start_time = SystemTime::now();
-        let query = if let Some(addr) = address {
+        let current_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_secs() as i64;
+        let query = if let Some(secs) = window_secs {
             sqlx::query(
                 r#"
-                SELECT address, COUNT(*) as count
+                SELECT address, SUM(difficulty)::BIGINT as total_difficulty
                 FROM shares
-                WHERE address = $1
+                WHERE timestamp >= $1
                 GROUP BY address
                 "#,
             )
-            .bind(addr)
+            .bind(current_time - secs as i64)
         } else {
             sqlx::query(
                 r#"
-                SELECT address, COUNT(*) as count
+                SELECT address, SUM(difficulty)::BIGINT as total_difficulty
                 FROM shares
                 GROUP BY address
                 "#,
@@ -365,21 +364,19 @@ impl Db {
 
         match result {
             Ok(rows) => {
-                let sums = DashMap::new();
+                let mut sums = HashMap::new();
                 for row in rows {
                     let address: String = row.get(0);
-                    let count: i64 = row.get(1);
-                    sums.insert(address, count as u64);
+                    let total_difficulty: i64 = row.get(1);
+                    sums.insert(address, total_difficulty as u64);
                 }
                 Ok(sums)
             }
-            Err(e) => {
-                Err(e)
-            }
+            Err(e) => Err(e)
         }
     }
 
-    pub async fn get_shares_in_time_window(&self, timestamp: i64, window_duration_secs: u64) -> Result<DashMap<String, u64>> {
+    pub async fn get_shares_in_time_window(&self, timestamp: i64, window_duration_secs: u64) -> Result<HashMap<String, u64>> {
         let start_time = SystemTime::now();
         let start_timestamp = timestamp.saturating_sub(window_duration_secs as i64);
         let result = sqlx::query(
@@ -411,7 +408,7 @@ impl Db {
 
         match result {
             Ok(rows) => {
-                let sums = DashMap::new();
+                let mut sums = HashMap::new();
                 for row in rows {
                     let address: String = row.get(0);
                     let total_difficulty: i64 = row.get(1);
@@ -419,9 +416,7 @@ impl Db {
                 }
                 Ok(sums)
             }
-            Err(e) => {
-                Err(e)
-            }
+            Err(e) => Err(e)
         }
     }
 
@@ -450,12 +445,8 @@ impl Db {
         debug!("add_balance query took {} seconds for address={}", elapsed, base_address);
 
         match result {
-            Ok(_) => {
-                Ok(())
-            }
-            Err(e) => {
-                Err(e)
-            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e)
         }
     }
 
@@ -518,12 +509,8 @@ impl Db {
         }
 
         match result {
-            Ok(_) => {
-                Ok(())
-            }
-            Err(e) => {
-                Err(e)
-            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e)
         }
     }
 
@@ -550,9 +537,7 @@ impl Db {
                 }
                 Ok(rows)
             }
-            Err(e) => {
-                Err(e)
-            }
+            Err(e) => Err(e)
         }
     }
 
@@ -579,9 +564,7 @@ impl Db {
                 }
                 Ok(rows)
             }
-            Err(e) => {
-                Err(e)
-            }
+            Err(e) => Err(e)
         }
     }
 
@@ -602,12 +585,8 @@ impl Db {
         debug!("update_block_status query took {} seconds for reward_block_hash={}", elapsed, reward_block_hash);
 
         match result {
-            Ok(_) => {
-                Ok(())
-            }
-            Err(e) => {
-                Err(e)
-            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e)
         }
     }
 
@@ -639,9 +618,7 @@ impl Db {
                 }
                 Ok(count)
             }
-            Err(e) => {
-                Err(e)
-            }
+            Err(e) => Err(e)
         }
     }
 
@@ -673,9 +650,7 @@ impl Db {
                 }
                 Ok(())
             }
-            Err(e) => {
-                Err(e)
-            }
+            Err(e) => Err(e)
         }
     }
 
@@ -701,9 +676,7 @@ impl Db {
                 }
                 Ok(())
             }
-            Err(e) => {
-                Err(e)
-            }
+            Err(e) => Err(e)
         }
     }
 
@@ -729,9 +702,7 @@ impl Db {
                 }
                 Ok(())
             }
-            Err(e) => {
-                Err(e)
-            }
+            Err(e) => Err(e)
         }
     }
 }

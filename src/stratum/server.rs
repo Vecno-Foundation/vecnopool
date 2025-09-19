@@ -28,9 +28,10 @@ impl Stratum {
         pool_address: &str,
         _network_id: &str,
         pool_fee: f64,
+        window_time_ms: u64,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        info!("Listening on {}, pool fee: {}%", addr, pool_fee);
+        info!("Listening on {}, pool fee: {}%, window_time_ms: {}ms ({}s)", addr, pool_fee, window_time_ms, window_time_ms / 1000);
         let last_template = Arc::new(tokio::sync::RwLock::new(None));
         let db = Arc::new(Db::new().await?);
         let jobs = Arc::new(Jobs::new(handle, db.clone(), pool_address.to_string(), pool_fee));
@@ -39,11 +40,9 @@ impl Stratum {
         let (payout_notify, _) = broadcast::channel(100);
         let share_handler = Arc::new(Sharehandler::new(
             db,
-            10000,           // n_window
-            30_000,         // window_time_ms
-            pool_address.to_string(),
             pool_fee,
-            jobs.clone(),   // Added Jobs argument
+            jobs.clone(),
+            window_time_ms,
         ).await?);
         let worker_counter = Arc::new(AtomicU32::new(1));
 

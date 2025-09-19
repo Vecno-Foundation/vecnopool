@@ -79,6 +79,13 @@ impl Db {
         .context("Failed to create index on shares table (timestamp, address)")?;
 
         sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shares_timestamp_address_difficulty ON shares (timestamp, address, difficulty)"
+        )
+        .execute(&pool)
+        .await
+        .context("Failed to create index on shares table (timestamp, address, difficulty)")?;
+
+        sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_shares_address ON shares (address)"
         )
         .execute(&pool)
@@ -224,6 +231,7 @@ impl Db {
                 'idx_shares_daa_score_address',
                 'idx_shares_timestamp',
                 'idx_shares_timestamp_address',
+                'idx_shares_timestamp_address_difficulty',
                 'idx_shares_address',
                 'idx_shares_job_id',
                 'idx_blocks_confirmations_processed',
@@ -241,6 +249,7 @@ impl Db {
             "idx_shares_daa_score_address",
             "idx_shares_timestamp",
             "idx_shares_timestamp_address",
+            "idx_shares_timestamp_address_difficulty",
             "idx_shares_address",
             "idx_shares_job_id",
             "idx_blocks_confirmations_processed",

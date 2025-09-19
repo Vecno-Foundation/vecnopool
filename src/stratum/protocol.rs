@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::io::{AsyncWriteExt, BufReader, Lines};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
-use tokio::sync::{broadcast, mpsc, watch, RwLock, Mutex};
+use tokio::sync::{mpsc, watch, RwLock, Mutex};
 use hex;
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 use crate::stratum::{Id, Request, Response};
@@ -37,15 +37,6 @@ pub struct StratumConn<'a> {
     pub extranonce: String,
     pub mining_addr: String,
     pub duplicate_share_count: Arc<AtomicU64>,
-    pub payout_notify_recv: broadcast::Receiver<PayoutNotification>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct PayoutNotification {
-    pub address: String,
-    pub amount: u64,
-    pub tx_id: String,
-    pub timestamp: i64,
 }
 
 async fn validate_and_submit_share(
@@ -157,17 +148,6 @@ async fn validate_and_submit_share(
             info!("Failed to record share for worker={}: {:?}", address, e);
         }
 
-        let (total_submissions, window_difficulty) = share_handler.get_share_counts(&address).await
-            .map_err(|e| anyhow!("Failed to get share counts: {}", e))?;
-        if share_handler.should_log_share(&address, total_submissions).await {
-            info!(
-                "Share accepted: job_id={}, worker={}, total_submissions={}, window_difficulty={}",
-                job_id, address, total_submissions, window_difficulty
-            );
-            share_handler.update_log_time(&address).await;
-            let params = json!([address.clone(), total_submissions, window_difficulty]);
-            write_notification(writer, "mining.share_update", Some(params)).await?;
-        }
         write_response(writer, i, Some(true)).await?;
     } else {
         debug!("Unable to submit share: job_id={}, block_hash={}", job_id, block_hash);
@@ -185,15 +165,6 @@ async fn write_response<T: Serialize>(writer: &Arc<Mutex<WriteHalf<'_>>>, id: Id
 async fn write_error_response(writer: &Arc<Mutex<WriteHalf<'_>>>, id: Id, code: u64, message: Box<str>) -> Result<()> {
     let res = Response::err(id, code, message)?;
     write(writer, &res).await
-}
-
-async fn write_notification(writer: &Arc<Mutex<WriteHalf<'_>>>, method: &'static str, params: Option<serde_json::Value>) -> Result<()> {
-    let req = Request {
-        id: None,
-        method: method.into(),
-        params,
-    };
-    write(writer, &req).await
 }
 
 async fn write<T: Serialize>(writer: &Arc<Mutex<WriteHalf<'_>>>, data: &T) -> Result<()> {
@@ -274,38 +245,12 @@ impl<'a> StratumConn<'a> {
         self.write(&res).await
     }
 
-    async fn write_notification(&mut self, method: &'static str, params: Option<serde_json::Value>) -> Result<()> {
-        let req = Request {
-            id: None,
-            method: method.into(),
-            params,
-        };
-        self.write(&req).await
-    }
-
     async fn write<T: Serialize>(&mut self, data: &T) -> Result<()> {
         let data = serde_json::to_vec(data)?;
         debug!("Writing to miner: {} for worker: {:?}", String::from_utf8_lossy(&data), self.payout_addr);
         let mut writer = self.writer.lock().await;
         writer.write_all(&data).await?;
         writer.write_all(NEW_LINE.as_bytes()).await?;
-        Ok(())
-    }
-
-    async fn send_payout_notification(&mut self, payout: PayoutNotification) -> Result<()> {
-        if self.payout_addr.as_ref() == Some(&payout.address) {
-            debug!("Sending payout notification to worker: {:?}, amount={} VE, tx_id={}",
-                   self.payout_addr, payout.amount as f64 / 100_000_000.0, payout.tx_id);
-            self.write_notification(
-                "mining.payout",
-                Some(json!({
-                    "address": payout.address,
-                    "amount": payout.amount as f64 / 100_000_000.0,
-                    "tx_id": payout.tx_id,
-                    "timestamp": payout.timestamp
-                }))
-            ).await?;
-        }
         Ok(())
     }
 
@@ -320,21 +265,6 @@ impl<'a> StratumConn<'a> {
                     Ok(_) => {
                         if self.subscribed {
                             self.write_template().await?;
-                        }
-                    }
-                },
-                item = self.payout_notify_recv.recv() => {
-                    match item {
-                        Ok(payout) => {
-                            self.send_payout_notification(payout).await?;
-                        }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            info!("Payout notification receiver lagged by {} messages for worker {:?}", n, self.payout_addr);
-                            continue;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            info!("Payout notification channel closed for worker {:?}", self.payout_addr);
-                            break;
                         }
                     }
                 },
@@ -393,32 +323,6 @@ impl<'a> StratumConn<'a> {
                                     .await?;
                                 self.write_response(id, Some(true)).await?;
                                 self.write_template().await?;
-                            }
-                            (Some(id), "mining.get_shares", Some(p)) => {
-                                if !self.authorized {
-                                    self.write_error_response(id, 24, "Unauthorized worker".into()).await?;
-                                    continue;
-                                }
-                                let params: Vec<String> = serde_json::from_value(p)?;
-                                let address = params.get(0).cloned().unwrap_or_default();
-                                if address != *self.payout_addr.as_ref().unwrap_or(&String::new()) {
-                                    self.write_error_response(id, 23, "Unknown worker".into()).await?;
-                                    continue;
-                                }
-                                let (total_submissions, window_difficulty) = self.share_handler.get_share_counts(&address).await
-                                    .map_err(|e| anyhow!("Failed to get share counts: {}", e))?;
-                                debug!(
-                                    "Sending share counts: total={}, window_difficulty={} for address={}",
-                                    total_submissions, window_difficulty, address
-                                );
-                                self.write_response(id, Some(json!([total_submissions, window_difficulty]))).await?;
-                            }
-                            (Some(id), "mining.configure", Some(_)) => {
-                                debug!("Received mining.configure for worker: {:?}", self.payout_addr);
-                                self.write_response(id, Some(json!({
-                                    "version-rolling": false,
-                                    "minimum-difficulty": true
-                                }))).await?;
                             }
                             (Some(i), "mining.submit", Some(p)) => {
                                 if !self.authorized {

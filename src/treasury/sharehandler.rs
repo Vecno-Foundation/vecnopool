@@ -28,7 +28,6 @@ pub struct Contribution {
 #[derive(Debug)]
 pub struct Sharehandler {
     pub db: Arc<Db>,
-    pub window_time_ms: u64,
     pub share_batch: mpsc::Sender<Contribution>,
     pub worker_share_counts: Arc<DashMap<String, Arc<AtomicU64>>>,
     pub worker_invalid_shares: Arc<DashMap<String, Arc<AtomicU64>>>,
@@ -73,13 +72,12 @@ impl Sharehandler {
         let total_shares_clone = total_shares.clone();
         let worker_share_counts_clone = worker_share_counts.clone();
         let worker_log_times_clone = worker_log_times.clone();
-        let window_time_ms_clone = window_time_ms;
 
         tokio::spawn(async move {
             let mut batch = Vec::<Contribution>::new();
             let mut window_submission_counts: HashMap<String, u64> = HashMap::new();
             // Initialize window_submission_counts from database
-            if let Ok(counts) = db_clone.get_share_counts(Some(window_time_ms_clone / 1000)).await {
+            if let Ok(counts) = db_clone.get_share_counts(Some(window_time_ms / 1000)).await {
                 for (address, count) in counts {
                     window_submission_counts.insert(address, count);
                 }
@@ -115,7 +113,7 @@ impl Sharehandler {
                                 &total_shares_clone,
                                 &mut window_submission_counts,
                                 &mut batch,
-                                window_time_ms_clone,
+                                window_time_ms,
                             ).await;
                         }
                     }
@@ -126,7 +124,7 @@ impl Sharehandler {
                                 &total_shares_clone,
                                 &mut window_submission_counts,
                                 &mut batch,
-                                window_time_ms_clone,
+                                window_time_ms,
                             ).await;
                         }
                     }
@@ -136,7 +134,6 @@ impl Sharehandler {
 
         Ok(Sharehandler {
             db,
-            window_time_ms,
             share_batch,
             worker_share_counts,
             worker_invalid_shares,
@@ -199,8 +196,6 @@ impl Sharehandler {
             info!(target: "sharehandler", "Recorded {} batched shares for worker={}", count, address);
         }
 
-        // Note: No in-memory share window pruning, as shares are managed by the database
-        // Database cleanup is handled by the periodic task in src/main.rs
         debug!(target: "sharehandler",
             "Processed batch: total_shares={}, window_submission_counts={:?}",
             total_shares.load(AtomicOrdering::Relaxed), window_submission_counts
@@ -353,44 +348,5 @@ impl Sharehandler {
 
         info!(target: "sharehandler", "Recorded share for worker={}", contribution.address);
         Ok(())
-    }
-
-    pub async fn get_share_counts(&self, address: &str) -> Result<(u64, u64)> {
-        // Query database for share counts within the time window
-        let window_difficulty = self.db
-            .get_share_counts(Some(self.window_time_ms / 1000))
-            .await
-            .map(|counts| counts.get(address).copied().unwrap_or(0))?;
-        let total_submissions = self.worker_share_counts
-            .get(address)
-            .map(|count| count.load(AtomicOrdering::Relaxed))
-            .unwrap_or(0);
-        debug!(target: "sharehandler",
-            "Share counts: total={}, window_difficulty={} for address={}",
-            total_submissions, window_difficulty, address
-        );
-        Ok((total_submissions, window_difficulty))
-    }
-
-    pub async fn should_log_share(&self, address: &str, count: u64) -> bool {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs();
-        let last_log_time = self.worker_log_times
-            .entry(address.to_string())
-            .or_insert(Arc::new(AtomicU64::new(0)))
-            .load(AtomicOrdering::Relaxed);
-        count % 500 == 0 || current_time >= last_log_time + 30
-    }
-
-    pub async fn update_log_time(&self, address: &str) {
-        let current_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_secs();
-        if let Some(log_time) = self.worker_log_times.get(address) {
-            log_time.store(current_time, AtomicOrdering::Relaxed);
-        }
     }
 }

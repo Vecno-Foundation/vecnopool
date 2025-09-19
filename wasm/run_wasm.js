@@ -187,7 +187,7 @@ async function cleanupOldPayments(db, retentionPeriodDays = 30) {
   }
 }
 
-// Process payouts with transaction isolation
+// Process payouts with transaction isolation and dynamic fee calculation
 async function processPayouts(rpcClient, vecno, createTransactions, db, context, privateKey, MINING_ADDR, NETWORK_ID, processor) {
   let isProcessing = false;
   if (isProcessing) {
@@ -251,7 +251,7 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
       return [];
     }
 
-    // Wait for UTXOs
+    // Fetch UTXOs
     await retry(
       async () => {
         const utxos = (await rpcClient.getUtxosByAddresses({ addresses: [MINING_ADDR] })).entries || [];
@@ -285,23 +285,182 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
       }
     }
 
-    // Create transactions
+    console.log(`Available UTXOs: ${utxos.length}, total amount: ${utxos.reduce((sum, u) => sum + BigInt(u.amount), 0n)} sompi`);
+
+    // Calculate total payment amount
+    const totalPaymentAmount = payments.reduce((sum, p) => sum + BigInt(p.amount), 0n);
+    console.log(`Total payment amount: ${totalPaymentAmount} sompi`);
+
+    // Estimate transaction fee with retries
+    let feePerByte = 2000n; // Default fee rate (sompi per byte)
+    let feeSource = 'default';
+    try {
+      const feeEstimate = await retry(
+        async () => {
+          const estimate = await rpcClient.getFeeEstimate(null);
+          console.log('getFeeEstimate response:', serializeBigInt(estimate));
+          return estimate;
+        },
+        {
+          retries: 3,
+          factor: 2,
+          minTimeout: 1000,
+          maxTimeout: 5000,
+          onRetry: (err) => console.warn(`getFeeEstimate retry: ${err.message || 'Unknown error'}`),
+        }
+      );
+      if (feeEstimate?.estimate?.normalBuckets?.length && BigInt(feeEstimate.estimate.normalBuckets[0].feerate) > 0n) {
+        feePerByte = BigInt(feeEstimate.estimate.normalBuckets[0].feerate);
+        if (feePerByte < 1000n) {
+          console.warn(`Fee rate ${feePerByte} sompi/byte is below minimum threshold; using 1000 sompi/byte`);
+          feePerByte = 1000n;
+        } else {
+          feeSource = 'getFeeEstimate';
+          console.log(`Fetched fee rate from getFeeEstimate: ${feePerByte} sompi/byte`);
+        }
+      } else {
+        console.warn('Invalid fee estimate from getFeeEstimate; using default fee rate');
+      }
+    } catch (err) {
+      console.warn(`Failed to fetch fee estimate: ${err.message || 'Unknown error'}, stack: ${err.stack || 'No stack trace'}; using default fee rate`);
+    }
+
+    // Create transaction outputs
     const transactionOutputs = payments.map((p) => ({
       address: p.address,
       amount: p.amount,
       paymentId: p.paymentId,
     }));
 
-    const { transactions, summary } = await createTransactions({
-      entries: context,
-      outputs: transactionOutputs,
-      changeAddress: MINING_ADDR,
-      priorityFee: 0n,
-    });
+    // Get maximum standard transaction mass
+    const maxMass = vecno.maximumStandardTransactionMass();
+    console.log(`Maximum standard transaction mass: ${maxMass}`);
+
+    // Estimate transaction fee
+    let estimatedFee = 0n;
+    let transactions = [];
+    let summary = {};
+
+    try {
+      // Split payments into batches to avoid exceeding maxMass
+      const batchSize = Math.max(1, Math.floor(100 / payments.length)); // Adjust based on payment count
+      const paymentBatches = [];
+      for (let i = 0; i < payments.length; i += batchSize) {
+        paymentBatches.push(payments.slice(i, i + batchSize));
+      }
+
+      let totalFee = 0n;
+      const batchTransactions = [];
+      const maxAttempts = 3;
+
+      for (const [batchIndex, batchPayments] of paymentBatches.entries()) {
+        const batchOutputs = batchPayments.map((p) => ({
+          address: p.address,
+          amount: p.amount,
+          paymentId: p.paymentId,
+        }));
+
+        let batchFee = 0n;
+        let batchTxs, batchSummary;
+
+        // Calculate fee for batch
+        try {
+          const result = await retry(
+            async () => {
+              const res = await createTransactions({
+                entries: context,
+                outputs: batchOutputs,
+                changeAddress: MINING_ADDR,
+                priorityFee: 0n, // Temporary for fee estimation
+              });
+              console.log(`Batch ${batchIndex} temporary createTransactions summary:`, serializeBigInt(res.summary));
+              return res;
+            },
+            {
+              retries: maxAttempts,
+              factor: 2,
+              minTimeout: 1000,
+              maxTimeout: 5000,
+              onRetry: (err) => console.warn(`Batch ${batchIndex} temporary createTransactions retry: ${err.message || 'Unknown error'}`),
+            }
+          );
+          batchTxs = result.transactions;
+          batchSummary = result.summary;
+
+          if (!batchTxs?.length) {
+            throw new Error(`No transactions created for batch ${batchIndex}; check UTXO or output configuration`);
+          }
+
+          // Calculate fee for each transaction
+          for (const tx of batchTxs) {
+            try {
+              console.log(`Calculating fee for batch ${batchIndex} transaction ${tx.id || 'unknown'}:`, serializeBigInt(tx.transaction));
+              const fee = await vecno.calculateTransactionFee(NETWORK_ID, tx.transaction, null);
+              if (fee === undefined) {
+                throw new Error(`Transaction ${tx.id || 'unknown'} exceeds maximum standard transaction mass (${maxMass})`);
+              }
+              batchFee += BigInt(fee);
+            } catch (feeErr) {
+              console.error(`Failed to calculate fee for batch ${batchIndex} transaction ${tx.id || 'unknown'}: ${feeErr.message || 'Unknown error'}, stack: ${feeErr.stack || 'No stack trace'}`);
+              throw feeErr;
+            }
+          }
+        } catch (err) {
+          throw new Error(`Failed to process batch ${batchIndex}: ${err.message || 'Unknown error'}, stack: ${err.stack || 'No stack trace'}`);
+        }
+
+        totalFee += batchFee;
+        batchTransactions.push(...batchTxs);
+      }
+
+      estimatedFee = totalFee;
+      console.log(`Estimated total fee: ${estimatedFee} sompi (using ${feeSource} fee rate: ${feePerByte} sompi/byte)`);
+
+      // Calculate total required amount
+      const totalRequired = totalPaymentAmount + estimatedFee;
+      const availableBalance = utxos.reduce((sum, utxo) => sum + BigInt(utxo.amount), 0n);
+      if (totalRequired > availableBalance) {
+        throw new Error(
+          `Insufficient UTXO balance: required=${totalRequired}, available=${availableBalance}, payments=${totalPaymentAmount}, estimatedFee=${estimatedFee}`
+        );
+      }
+
+      // Create final transactions with calculated fee
+      try {
+        const result = await retry(
+          async () => {
+            const res = await createTransactions({
+              entries: context,
+              outputs: transactionOutputs,
+              changeAddress: MINING_ADDR,
+              priorityFee: estimatedFee,
+            });
+            console.log('Final createTransactions inputs:', serializeBigInt(res.transactions.map(t => t.transaction.inputs)));
+            console.log('Final createTransactions outputs:', serializeBigInt(res.transactions.map(t => t.transaction.outputs)));
+            return res;
+          },
+          {
+            retries: maxAttempts,
+            factor: 2,
+            minTimeout: 1000,
+            maxTimeout: 5000,
+            onRetry: (err) => console.warn(`Final createTransactions retry: ${err.message || 'Unknown error'}`),
+          }
+        );
+        transactions = result.transactions;
+        summary = result.summary;
+      } catch (err) {
+        throw new Error(`Failed to create final transactions: ${err.message || 'Unknown error'}, stack: ${err.stack || 'No stack trace'}`);
+      }
+    } catch (err) {
+      throw new Error(`Transaction creation failed: ${err.message || 'Unknown error'}, stack: ${err.stack || 'No stack trace'}`);
+    }
 
     if (!transactions?.length) {
       throw new Error('No transactions created; check UTXO or output configuration');
     }
+
+    console.log(`Created ${transactions.length} transactions, summary: ${serializeBigInt(summary)}`);
 
     const processedPayments = [];
     const processedPaymentIds = new Set();
@@ -316,10 +475,17 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
           continue;
         }
 
+        // Log transaction outputs for debugging
+        console.log(`Transaction ${transaction.id} outputs:`, serializeBigInt(transaction.transaction.outputs));
+
         // Sign transaction
-        await transaction.sign([privateKey]);
-        if (!transaction.transaction.inputs.every((input) => input.signatureScript?.length)) {
-          throw new Error(`Signature script empty for transaction ${transaction.id || 'unknown'}`);
+        try {
+          await transaction.sign([privateKey]);
+          if (!transaction.transaction.inputs.every((input) => input.signatureScript?.length)) {
+            throw new Error(`Signature script empty for transaction ${transaction.id || 'unknown'}`);
+          }
+        } catch (signErr) {
+          throw new Error(`Failed to sign transaction ${transaction.id || 'unknown'}: ${signErr.message || 'Unknown error'}, stack: ${signErr.stack || 'No stack trace'}`);
         }
 
         // Submit transaction
@@ -337,13 +503,14 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
             onRetry: (err) => console.warn(`Transaction submission retry for ${transaction.id || 'unknown'}: ${err.message || 'Unknown submission error'}`),
           }
         );
-        console.log(`Transaction ${transaction.id} submitted: ${JSON.stringify(submissionResponse)}`);
+        console.log(`Transaction ${transaction.id} submitted: ${serializeBigInt(submissionResponse)}`);
 
         // Record payments
+        let matchedOutputs = 0;
         for (const output of transaction.transaction.outputs || []) {
           const outputAmount = BigInt(output.value);
           const matchingPayment = payments.find(
-            (p) => p.amount === outputAmount && !processedPaymentIds.has(p.paymentId)
+            (p) => Math.abs(Number(p.amount) - Number(outputAmount)) <= 1000 && !processedPaymentIds.has(p.paymentId)
           );
 
           if (matchingPayment) {
@@ -355,8 +522,11 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
               txId: transaction.id,
             });
             processedPaymentIds.add(matchingPayment.paymentId);
+            matchedOutputs++;
+
           }
         }
+        console.log(`Transaction ${transaction.id} matched ${matchedOutputs} outputs`);
       }
 
       await client.query('COMMIT');
@@ -365,6 +535,11 @@ async function processPayouts(rpcClient, vecno, createTransactions, db, context,
       throw new Error(`Payout transaction failed: ${err.message || 'Unknown transaction error'}, stack: ${err.stack || 'No stack trace'}`);
     } finally {
       client.release();
+    }
+
+    if (processedPayments.length < payments.length) {
+      console.warn(`Processed ${processedPayments.length} out of ${payments.length} payments; some payments may not have matched transaction outputs`);
+      console.log('Unmatched payments:', serializeBigInt(payments.filter(p => !processedPaymentIds.has(p.paymentId))));
     }
 
     return processedPayments;

@@ -2,12 +2,9 @@
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
-use sqlx::Row;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use crate::database::db::{Db};
-use crate::stratum::protocol::PayoutNotification;
-use tokio::sync::broadcast::Sender;
 use log::{debug, warn, info};
 
 pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<Option<u64>>, window_time_ms: u64) -> Result<()> {
@@ -216,84 +213,5 @@ pub async fn process_rewards(db: Arc<Db>, window_time_ms: u64) -> Result<()> {
     }
 
     debug!("Completed process_rewards task");
-    Ok(())
-}
-
-pub async fn process_payouts(db: Arc<Db>, payout_notify: Sender<PayoutNotification>) -> Result<()> {
-    debug!("Starting process_payouts task");
-
-    let payments = match sqlx::query("SELECT address, amount, tx_id FROM payments WHERE notified = $1")
-        .bind(false)
-        .fetch_all(&db.pool)
-        .await
-        .context("Failed to fetch new payments")
-    {
-        Ok(rows) => {
-            debug!("Fetched {} payments from database", rows.len());
-            rows
-        }
-        Err(e) => {
-            warn!("Failed to fetch payments: {:?}", e);
-            return Err(e);
-        }
-    };
-
-    debug!("Found {} new payments in database", payments.len());
-
-    if payments.is_empty() {
-        debug!("No new payments found in database");
-        return Ok(());
-    }
-
-    let payments = payments
-        .into_iter()
-        .map(|row| {
-            Ok::<_, sqlx::Error>((
-                row.get::<String, _>("address"),
-                row.get::<i64, _>("amount"),
-                row.get::<String, _>("tx_id"),
-            ))
-        })
-        .collect::<Result<Vec<(String, i64, String)>, sqlx::Error>>()
-        .context("Failed to parse payment rows")?;
-
-    for (address, amount, tx_id) in &payments {
-        debug!("Processing payout: address={}, amount={}, tx_id={}", address, amount, tx_id);
-        let notification = PayoutNotification {
-            address: address.to_string(),
-            amount: *amount as u64,
-            tx_id: tx_id.to_string(),
-            timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64,
-        };
-
-        if let Err(e) = payout_notify.send(notification) {
-            warn!("Failed to send payout notification for address={}: {:?}", address, e);
-        } else {
-            info!(
-                "Sent payout notification: amount={} VE, address={}, tx_id={}",
-                *amount as f64 / 100_000_000.0,
-                address,
-                tx_id
-            );
-
-            let result = sqlx::query("UPDATE payments SET notified = $1 WHERE tx_id = $2")
-                .bind(true)
-                .bind(tx_id)
-                .execute(&db.pool)
-                .await
-                .context(format!("Failed to mark payment as notified for tx_id={}", tx_id));
-
-            match result {
-                Ok(_) => {
-                    debug!("Marked payment as notified: tx_id={}", tx_id);
-                }
-                Err(e) => {
-                    warn!("Failed to mark payment as notified for tx_id={}: {:?}", tx_id, e);
-                }
-            }
-        }
-    }
-
-    info!("Processed {} new payout notifications successfully", payments.len());
     Ok(())
 }

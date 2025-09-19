@@ -5,7 +5,7 @@ use log::{debug, info, warn, LevelFilter};
 use std::env;
 use tokio::time::{self, Duration};
 use tokio::sync::watch;
-use crate::treasury::payout::{check_confirmations, process_payouts};
+use crate::treasury::payout::check_confirmations;
 use crate::vecnod::{Client, Message, VecnodHandle};
 use crate::stratum::Stratum;
 use crate::vecnod::proto::vecnod_message::Payload;
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
 
     // Validate window_time_ms
     if window_time_ms < 30000 {
-        return Err(anyhow::anyhow!("WINDOW_TIME_MS must be at least 1000 milliseconds"));
+        return Err(anyhow::anyhow!("WINDOW_TIME_MS must be at least 3000 milliseconds"));
     }
 
     debug!("Loaded WINDOW_TIME_MS: {}ms ({}s)", window_time_ms, window_time_ms / 1000);
@@ -41,7 +41,6 @@ async fn main() -> Result<()> {
     let stratum_addr = env::var("STRATUM_ADDR").unwrap_or("localhost:6969".to_string());
     let extra_data = env::var("EXTRA_DATA").unwrap_or("Vecno Mining Pool".to_string());
     let pool_address = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
-    let network_id = env::var("NETWORK_ID").unwrap_or("mainnet".to_string());
     let debug = env::var("DEBUG")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
@@ -71,7 +70,7 @@ async fn main() -> Result<()> {
     let (handle, recv_cmd) = VecnodHandle::new();
     debug!("Initializing database");
 
-    let stratum = Stratum::new(&stratum_addr, handle.clone(), &pool_address, &network_id, pool_fee, window_time_ms)
+    let stratum = Stratum::new(&stratum_addr, handle.clone(), &pool_address, pool_fee, window_time_ms)
         .await
         .context("Failed to initialize Stratum")?;
 
@@ -120,27 +119,6 @@ async fn main() -> Result<()> {
                     warn!("Failed to check confirmations: {:?}", e);
                 } else {
                     debug!("check_confirmations completed successfully");
-                }
-            }
-        }
-    });
-
-    // Start payout task
-    debug!("Spawning payout task");
-    tokio::spawn({
-        let db = stratum.share_handler.db.clone();
-        let payout_notify = stratum.payout_notify.clone();
-        async move {
-            let mut payouts_interval = time::interval(Duration::from_secs(30));
-            payouts_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-            loop {
-                debug!("Payout task loop iteration");
-                payouts_interval.tick().await;
-                debug!("Triggering process_payouts");
-                if let Err(e) = process_payouts(db.clone(), payout_notify.clone()).await {
-                    warn!("Failed to process payouts: {:?}", e);
-                } else {
-                    debug!("process_payouts completed successfully");
                 }
             }
         }

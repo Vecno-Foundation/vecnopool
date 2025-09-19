@@ -5,9 +5,9 @@ use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio::io::AsyncBufReadExt;
-use crate::stratum::protocol::{StratumConn, PayoutNotification};
+use crate::stratum::protocol::StratumConn;
 use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
 use crate::treasury::sharehandler::Sharehandler;
 use crate::vecnod::{VecnodHandle, RpcBlock};
@@ -18,7 +18,6 @@ pub struct Stratum {
     pub jobs: Arc<Jobs>,
     pub share_handler: Arc<Sharehandler>,
     pub send: watch::Sender<Option<JobParams>>,
-    pub payout_notify: broadcast::Sender<PayoutNotification>,
 }
 
 impl Stratum {
@@ -26,7 +25,6 @@ impl Stratum {
         addr: &str,
         handle: VecnodHandle,
         pool_address: &str,
-        _network_id: &str,
         pool_fee: f64,
         window_time_ms: u64,
     ) -> Result<Self> {
@@ -37,7 +35,6 @@ impl Stratum {
         let jobs = Arc::new(Jobs::new(handle, db.clone(), pool_address.to_string(), pool_fee));
         let (pending, _) = mpsc::unbounded_channel();
         let (send, recv) = watch::channel(None);
-        let (payout_notify, _) = broadcast::channel(100);
         let share_handler = Arc::new(Sharehandler::new(
             db,
             pool_fee,
@@ -50,7 +47,6 @@ impl Stratum {
         let share_handler_clone = share_handler.clone();
         let last_template_clone = last_template.clone();
         let pending_clone = pending.clone();
-        let payout_notify_clone = payout_notify.clone();
         let pool_address_clone = pool_address.to_string();
 
         tokio::spawn(async move {
@@ -74,7 +70,6 @@ impl Stratum {
                         let share_handler = share_handler_clone.clone();
                         let last_template = last_template_clone.clone();
                         let pending_send = pending_clone.clone();
-                        let payout_notify_recv = payout_notify_clone.subscribe();
                         let (pending_send_inner, pending_recv) = mpsc::unbounded_channel();
                         let mining_addr = pool_address_clone.clone();
                         let recv_clone = recv.clone();
@@ -98,7 +93,6 @@ impl Stratum {
                                 extranonce: String::new(),
                                 mining_addr,
                                 duplicate_share_count: Arc::new(AtomicU64::new(0)),
-                                payout_notify_recv,
                             };
                             debug!(
                                 "Initialized StratumConn for worker: addr={}, worker_id={}, worker_bytes={:?}, worker_hex={}",
@@ -124,7 +118,6 @@ impl Stratum {
             jobs,
             share_handler,
             send,
-            payout_notify,
         })
     }
 

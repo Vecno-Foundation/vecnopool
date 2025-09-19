@@ -16,10 +16,6 @@ use crate::treasury::share_validator::validate_share;
 use crate::pow;
 use crate::vecnod::RpcBlock;
 use crate::uint::{U256, u256_to_hex};
-use crate::metrics::{
-    MINER_ADDED_SHARES, MINER_INVALID_SHARES, MINER_DUPLICATED_SHARES, MINER_ADDRESS_MISMATCH,
-    SHARE_VALIDATION_LATENCY,
-};
 
 const NEW_LINE: &'static str = "\n";
 
@@ -67,8 +63,6 @@ async fn validate_and_submit_share(
     _mining_addr: &str,
     duplicate_share_count: &Arc<AtomicU64>,
 ) -> Result<()> {
-    let timer = SHARE_VALIDATION_LATENCY.start_timer();
-
     let block_hash = {
         let mut header = template.header.clone().unwrap();
         header.nonce = nonce;
@@ -107,7 +101,6 @@ async fn validate_and_submit_share(
 
     if is_duplicate {
         let count = duplicate_share_count.fetch_add(1, Ordering::SeqCst) + 1;
-        MINER_DUPLICATED_SHARES.with_label_values(&[&address]).inc();
         write_error_response(writer, i, 22, "Duplicate share".into()).await?;
         debug!(
             "Share rejected (duplicate): job_id={}, block_hash={}, nonce={} for worker={}",
@@ -120,18 +113,15 @@ async fn validate_and_submit_share(
             );
             return Err(anyhow!("Excessive duplicate shares from {}", address));
         }
-        timer.stop_and_record();
         return Ok(());
     }
 
     if !is_valid {
-        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
         write_error_response(writer, i, 22, "Invalid share".into()).await?;
         debug!(
             "Share rejected (invalid): job_id={}, block_hash={}, nonce={} for worker={}",
             job_id, block_hash, nonce_hex, address
         );
-        timer.stop_and_record();
         return Ok(());
     }
 
@@ -157,13 +147,11 @@ async fn validate_and_submit_share(
             job_id, panic_err
         );
         write_error_response(writer, i, 23, "Internal server error".into()).await?;
-        timer.stop_and_record();
         return Ok(());
     }
 
     debug!("Submitting share to jobs: job_id={}, nonce={:016x}, block_hash={}", job_id, nonce, block_hash);
     if jobs.submit(i.clone(), job_id, nonce, address.clone(), extranonce.clone(), pending_send.clone()).await {
-        MINER_ADDED_SHARES.with_label_values(&[&address]).inc();
         info!("Share accepted: job_id={} for worker={}", job_id, address);
         if let Err(e) = share_handler.record_share(&contribution, difficulty, is_valid, is_duplicate).await {
             info!("Failed to record share for worker={}: {:?}", address, e);
@@ -182,12 +170,10 @@ async fn validate_and_submit_share(
         }
         write_response(writer, i, Some(true)).await?;
     } else {
-        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
         debug!("Unable to submit share: job_id={}, block_hash={}", job_id, block_hash);
         write_error_response(writer, i, 20, "Unable to submit share".into()).await?;
     }
 
-    timer.stop_and_record();
     Ok(())
 }
 
@@ -416,7 +402,6 @@ impl<'a> StratumConn<'a> {
                                 let params: Vec<String> = serde_json::from_value(p)?;
                                 let address = params.get(0).cloned().unwrap_or_default();
                                 if address != *self.payout_addr.as_ref().unwrap_or(&String::new()) {
-                                    MINER_ADDRESS_MISMATCH.with_label_values(&[&address]).inc();
                                     self.write_error_response(id, 23, "Unknown worker".into()).await?;
                                     continue;
                                 }
@@ -442,14 +427,12 @@ impl<'a> StratumConn<'a> {
                                 }
                                 let (address, id_str, nonce_str): (String, String, String) = serde_json::from_value(p)?;
                                 if address != *self.payout_addr.as_ref().unwrap_or(&String::new()) {
-                                    MINER_ADDRESS_MISMATCH.with_label_values(&[&address]).inc();
                                     self.write_error_response(i, 23, "Unknown worker".into()).await?;
                                     continue;
                                 }
                                 let job_id = match u8::from_str_radix(&id_str, 16) {
                                     Ok(id) => id,
                                     Err(e) => {
-                                        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
                                         self.write_error_response(i, 21, format!("Invalid job ID: {}", e).into()).await?;
                                         continue;
                                     }
@@ -457,7 +440,6 @@ impl<'a> StratumConn<'a> {
                                 let nonce = match u64::from_str_radix(nonce_str.trim_start_matches("0x"), 16) {
                                     Ok(n) => n,
                                     Err(e) => {
-                                        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
                                         self.write_error_response(i, 21, format!("Invalid nonce: {}", e).into()).await?;
                                         continue;
                                     }
@@ -466,7 +448,6 @@ impl<'a> StratumConn<'a> {
                                 let template = match self.jobs.get_job(job_id).await {
                                     Some(b) => b,
                                     None => {
-                                        MINER_INVALID_SHARES.with_label_values(&[&address]).inc();
                                         self.write_error_response(i, 21, "Stale job".into()).await?;
                                         debug!("Stale job: job_id={} for worker={}", job_id, address);
                                         continue;

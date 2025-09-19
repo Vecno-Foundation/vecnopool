@@ -8,7 +8,6 @@ use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::treasury::sharehandler::Contribution;
 use log::{debug, warn};
-use crate::metrics::{DB_QUERIES_SUCCESS, DB_QUERIES_FAILED};
 
 #[derive(Debug)]
 pub struct Db {
@@ -59,7 +58,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create shares table")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_shares_table"]).inc();
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_shares_daa_score_address ON shares (daa_score, address)"
@@ -67,7 +65,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on shares table (daa_score, address)")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_shares_index_daa_score"]).inc();
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_shares_timestamp ON shares (timestamp)"
@@ -75,7 +72,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on shares table (timestamp)")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_shares_index_timestamp"]).inc();
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_shares_timestamp_address ON shares (timestamp, address)"
@@ -83,7 +79,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on shares table (timestamp, address)")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_shares_index_timestamp_address"]).inc();
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_shares_address ON shares (address)"
@@ -91,7 +86,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on shares table (address)")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_shares_index_address"]).inc();
 
         sqlx::query(
             r#"
@@ -105,7 +99,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create balances table")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_balances_table"]).inc();
 
         sqlx::query(
             r#"
@@ -122,7 +115,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create payments table")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_payments_table"]).inc();
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_payments_timestamp ON payments (timestamp)"
@@ -130,7 +122,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on payments table (timestamp)")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_payments_index_timestamp"]).inc();
 
         sqlx::query(
             r#"
@@ -153,7 +144,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create blocks table")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_blocks_table"]).inc();
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_blocks_confirmations_processed ON blocks (confirmations, processed)"
@@ -161,7 +151,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on blocks table (confirmations, processed)")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_blocks_index_confirmations_processed"]).inc();
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_blocks_processed ON blocks (processed)"
@@ -169,7 +158,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on blocks table (processed)")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_blocks_index_processed"]).inc();
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_blocks_miner_id ON blocks (miner_id)"
@@ -177,7 +165,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on blocks table (miner_id)")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_blocks_index_miner_id"]).inc();
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_blocks_accepted ON blocks (accepted)"
@@ -185,7 +172,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on blocks table (accepted)")?;
-        DB_QUERIES_SUCCESS.with_label_values(&["create_blocks_index_accepted"]).inc();
 
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
@@ -300,17 +286,15 @@ impl Db {
         match result {
             Ok(res) => {
                 if res.rows_affected() > 0 {
-                    DB_QUERIES_SUCCESS.with_label_values(&["record_share"]).inc();
+                    // No metrics
                 } else {
                     debug!(
                         "Skipping duplicate share for job_id={job_id}, address={address}, extranonce={extranonce}, nonce={nonce}"
                     );
-                    DB_QUERIES_SUCCESS.with_label_values(&["record_share"]).inc();
                 }
                 Ok(())
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["record_share"]).inc();
                 Err(e.into())
             }
         }
@@ -341,11 +325,9 @@ impl Db {
                     total_shares += 1;
                     share_window.push_front(contribution);
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["load_recent_shares"]).inc();
                 Ok(total_shares)
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["load_recent_shares"]).inc();
                 Err(e)
             }
         }
@@ -389,11 +371,9 @@ impl Db {
                     let count: i64 = row.get(1);
                     sums.insert(address, count as u64);
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["get_share_counts"]).inc();
                 Ok(sums)
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["get_share_counts"]).inc();
                 Err(e)
             }
         }
@@ -437,11 +417,9 @@ impl Db {
                     let total_difficulty: i64 = row.get(1);
                     sums.insert(address, total_difficulty as u64);
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["get_shares_in_time_window"]).inc();
                 Ok(sums)
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["get_shares_in_time_window"]).inc();
                 Err(e)
             }
         }
@@ -473,11 +451,9 @@ impl Db {
 
         match result {
             Ok(_) => {
-                DB_QUERIES_SUCCESS.with_label_values(&["add_balance"]).inc();
                 Ok(())
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["add_balance"]).inc();
                 Err(e)
             }
         }
@@ -543,11 +519,9 @@ impl Db {
 
         match result {
             Ok(_) => {
-                DB_QUERIES_SUCCESS.with_label_values(&["add_block_details"]).inc();
                 Ok(())
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["add_block_details"]).inc();
                 Err(e)
             }
         }
@@ -574,11 +548,9 @@ impl Db {
                 for block in &rows {
                     debug!("Unconfirmed block: reward_block_hash={}, miner_id={}", block.reward_block_hash, block.miner_id);
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["get_unconfirmed_blocks"]).inc();
                 Ok(rows)
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["get_unconfirmed_blocks"]).inc();
                 Err(e)
             }
         }
@@ -605,11 +577,9 @@ impl Db {
                 for block in &rows {
                     debug!("Block for rewards: reward_block_hash={}, miner_id={}", block.reward_block_hash, block.miner_id);
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["get_blocks_for_rewards"]).inc();
                 Ok(rows)
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["get_blocks_for_rewards"]).inc();
                 Err(e)
             }
         }
@@ -633,11 +603,9 @@ impl Db {
 
         match result {
             Ok(_) => {
-                DB_QUERIES_SUCCESS.with_label_values(&["update_block_status"]).inc();
                 Ok(())
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["update_block_status"]).inc();
                 Err(e)
             }
         }
@@ -669,11 +637,9 @@ impl Db {
                         "Duplicate share found for reward_block_hash={reward_block_hash}, nonce={nonce}"
                     );
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["check_duplicate_share"]).inc();
                 Ok(count)
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["check_duplicate_share"]).inc();
                 Err(e)
             }
         }
@@ -705,11 +671,9 @@ impl Db {
                 if rows_affected > 0 {
                     debug!("Cleaned up {} old shares older than {} seconds", rows_affected, retention_period_secs);
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["cleanup_old_shares"]).inc();
                 Ok(())
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["cleanup_old_shares"]).inc();
                 Err(e)
             }
         }
@@ -735,11 +699,9 @@ impl Db {
                 if rows_affected > 0 {
                     debug!("Cleaned up {} processed blocks", rows_affected);
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["cleanup_processed_blocks"]).inc();
                 Ok(())
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["cleanup_processed_blocks"]).inc();
                 Err(e)
             }
         }
@@ -765,11 +727,9 @@ impl Db {
                 if rows_affected > 0 {
                     debug!("Cleaned up {} unaccepted blocks", rows_affected);
                 }
-                DB_QUERIES_SUCCESS.with_label_values(&["cleanup_unaccepted_blocks"]).inc();
                 Ok(())
             }
             Err(e) => {
-                DB_QUERIES_FAILED.with_label_values(&["cleanup_unaccepted_blocks"]).inc();
                 Err(e)
             }
         }

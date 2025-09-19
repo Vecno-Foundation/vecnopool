@@ -9,7 +9,6 @@ use crate::database::db::{Db};
 use crate::stratum::protocol::PayoutNotification;
 use tokio::sync::broadcast::Sender;
 use log::{debug, warn, info};
-use crate::metrics::{DB_QUERIES_SUCCESS, DB_QUERIES_FAILED, REWARDS_DISTRIBUTED};
 
 pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<Option<u64>>) -> Result<()> {
     debug!("Starting check_confirmations task");
@@ -40,7 +39,6 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
         }
         Err(e) => {
             warn!("Failed to get unconfirmed blocks: {:?}", e);
-            DB_QUERIES_FAILED.with_label_values(&["get_unconfirmed_blocks"]).inc();
             return Err(e).context("Failed to get unconfirmed blocks");
         }
     };
@@ -86,11 +84,9 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
 
             match result {
                 Ok(_) => {
-                    DB_QUERIES_SUCCESS.with_label_values(&["update_block_confirmations"]).inc();
                     debug!("Updated confirmations: block_hash={}, confirmations={}", reward_block_hash, confirmations);
                 }
                 Err(e) => {
-                    DB_QUERIES_FAILED.with_label_values(&["update_block_confirmations"]).inc();
                     warn!("Failed to update confirmations for block_hash={}: {:?}", reward_block_hash, e);
                 }
             }
@@ -131,7 +127,6 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
         }
         Err(e) => {
             warn!("Failed to fetch blocks for reward processing: {:?}", e);
-            DB_QUERIES_FAILED.with_label_values(&["fetch_blocks_for_rewards"]).inc();
             return Err(e).context("Failed to fetch blocks for reward processing");
         }
     };
@@ -157,7 +152,6 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
             Ok(counts) => counts,
             Err(e) => {
                 warn!("Failed to get share difficulties for block {}: {:?}", block.reward_block_hash, e);
-                DB_QUERIES_FAILED.with_label_values(&["get_shares_in_time_window"]).inc();
                 continue;
             }
         };
@@ -181,19 +175,15 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
             info!("Distributing reward for block {}: address={}, reward={} sompi, share_percentage={:.2}%", 
                   block.reward_block_hash, base_address, miner_reward, share_percentage * 100.0);
 
-            // Note: The miner_id is not used in the balance update, as balances are now keyed by address only
             let result = db.add_balance("", base_address, miner_reward).await
                 .context(format!("Failed to add balance for address {} in block {}", base_address, block.reward_block_hash));
 
             match result {
                 Ok(_) => {
-                    DB_QUERIES_SUCCESS.with_label_values(&["add_balance"]).inc();
-                    REWARDS_DISTRIBUTED.with_label_values(&[base_address, &block.reward_block_hash]).inc_by(miner_reward as f64 / 100_000_000.0);
                     info!("Added balance: address={}, reward={} VE, block={}", 
                          base_address, miner_reward as f64 / 100_000_000.0, block.reward_block_hash);
                 }
                 Err(e) => {
-                    DB_QUERIES_FAILED.with_label_values(&["add_balance"]).inc();
                     warn!("Failed to add balance for address={}: {:?}", base_address, e);
                 }
             }
@@ -215,11 +205,9 @@ pub async fn process_rewards(db: Arc<Db>) -> Result<()> {
 
             match result {
                 Ok(_) => {
-                    DB_QUERIES_SUCCESS.with_label_values(&["mark_block_processed"]).inc();
                     debug!("Marked block as processed: {}", reward_block_hash);
                 }
                 Err(e) => {
-                    DB_QUERIES_FAILED.with_label_values(&["mark_block_processed"]).inc();
                     warn!("Failed to mark block {} as processed: {:?}", reward_block_hash, e);
                 }
             }
@@ -248,7 +236,6 @@ pub async fn process_payouts(db: Arc<Db>, payout_notify: Sender<PayoutNotificati
         }
         Err(e) => {
             warn!("Failed to fetch payments: {:?}", e);
-            DB_QUERIES_FAILED.with_label_values(&["fetch_payments"]).inc();
             return Err(e);
         }
     };
@@ -300,11 +287,9 @@ pub async fn process_payouts(db: Arc<Db>, payout_notify: Sender<PayoutNotificati
 
             match result {
                 Ok(_) => {
-                    DB_QUERIES_SUCCESS.with_label_values(&["update_payment_notified"]).inc();
                     debug!("Marked payment as notified: tx_id={}", tx_id);
                 }
                 Err(e) => {
-                    DB_QUERIES_FAILED.with_label_values(&["update_payment_notified"]).inc();
                     warn!("Failed to mark payment as notified for tx_id={}: {:?}", tx_id, e);
                 }
             }

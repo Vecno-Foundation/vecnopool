@@ -7,7 +7,6 @@ use std::sync::Arc;
 use tokio::time::{self, Duration};
 use tokio::sync::watch;
 use crate::database::db::Db;
-use crate::metrics::start_metrics_server;
 use crate::treasury::payout::{check_confirmations, process_payouts};
 use crate::vecnod::{Client, Message, VecnodHandle};
 use crate::stratum::Stratum;
@@ -19,7 +18,6 @@ mod stratum;
 mod treasury;
 mod database;
 mod uint;
-mod metrics;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,9 +53,6 @@ async fn main() -> Result<()> {
         .filter_level(LevelFilter::Info)
         .filter_module("vecnod_stratum", if debug { LevelFilter::Debug } else { LevelFilter::Info })
         .init();
-
-    debug!("Spawning metrics server");
-    tokio::spawn(start_metrics_server());
 
     debug!("Creating VecnodHandle");
     let (handle, recv_cmd) = VecnodHandle::new();

@@ -11,10 +11,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, RwLock};
 use log::{debug, info, warn};
 use crate::database::db::Db;
-use crate::metrics::{
-    TOTAL_SHARES_RECORDED, SHARE_WINDOW_SIZE, SHARE_PROCESSING_FAILED,
-    MINER_INVALID_SHARES, MINER_DUPLICATED_SHARES,
-};
 use crate::stratum::jobs::{Jobs};
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -93,7 +89,6 @@ impl Sharehandler {
             let mut window_submission_counts: HashMap<String, u64> = HashMap::new();
             {
                 let window = share_window_clone.read().await;
-                SHARE_WINDOW_SIZE.set(window.len() as f64);
                 for share in window.iter() {
                     *window_submission_counts.entry(share.address.clone()).or_insert(0) += 1;
                 }
@@ -219,11 +214,7 @@ impl Sharehandler {
         }
 
         for (address, count) in valid_shares {
-            TOTAL_SHARES_RECORDED.with_label_values(&[&address]).inc_by(count as f64);
             info!(target: "sharehandler", "Recorded {} batched shares for worker={}", count, address);
-        }
-        for (address, count) in failed_shares {
-            SHARE_PROCESSING_FAILED.with_label_values(&[&address]).inc_by(count as f64);
         }
 
         while share_window.len() > n_window || (share_window.len() > 0 && current_time_ms - share_window.front().map(|s| (s.timestamp as u64) * 1000).unwrap_or(0) > window_time_ms) {
@@ -241,7 +232,6 @@ impl Sharehandler {
         debug!(target: "sharehandler",
             "Share window size: {}, oldest timestamp: {:?}", share_window.len(), share_window.front().map(|s| s.timestamp)
         );
-        SHARE_WINDOW_SIZE.set(share_window.len() as f64);
     }
 
     pub async fn record_share(&self, contribution: &Contribution, miner_difficulty: u64, is_valid: bool, is_duplicate: bool) -> Result<()> {
@@ -308,7 +298,6 @@ impl Sharehandler {
                 .entry(contribution.address.clone())
                 .or_insert(Arc::new(AtomicU64::new(0)))
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            MINER_DUPLICATED_SHARES.with_label_values(&[&contribution.address]).inc();
             warn!(target: "sharehandler",
                 "Duplicate share detected for address={}: block_hash={}, nonce={}",
                 contribution.address, share_key.0, share_key.1
@@ -320,7 +309,6 @@ impl Sharehandler {
                 .entry(contribution.address.clone())
                 .or_insert(Arc::new(AtomicU64::new(0)))
                 .fetch_add(1, AtomicOrdering::Relaxed);
-            MINER_INVALID_SHARES.with_label_values(&[&contribution.address]).inc();
             warn!(target: "sharehandler",
                 "Invalid share for address={}: difficulty={}", contribution.address, contribution.difficulty
             );
@@ -363,7 +351,6 @@ impl Sharehandler {
         debug!(target: "sharehandler",
             "Share window size: {}, window_submissions: {:?}", share_window.len(), window_submission_counts.get(&contribution.address)
         );
-        SHARE_WINDOW_SIZE.set(share_window.len() as f64);
 
         let current_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -410,16 +397,13 @@ impl Sharehandler {
             info!(target: "sharehandler",
                 "Failed to record share for worker={}: {:?}", contribution.address, e
             );
-            SHARE_PROCESSING_FAILED.with_label_values(&[&contribution.address]).inc();
             Err(e)
         } else {
-            TOTAL_SHARES_RECORDED.with_label_values(&[&contribution.address]).inc();
             info!(target: "sharehandler", "Recorded share for worker={}", contribution.address);
             if let Err(e) = self.share_batch.send(contribution.clone()).await {
                 info!(target: "sharehandler",
                     "Failed to send share to batch for worker={}: {:?}", contribution.address, e
                 );
-                SHARE_PROCESSING_FAILED.with_label_values(&[&contribution.address]).inc();
             }
             Ok(())
         }

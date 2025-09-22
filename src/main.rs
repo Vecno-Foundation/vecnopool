@@ -44,17 +44,10 @@ async fn main() -> Result<()> {
     let debug = env::var("DEBUG")
         .map(|v| v.to_lowercase() == "true")
         .unwrap_or(false);
-    let mnemonic = env::var("MNEMONIC").context("MNEMONIC must be set in .env")?;
     let pool_fee: f64 = env::var("POOL_FEE_PERCENT")
         .context("POOL_FEE_PERCENT must be set in .env")?
         .parse()
         .context("POOL_FEE_PERCENT must be a valid float")?;
-
-    let words = mnemonic.trim().split_whitespace().count();
-    if words != 12 && words != 24 {
-        return Err(anyhow::anyhow!("MNEMONIC must be a 12 or 24-word phrase"));
-    }
-
     if pool_fee < 0.0 || pool_fee > 100.0 {
         return Err(anyhow::anyhow!("POOL_FEE_PERCENT must be between 0 and 100"));
     }

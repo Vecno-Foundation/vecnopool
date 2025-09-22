@@ -1,5 +1,7 @@
 # Vecnopool
 
+Vecnopool is a high performance mining pool written in Rust. It uses postgresql to store and update balances for miners. Use [Vecnopool Payment](https://github.com/Vecno-Foundation/vecnopool-payment "Vecnopool Payment App") for paying out rewards using WASM.
+
 ## Installation
 
 - Install [Rust](http://rustup.rs)
@@ -9,7 +11,9 @@
 
 ## Usage
 
-Configure create a .env file and copy content of the .env.example. Enter your own configs.
+1. Create a pool wallet using the latest [WASM](https://github.com/Vecno-Foundation/vecnod/releases "Vecno WASM") release. Follow the instructions and make sure to save the keys.
+2. Create a postgresql database.
+3. Create a .env file and copy content of the .env.example. Enter your own configs.
 
 To start the mining pool, simply run
 

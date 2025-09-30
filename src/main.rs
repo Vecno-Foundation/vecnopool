@@ -19,8 +19,22 @@ mod uint;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    debug!("Starting main function");
-    dotenv::dotenv().context("Failed to load .env file")?;
+    // Load .env file and log the result
+    match dotenv::dotenv() {
+        Ok(_) => debug!(".env file loaded successfully"),
+        Err(e) => warn!("Failed to load .env file: {}", e),
+    }
+
+    // Log all environment variables for debugging
+    debug!("Environment variables:");
+    debug!("RPC_URL: {}", env::var("RPC_URL").unwrap_or_default());
+    debug!("STRATUM_ADDR: {}", env::var("STRATUM_ADDR").unwrap_or_default());
+    debug!("MINING_ADDR: {}", env::var("MINING_ADDR").unwrap_or_default());
+    debug!("POOL_FEE_PERCENT: {}", env::var("POOL_FEE_PERCENT").unwrap_or_default());
+    debug!("EXTRA_DATA: {}", env::var("EXTRA_DATA").unwrap_or_default());
+    debug!("SQL_URI: {}", env::var("SQL_URI").unwrap_or_default());
+    debug!("WINDOW_TIME_MS: {}", env::var("WINDOW_TIME_MS").unwrap_or_default());
+    debug!("DEBUG: {}", env::var("DEBUG").unwrap_or_default());
 
     let window_time_ms: u64 = env::var("WINDOW_TIME_MS")
         .map(|val| {
@@ -32,7 +46,7 @@ async fn main() -> Result<()> {
 
     // Validate window_time_ms
     if window_time_ms < 30000 {
-        return Err(anyhow::anyhow!("WINDOW_TIME_MS must be at least 3000 milliseconds"));
+        return Err(anyhow::anyhow!("WINDOW_TIME_MS must be at least 30000 milliseconds"));
     }
 
     debug!("Loaded WINDOW_TIME_MS: {}ms ({}s)", window_time_ms, window_time_ms / 1000);
@@ -42,7 +56,10 @@ async fn main() -> Result<()> {
     let extra_data = env::var("EXTRA_DATA").unwrap_or("Vecno Mining Pool".to_string());
     let pool_address = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
     let debug = env::var("DEBUG")
-        .map(|v| v.to_lowercase() == "true")
+        .map(|v| {
+            debug!("DEBUG env var: {}", v);
+            v.to_lowercase() == "true"
+        })
         .unwrap_or(false);
     let pool_fee: f64 = env::var("POOL_FEE_PERCENT")
         .context("POOL_FEE_PERCENT must be set in .env")?
@@ -54,10 +71,11 @@ async fn main() -> Result<()> {
 
     info!("Loaded pool fee: {}%", pool_fee);
 
+    // Initialize logger with global debug level when DEBUG=true
     env_logger::Builder::new()
-        .filter_level(LevelFilter::Info)
-        .filter_module("vecnod_stratum", if debug { LevelFilter::Debug } else { LevelFilter::Info })
+        .filter_level(if debug { LevelFilter::Debug } else { LevelFilter::Info })
         .init();
+    debug!("Logger initialized with level: {}", if debug { "Debug" } else { "Info" });
 
     debug!("Creating VecnodHandle");
     let (handle, recv_cmd) = VecnodHandle::new();
@@ -66,9 +84,11 @@ async fn main() -> Result<()> {
     let stratum = Stratum::new(&stratum_addr, handle.clone(), &pool_address, pool_fee, window_time_ms)
         .await
         .context("Failed to initialize Stratum")?;
+    debug!("Stratum server initialized at {}", stratum_addr);
 
     // Create a watch channel for sharing the latest DAA score
     let (daa_score_tx, daa_score_rx) = watch::channel::<Option<u64>>(None);
+    debug!("Created DAA score watch channel");
 
     // Start cleanup task
     debug!("Spawning cleanup task");
@@ -80,13 +100,11 @@ async fn main() -> Result<()> {
             loop {
                 debug!("Cleanup task loop iteration");
                 cleanup_interval.tick().await;
-                // Clean up shares older than 24 hours (86400 seconds)
                 if let Err(e) = db.cleanup_old_shares(86_400).await {
                     warn!("Failed to clean up old shares: {:?}", e);
                 } else {
                     debug!("Successfully cleaned up old shares (retention: 86400s)");
                 }
-                // Clean up processed blocks
                 if let Err(e) = db.cleanup_processed_blocks().await {
                     warn!("Failed to clean up processed blocks: {:?}", e);
                 } else {
@@ -119,13 +137,15 @@ async fn main() -> Result<()> {
 
     debug!("Creating Vecnod client");
     let (client, mut msgs) = Client::new(&rpc_url, &pool_address, &extra_data, handle.clone(), recv_cmd);
+    debug!("Vecnod client created with RPC_URL: {}", rpc_url);
 
     // Request initial DAA score
     handle.send_cmd(Payload::get_block_dag_info());
+    debug!("Requested initial DAA score");
 
     debug!("Entering main message loop");
     while let Some(msg) = msgs.recv().await {
-        debug!("Received message: {:?}", msg);
+        debug!("Processing message: {:?}", msg);
         match msg {
             Message::Info { version, .. } => {
                 info!("Connected to Vecnod {version}");

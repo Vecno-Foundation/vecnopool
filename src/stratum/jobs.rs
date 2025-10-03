@@ -1,5 +1,4 @@
 //src/stratum/jobs.rs
-
 use crate::stratum::{Id, Response};
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use crate::uint::U256;
@@ -22,11 +21,12 @@ pub struct Jobs {
     pool_address: String,
     pool_fee: f64,
     submitted_hashes: Arc<DashMap<String, Instant>>,
+    submission_lock: Arc<Mutex<()>>,
 }
 
 impl Jobs {
     pub fn new(handle: VecnodHandle, db: Arc<Db>, pool_address: String, pool_fee: f64) -> Self {
-        Self {
+        let jobs = Self {
             inner: Arc::new(RwLock::new(JobsInner {
                 next: 0,
                 jobs: Vec::with_capacity(256),
@@ -37,7 +37,20 @@ impl Jobs {
             pool_address,
             pool_fee,
             submitted_hashes: Arc::new(DashMap::new()),
-        }
+            submission_lock: Arc::new(Mutex::new(())),
+        };
+        // Start background task for cleaning up submitted_hashes
+        tokio::spawn({
+            let submitted_hashes = Arc::clone(&jobs.submitted_hashes);
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    let now = Instant::now();
+                    submitted_hashes.retain(|_, v| now.duration_since(*v) < Duration::from_secs(60));
+                }
+            }
+        });
+        jobs
     }
 
     pub async fn insert(&self, template: RpcBlock) -> Option<JobParams> {
@@ -77,7 +90,20 @@ impl Jobs {
         extranonce: String,
         send: mpsc::UnboundedSender<PendingResult>,
     ) -> bool {
-        let (mut block, handle, network_difficulty) = {
+        let start = Instant::now();
+        // Acquire lock with timeout
+        let _lock = match tokio::time::timeout(Duration::from_millis(100), self.submission_lock.lock()).await {
+            Ok(lock) => lock,
+            Err(_) => {
+                debug!(target: "stratum::jobs", "Submission lock timeout for job_id={}", job_id);
+                let pending = Pending { id: rpc_id, send, block_hash: "timeout".to_string() };
+                pending.resolve(Some(Box::from("Submission lock timeout")));
+                return false;
+            }
+        };
+
+        // Critical section: validate job and check for duplicates
+        let (submission_key, block, handle, network_difficulty) = {
             let r = self.inner.read().await;
             let block = match r.jobs.get(job_id as usize) {
                 Some(b) => b.clone(),
@@ -87,9 +113,39 @@ impl Jobs {
                 }
             };
             let difficulty = block.header.as_ref().map(|h| h.difficulty()).unwrap_or(0);
-            (block, r.handle.clone(), difficulty)
+            let mut block = block;
+            let reward_block_hash = if let Some(header) = &mut block.header {
+                header.nonce = nonce;
+                match header.hash(false) {
+                    Ok(hash) => hex::encode(hash.as_bytes()),
+                    Err(e) => {
+                        debug!(target: "stratum::jobs", "Failed to compute block hash for job_id={}: {}", job_id, e);
+                        return false;
+                    }
+                }
+            } else {
+                debug!(target: "stratum::jobs", "No header found for job_id={}", job_id);
+                return false;
+            };
+            let nonce_hex = format!("{:016x}", nonce);
+            let submission_key = format!("{}:{}", reward_block_hash, nonce_hex);
+            let now = Instant::now();
+            if let Some(entry) = self.submitted_hashes.get(&submission_key) {
+                if now.duration_since(*entry.value()) < Duration::from_secs(10) {
+                    warn!(target: "stratum::jobs",
+                        "Duplicate block submission detected: job_id={}, block_hash={}, nonce={}, miner={}",
+                        job_id, reward_block_hash, nonce_hex, miner_address
+                    );
+                    let pending = Pending { id: rpc_id, send, block_hash: reward_block_hash };
+                    pending.resolve(Some(Box::from("Duplicate block submission")));
+                    return false;
+                }
+            }
+            self.submitted_hashes.insert(submission_key.clone(), now);
+            (submission_key, block, r.handle.clone(), difficulty)
         };
 
+        // Perform slow operations outside the lock
         if let Some(header) = &block.header {
             let block_difficulty = header.difficulty();
             if block_difficulty < network_difficulty {
@@ -97,109 +153,74 @@ impl Jobs {
                     "Block rejected: job_id={}, block_hash=pending, miner={}, difficulty={} below network_difficulty={}",
                     job_id, miner_address, block_difficulty, network_difficulty
                 );
-                let pending = Pending {
-                    id: rpc_id,
-                    send,
-                    block_hash: "rejected_pre_hash".to_string(),
-                };
+                let pending = Pending { id: rpc_id, send, block_hash: "rejected_pre_hash".to_string() };
                 pending.resolve(Some(Box::from(format!(
                     "Difficulty {} below network minimum {}",
                     block_difficulty, network_difficulty
                 ))));
+                self.submitted_hashes.remove(&submission_key);
                 return false;
             }
         }
 
-        if let Some(header) = &mut block.header {
-            header.nonce = nonce;
-            let reward_block_hash = match header.hash(false) {
-                Ok(hash) => hex::encode(hash.as_bytes()),
-                Err(e) => {
-                    debug!(target: "stratum::jobs", "Failed to compute block hash for job_id={}: {}", job_id, e);
-                    return false;
-                }
-            };
-
-            // Check for duplicate block submission *before* adding to database
-            let now = Instant::now();
-            if let Some(entry) = self.submitted_hashes.get(&reward_block_hash) {
-                if now.duration_since(*entry.value()) < Duration::from_secs(10) {
-                    warn!(target: "stratum::jobs",
-                        "Duplicate block submission detected: job_id={}, block_hash={}, miner={}",
-                        job_id, reward_block_hash, miner_address
-                    );
-                    let pending = Pending {
-                        id: rpc_id,
-                        send,
-                        block_hash: reward_block_hash.clone(),
-                    };
-                    pending.resolve(Some(Box::from("Duplicate block submission")));
-                    return false;
+        // Calculate reward from the first output of the coinbase transaction
+        let reward = match block.transactions.get(0) {
+            Some(coinbase_tx) if coinbase_tx.inputs.is_empty() => {
+                match coinbase_tx.outputs.get(0) {
+                    Some(output) => ((output.amount as f64) * (1.0 - self.pool_fee / 100.0)) as u64,
+                    None => {
+                        debug!(target: "stratum::jobs", "No outputs in coinbase transaction for job_id={}", job_id);
+                        self.submitted_hashes.remove(&submission_key);
+                        return false;
+                    }
                 }
             }
+            _ => {
+                info!(target: "stratum::jobs", "No valid coinbase transaction found for job_id={}", job_id);
+                self.submitted_hashes.remove(&submission_key);
+                return false;
+            }
+        };
 
-            // Insert into submitted_hashes *before* database operation
-            self.submitted_hashes.insert(reward_block_hash.clone(), now);
-
-            // Clean up old entries to prevent memory growth
-            self.submitted_hashes.retain(|_, v| now.duration_since(*v) < Duration::from_secs(60));
-
-            // Calculate reward from coinbase transaction
-            let reward = match block.transactions.get(0) {
-                Some(coinbase_tx) if coinbase_tx.inputs.is_empty() => {
-                    // Sum the amounts in the coinbase transaction outputs
-                    let total_reward: u64 = coinbase_tx
-                        .outputs
-                        .iter()
-                        .map(|output| output.amount)
-                        .sum();
-                    // Apply pool fee
-                    ((total_reward as f64) * (1.0 - self.pool_fee / 100.0)) as u64
-                }
-                _ => {
-                    debug!(target: "stratum::jobs", "No valid coinbase transaction found for job_id={}", job_id);
-                    // Remove from submitted_hashes to allow retry
-                    self.submitted_hashes.remove(&reward_block_hash);
-                    return false;
-                }
-            };
-
-            let daa_score = header.daa_score;
-
-            // Add block details to database only if not a duplicate
-            if let Err(e) = self.db.add_block_details(
-                &reward_block_hash,
-                &miner_address,
-                &reward_block_hash,
+        let daa_score = block.header.as_ref().map(|h| h.daa_score).unwrap_or(0);
+        // Offload database write to a background task
+        let db = Arc::clone(&self.db);
+        let submission_key_clone = submission_key.clone();
+        let miner_address_clone = miner_address.clone();
+        let extranonce_clone = extranonce.clone();
+        let pool_address_clone = self.pool_address.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db.add_block_details(
+                &submission_key_clone,
+                &miner_address_clone,
+                &submission_key_clone,
                 job_id,
-                &extranonce,
+                &extranonce_clone,
                 &format!("{:016x}", nonce),
                 daa_score,
-                &self.pool_address,
+                &pool_address_clone,
                 reward,
             ).await {
                 debug!(target: "stratum::jobs", "Failed to store block submission for job_id={}: {}", job_id, e);
-                // Remove from submitted_hashes to allow retry
-                self.submitted_hashes.remove(&reward_block_hash);
-                return false;
             }
+        });
 
-            let mut pending = self.pending.lock().await;
-            pending.push_back(Pending {
-                id: rpc_id,
-                send,
-                block_hash: reward_block_hash.clone(),
-            });
-            info!(target: "stratum::jobs",
-                "Submitted block: job_id={}, block_hash={}, miner={}, difficulty={}",
-                job_id, reward_block_hash, miner_address, network_difficulty
-            );
-            handle.submit_block(block);
-            true
-        } else {
-            debug!(target: "stratum::jobs", "No header found for job_id={}", job_id);
-            false
-        }
+        let mut pending = self.pending.lock().await;
+        pending.push_back(Pending { id: rpc_id, send, block_hash: submission_key.clone() });
+        info!(target: "stratum::jobs",
+            "Submitted block: job_id={}, block_hash={}, nonce={}, miner={}, difficulty={}",
+            job_id, submission_key, format!("{:016x}", nonce), miner_address, network_difficulty
+        );
+
+        // Submit block asynchronously
+        tokio::spawn({
+            let handle = handle.clone();
+            let block = block.clone();
+            async move { handle.submit_block(block); }
+        });
+
+        info!(target: "stratum::jobs", "Submission processed in {:?}", start.elapsed());
+        true
     }
 
     pub async fn resolve_pending(&self, error: Option<Box<str>>) {

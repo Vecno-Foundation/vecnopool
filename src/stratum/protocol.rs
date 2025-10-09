@@ -198,12 +198,12 @@ impl<'a> StratumConn<'a> {
                     .get_job_params(job_id_u8)
                     .await
                     .map(|params| params.difficulty())
-                    .unwrap_or(1000),
+                    .ok_or_else(|| anyhow!("No job params for job_id={}", job_id_u8))?,
                 Err(_) => {
                     warn!(target: "stratum::protocol",
                         "Invalid job_id format for worker={}: job_id={}", address, job_id
                     );
-                    1000
+                    return Ok(());
                 }
             };
             if self.difficulty != network_difficulty {
@@ -258,11 +258,27 @@ impl<'a> StratumConn<'a> {
         debug!("Initialized connection with sharehandler for worker: {:?}", self.payout_addr);
         debug!("Last template status: has_template={:?} for worker: {:?}", self.last_template.read().await.is_some(), self.payout_addr);
 
+        // Check initial connection state
+        if self.recv.borrow().is_none() {
+            debug!("No valid template available, rejecting connection for worker: {:?}", self.payout_addr);
+            self.write_error_response(Id::Number(0), 25, "Node disconnected, please try again later".into()).await?;
+            return Ok(());
+        }
+
         loop {
             tokio::select! {
                 res = self.recv.changed() => match res {
-                    Err(_) => break,
+                    Err(_) => {
+                        debug!("Template channel closed, closing connection for worker: {:?}", self.payout_addr);
+                        self.write_error_response(Id::Number(self.id + 1), 25, "Node disconnected, please try again later".into()).await?;
+                        return Ok(());
+                    }
                     Ok(_) => {
+                        if self.recv.borrow().is_none() {
+                            debug!("No valid template available, closing connection for worker: {:?}", self.payout_addr);
+                            self.write_error_response(Id::Number(self.id + 1), 25, "Node disconnected, please try again later".into()).await?;
+                            return Ok(());
+                        }
                         if self.subscribed {
                             self.write_template().await?;
                         }
@@ -296,21 +312,31 @@ impl<'a> StratumConn<'a> {
                                     self.write_error_response(id, 21, "Invalid address format".into()).await?;
                                     continue;
                                 }
+                                // Check template availability before authorizing
+                                if self.recv.borrow().is_none() {
+                                    self.write_error_response(id, 25, "Node disconnected, please try again later".into()).await?;
+                                    debug!("No valid template available, rejecting authorization for worker: {:?}", self.payout_addr);
+                                    return Ok(());
+                                }
                                 self.payout_addr = Some(params[0].clone());
                                 self.authorized = true;
                                 let address = self.payout_addr.as_ref().unwrap();
                                 let job_id = self.recv.borrow().as_ref().map(|j| j.id.to_string()).unwrap_or_default();
                                 let network_difficulty = match job_id.parse::<u8>() {
-                                    Ok(job_id_u8) => self.jobs
-                                        .get_job_params(job_id_u8)
-                                        .await
-                                        .map(|params| params.difficulty())
-                                        .unwrap_or(1000),
+                                    Ok(job_id_u8) => match self.jobs.get_job_params(job_id_u8).await {
+                                        Some(params) => params.difficulty(),
+                                        None => {
+                                            warn!(target: "stratum::protocol",
+                                                "No valid job params for worker={}: job_id={}", address, job_id
+                                            );
+                                            continue;
+                                        }
+                                    },
                                     Err(_) => {
                                         warn!(target: "stratum::protocol",
                                             "Invalid job_id format for worker={}: job_id={}", address, job_id
                                         );
-                                        1000
+                                        continue;
                                     }
                                 };
                                 self.difficulty = network_difficulty;
@@ -333,6 +359,12 @@ impl<'a> StratumConn<'a> {
                                 if address != *self.payout_addr.as_ref().unwrap_or(&String::new()) {
                                     self.write_error_response(i, 23, "Unknown worker".into()).await?;
                                     continue;
+                                }
+                                // Check if a valid template exists (indicating Vecnod connection)
+                                if self.recv.borrow().is_none() {
+                                    self.write_error_response(i, 25, "Node disconnected, please try again later".into()).await?;
+                                    debug!("Share rejected due to no valid template for worker={}", address);
+                                    return Ok(());
                                 }
                                 let job_id = match u8::from_str_radix(&id_str, 16) {
                                     Ok(id) => id,

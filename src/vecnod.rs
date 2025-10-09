@@ -229,7 +229,7 @@ pub mod proto {
     const BLOCK_HASH_DOMAIN: &[u8; 32] = b"BlockHash\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
     include!(concat!(env!("OUT_DIR"), "/protowire.rs"));
-
+    #[allow(dead_code)]
     impl vecnod_message::Payload {
         pub fn get_info() -> Self {
             vecnod_message::Payload::GetInfoRequest(GetInfoRequestMessage {})

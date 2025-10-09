@@ -223,11 +223,6 @@ message RequestPruningPointAndItsAnticoneMessage {
 message RequestNextPruningPointAndItsAnticoneBlocksMessage{
 }
 
-message TrustedBlock {
-  BlockMessage block = 3;
-  GhostdagData ghostdagData = 2;
-}
-
 message TrustedHeader {
   BlockHeader header = 1;
   GhostdagData ghostdagData = 2;

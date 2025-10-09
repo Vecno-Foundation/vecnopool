@@ -103,7 +103,7 @@ impl Jobs {
         };
 
         // Critical section: validate job and check for duplicates
-        let (submission_key, block, handle, network_difficulty) = {
+        let (submission_key, reward_block_hash, block, handle, network_difficulty) = {
             let r = self.inner.read().await;
             let block = match r.jobs.get(job_id as usize) {
                 Some(b) => b.clone(),
@@ -142,7 +142,7 @@ impl Jobs {
                 }
             }
             self.submitted_hashes.insert(submission_key.clone(), now);
-            (submission_key, block, r.handle.clone(), difficulty)
+            (submission_key, reward_block_hash, block, r.handle.clone(), difficulty)
         };
 
         // Perform slow operations outside the lock
@@ -153,7 +153,7 @@ impl Jobs {
                     "Block rejected: job_id={}, block_hash=pending, miner={}, difficulty={} below network_difficulty={}",
                     job_id, miner_address, block_difficulty, network_difficulty
                 );
-                let pending = Pending { id: rpc_id, send, block_hash: "rejected_pre_hash".to_string() };
+                let pending = Pending { id: rpc_id, send, block_hash: reward_block_hash.clone() };
                 pending.resolve(Some(Box::from(format!(
                     "Difficulty {} below network minimum {}",
                     block_difficulty, network_difficulty
@@ -185,15 +185,15 @@ impl Jobs {
         let daa_score = block.header.as_ref().map(|h| h.daa_score).unwrap_or(0);
         // Offload database write to a background task
         let db = Arc::clone(&self.db);
-        let submission_key_clone = submission_key.clone();
+        let reward_block_hash_clone = reward_block_hash.clone();
         let miner_address_clone = miner_address.clone();
         let extranonce_clone = extranonce.clone();
         let pool_address_clone = self.pool_address.clone();
         tokio::spawn(async move {
             if let Err(e) = db.add_block_details(
-                &submission_key_clone,
+                &reward_block_hash_clone,
                 &miner_address_clone,
-                &submission_key_clone,
+                &reward_block_hash_clone,
                 job_id,
                 &extranonce_clone,
                 &format!("{:016x}", nonce),
@@ -206,10 +206,10 @@ impl Jobs {
         });
 
         let mut pending = self.pending.lock().await;
-        pending.push_back(Pending { id: rpc_id, send, block_hash: submission_key.clone() });
+        pending.push_back(Pending { id: rpc_id, send, block_hash: reward_block_hash.clone() });
         info!(target: "stratum::jobs",
             "Submitted block: job_id={}, block_hash={}, nonce={}, miner={}, difficulty={}",
-            job_id, submission_key, format!("{:016x}", nonce), miner_address, network_difficulty
+            job_id, reward_block_hash, format!("{:016x}", nonce), miner_address, network_difficulty
         );
 
         // Submit block asynchronously

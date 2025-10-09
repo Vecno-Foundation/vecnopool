@@ -167,7 +167,7 @@ pub async fn process_rewards(db: Arc<Db>, window_time_ms: u64) -> Result<()> {
             let base_address = address.split('.').next().unwrap_or(address);
             let share_percentage = *miner_difficulty as f64 / total_difficulty as f64;
             let miner_reward = ((amount as f64) * share_percentage) as u64;
-            info!("Distributing reward for block {}: address={}, reward={} sompi, share_percentage={:.2}%", 
+            info!("Distributing reward for block {}: address={}, reward={} veni, share_percentage={:.2}%", 
                   block.reward_block_hash, base_address, miner_reward, share_percentage * 100.0);
 
             let result = db.add_balance("", base_address, miner_reward).await

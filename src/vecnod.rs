@@ -1,5 +1,7 @@
 //src/vecnod.rs
 
+// src/vecnod.rs
+
 use anyhow::Result;
 use log::{debug, warn, info};
 use proto::vecnod_message::Payload as RequestPayload;
@@ -58,7 +60,7 @@ struct ClientTask {
     send_msg: Send<Message>,
     recv_cmd: Recv<RequestPayload>,
     db: Arc<Db>,
-    pool_script_public_key: String,
+    pool_address: String,
 }
 
 impl ClientTask {
@@ -128,51 +130,82 @@ impl ClientTask {
                 },
                 Some(ResponsePayload::BlockAddedNotification(block_added)) => {
                     if let Some(block) = block_added.block {
-                        let matches_pool = block.transactions.iter().any(|tx| {
+                        // Process all transactions with no inputs (coinbase transactions)
+                        let coinbase_txs: Vec<_> = block.transactions.iter().filter(|tx| tx.inputs.is_empty()).collect();
+                        let matches_pool_address = coinbase_txs.iter().any(|tx| {
                             tx.outputs.iter().any(|output| {
                                 output
-                                    .script_public_key
+                                    .verbose_data
                                     .as_ref()
-                                    .map(|spk| spk.script_public_key == self.pool_script_public_key)
+                                    .map(|vd| vd.script_public_key_address == self.pool_address)
                                     .unwrap_or(false)
                             })
                         });
 
-                        if matches_pool {
-                            info!("Block with matching pool script public key found: {:?}", block.verbose_data.as_ref().map(|vd| &vd.hash));
+                        if matches_pool_address {
+                            let block_hash = block
+                                .verbose_data
+                                .as_ref()
+                                .map(|vd| vd.hash.clone())
+                                .unwrap_or_default();
+                            // Log if multiple coinbase-like transactions are found
+                            if coinbase_txs.len() > 1 {
+                                let tx_ids: Vec<_> = coinbase_txs
+                                    .iter()
+                                    .filter_map(|tx| tx.verbose_data.as_ref().map(|vd| vd.transaction_id.clone()))
+                                    .collect();
+                                let amounts: Vec<_> = coinbase_txs
+                                    .iter()
+                                    .map(|tx| {
+                                        tx.outputs
+                                            .iter()
+                                            .filter(|output| {
+                                                output
+                                                    .verbose_data
+                                                    .as_ref()
+                                                    .map(|vd| vd.script_public_key_address == self.pool_address)
+                                                    .unwrap_or(false)
+                                            })
+                                            .map(|output| output.amount)
+                                            .sum::<u64>()
+                                    })
+                                    .collect();
+                                info!(
+                                    "Multiple coinbase-like transactions found in block {}: count={}, transaction_ids={:?}, amounts={:?}, total_amount={}",
+                                    block_hash,
+                                    coinbase_txs.len(),
+                                    tx_ids,
+                                    amounts,
+                                    amounts.iter().sum::<u64>()
+                                );
+                            } else {
+                                debug!("Block with matching pool address found in coinbase: {:?}", block_hash);
+                            }
+
                             if let Some(header) = &block.header {
-                                let reward_block_hash = block
-                                    .verbose_data
-                                    .as_ref()
-                                    .map(|vd| vd.hash.clone())
-                                    .unwrap_or_default();
+                                let reward_block_hash = block_hash;
                                 let job_id = 0;
                                 let extranonce = "";
                                 let nonce = format!("{:016x}", header.nonce);
                                 let daa_score = header.daa_score;
-                                let pool_wallet = self.pool_script_public_key.clone();
-                                let amount = block.transactions.iter().filter(|tx| {
-                                    tx.outputs.iter().any(|output| {
-                                        output
-                                            .script_public_key
-                                            .as_ref()
-                                            .map(|spk| spk.script_public_key == self.pool_script_public_key)
-                                            .unwrap_or(false)
+                                let pool_wallet = self.pool_address.clone();
+                                let amount = coinbase_txs
+                                    .iter()
+                                    .filter(|tx| tx.inputs.is_empty())
+                                    .flat_map(|tx| {
+                                        tx.outputs.iter().filter(|output| {
+                                            output
+                                                .verbose_data
+                                                .as_ref()
+                                                .map(|vd| vd.script_public_key_address == self.pool_address)
+                                                .unwrap_or(false)
+                                        })
                                     })
-                                }).map(|tx| {
-                                    tx.outputs.iter().filter(|output| {
-                                        output
-                                            .script_public_key
-                                            .as_ref()
-                                            .map(|spk| spk.script_public_key == self.pool_script_public_key)
-                                            .unwrap_or(false)
-                                    }).map(|output| output.amount).sum::<u64>()
-                                }).sum::<u64>();
-                                let miner_id = "unknown".to_string();
+                                    .map(|output| output.amount)
+                                    .sum::<u64>();
 
                                 if let Err(e) = self.db.add_block_details(
                                     &reward_block_hash,
-                                    &miner_id,
                                     &reward_block_hash,
                                     job_id,
                                     extranonce,
@@ -183,11 +216,11 @@ impl ClientTask {
                                 ).await {
                                     warn!("Failed to add block details to database: {:?}", e);
                                 } else {
-                                    info!("Successfully added block details to database: hash = {}, daaScore = {}", reward_block_hash, daa_score);
+                                    info!("Successfully added block details to database: hash = {}, daaScore = {}, amount = {}", reward_block_hash, daa_score, amount);
                                 }
                             }
                         } else {
-                            debug!("Block does not match pool script public key");
+                            debug!("No coinbase transactions match pool address");
                         }
                     }
                     Message::NewBlock
@@ -224,7 +257,7 @@ impl Client {
         handle: VecnodHandle,
         recv_cmd: Recv<RequestPayload>,
         db: Arc<Db>,
-        pool_script_public_key: String,
+        pool_address: String,
     ) -> (Self, Recv<Message>) {
         let (send_msg, recv_msg) = mpsc::unbounded_channel();
 
@@ -244,7 +277,7 @@ impl Client {
             send_msg,
             recv_cmd,
             db,
-            pool_script_public_key,
+            pool_address,
         };
 
         tokio::spawn(async move {
@@ -292,6 +325,7 @@ impl Client {
     }
 }
 
+// The proto module remains unchanged, so it's included as is
 pub mod proto {
     use crate::pow;
     use crate::uint::U256;

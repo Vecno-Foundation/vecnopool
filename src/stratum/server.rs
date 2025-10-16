@@ -32,7 +32,7 @@ impl Stratum {
         info!("Listening on {}, pool fee: {}%, window_time_ms: {}ms ({}s)", addr, pool_fee, window_time_ms, window_time_ms / 1000);
         let last_template = Arc::new(tokio::sync::RwLock::new(None));
         let db = Arc::new(Db::new().await?);
-        let jobs = Arc::new(Jobs::new(handle, db.clone()));
+        let jobs = Arc::new(Jobs::new(handle));
         let (pending, _) = mpsc::unbounded_channel();
         let (send, recv) = watch::channel(None);
         let share_handler = Arc::new(Sharehandler::new(
@@ -71,7 +71,7 @@ impl Stratum {
                         let last_template = last_template_clone.clone();
                         let pending_send = pending_clone.clone();
                         let (pending_send_inner, pending_recv) = mpsc::unbounded_channel();
-                        let mining_addr = pool_address_clone.clone();
+                        let pool_address = pool_address_clone.clone();
                         let recv_clone = recv.clone();
                         tokio::spawn(async move {
                             let (reader, writer) = stream.split();
@@ -91,7 +91,7 @@ impl Stratum {
                                 share_handler,
                                 last_template,
                                 extranonce: String::new(),
-                                mining_addr,
+                                pool_address,
                                 duplicate_share_count: Arc::new(AtomicU64::new(0)),
                             };
                             debug!(

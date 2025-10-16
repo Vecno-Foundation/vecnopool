@@ -5,7 +5,7 @@ use sqlx::postgres::{PgPoolOptions, PgPool};
 use sqlx::Row;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use log::{debug, warn, info};
+use log::{debug, warn};
 
 #[derive(Debug)]
 pub struct Db {
@@ -15,11 +15,9 @@ pub struct Db {
 #[derive(Debug, sqlx::FromRow)]
 pub struct Block {
     pub reward_block_hash: String,
-    pub miner_id: String,
     pub daa_score: i64,
     pub amount: i64,
     pub confirmations: i64,
-    pub accepted: i64,
     #[allow(dead_code)]
     pub processed: i64,
     #[allow(dead_code)]
@@ -149,13 +147,11 @@ impl Db {
             r#"
             CREATE TABLE IF NOT EXISTS blocks (
                 reward_block_hash TEXT PRIMARY KEY,
-                miner_id TEXT NOT NULL,
                 daa_score BIGINT NOT NULL,
                 pool_wallet TEXT NOT NULL,
                 amount BIGINT NOT NULL,
                 confirmations BIGINT NOT NULL DEFAULT 0,
                 processed BIGINT NOT NULL DEFAULT 0,
-                accepted BIGINT NOT NULL DEFAULT 0,
                 job_id TEXT NOT NULL,
                 extranonce TEXT NOT NULL,
                 nonce TEXT NOT NULL,
@@ -180,20 +176,6 @@ impl Db {
         .execute(&pool)
         .await
         .context("Failed to create index on blocks table (processed)")?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_blocks_miner_id ON blocks (miner_id)"
-        )
-        .execute(&pool)
-        .await
-        .context("Failed to create index on blocks table (miner_id)")?;
-
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_blocks_accepted ON blocks (accepted)"
-        )
-        .execute(&pool)
-        .await
-        .context("Failed to create index on blocks table (accepted)")?;
 
         let tables: Vec<(String,)> = sqlx::query_as(
             "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
@@ -225,8 +207,8 @@ impl Db {
         .await
         .context("Failed to verify blocks table schema")?;
         let expected_columns = vec![
-            "reward_block_hash", "miner_id", "daa_score", "pool_wallet", "amount",
-            "confirmations", "processed", "accepted", "job_id", "extranonce", "nonce", "timestamp"
+            "reward_block_hash", "daa_score", "pool_wallet", "amount",
+            "confirmations", "processed", "job_id", "extranonce", "nonce", "timestamp"
         ];
         for column in expected_columns {
             if !block_columns.iter().any(|(name,)| name == column) {
@@ -246,8 +228,6 @@ impl Db {
                 'idx_shares_job_id',
                 'idx_blocks_confirmations_processed',
                 'idx_blocks_processed',
-                'idx_blocks_miner_id',
-                'idx_blocks_accepted',
                 'idx_payments_timestamp'
             )
             "#,
@@ -264,8 +244,6 @@ impl Db {
             "idx_shares_job_id",
             "idx_blocks_confirmations_processed",
             "idx_blocks_processed",
-            "idx_blocks_miner_id",
-            "idx_blocks_accepted",
             "idx_payments_timestamp",
         ];
         for index in expected_indexes {
@@ -472,7 +450,6 @@ impl Db {
     pub async fn add_block_details(
         &self,
         _block_hash: &str,
-        miner_id: &str,
         reward_block_hash: &str,
         job_id: u8,
         extranonce: &str,
@@ -487,17 +464,16 @@ impl Db {
             .expect("Time went backwards")
             .as_secs() as i64;
 
-        info!("Adding block details: reward_block_hash={}, miner_id={}, job_id={}, daa_score={}, amount={}", 
-               reward_block_hash, miner_id, job_id, daa_score, amount);
+        debug!("Adding block details: reward_block_hash={}, job_id={}, daa_score={}, amount={}", 
+               reward_block_hash, job_id, daa_score, amount);
 
         let result = sqlx::query(
             r#"
             INSERT INTO blocks (
-                reward_block_hash, miner_id, daa_score, pool_wallet, amount, confirmations, processed, accepted,
+                reward_block_hash, daa_score, pool_wallet, amount, confirmations, processed,
                 job_id, extranonce, nonce, timestamp
-            ) VALUES ($1, $2, $3, $4, $5, 0, 0, 0, $6, $7, $8, $9)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
             ON CONFLICT (reward_block_hash) DO UPDATE SET
-                miner_id = EXCLUDED.miner_id,
                 daa_score = EXCLUDED.daa_score,
                 pool_wallet = EXCLUDED.pool_wallet,
                 amount = EXCLUDED.amount,
@@ -508,10 +484,11 @@ impl Db {
             "#,
         )
         .bind(reward_block_hash)
-        .bind(miner_id)
         .bind(daa_score as i64)
         .bind(pool_wallet)
         .bind(amount as i64)
+        .bind(0 as i64) 
+        .bind(0 as i64)
         .bind(job_id.to_string())
         .bind(extranonce)
         .bind(nonce)
@@ -537,7 +514,7 @@ impl Db {
         let start_time = SystemTime::now();
         let result = sqlx::query_as::<_, Block>(
             r#"
-            SELECT reward_block_hash, miner_id, daa_score, amount, confirmations, processed, accepted,
+            SELECT reward_block_hash, daa_score, amount, confirmations, processed,
                    pool_wallet, job_id, extranonce, nonce, timestamp
             FROM blocks WHERE processed = 0
             "#,
@@ -552,7 +529,7 @@ impl Db {
         match result {
             Ok(rows) => {
                 for block in &rows {
-                    debug!("Unconfirmed block: reward_block_hash={}, miner_id={}", block.reward_block_hash, block.miner_id);
+                    debug!("Unconfirmed block: reward_block_hash={}", block.reward_block_hash);
                 }
                 Ok(rows)
             }
@@ -564,9 +541,9 @@ impl Db {
         let start_time = SystemTime::now();
         let result = sqlx::query_as::<_, Block>(
             r#"
-            SELECT reward_block_hash, miner_id, daa_score, amount, confirmations, processed, accepted,
+            SELECT reward_block_hash, daa_score, amount, confirmations, processed,
                    pool_wallet, job_id, extranonce, nonce, timestamp
-            FROM blocks WHERE confirmations >= 100 AND accepted = 1 AND processed = 0
+            FROM blocks WHERE confirmations >= 101 AND processed = 0
             "#,
         )
         .fetch_all(&self.pool)
@@ -579,32 +556,10 @@ impl Db {
         match result {
             Ok(rows) => {
                 for block in &rows {
-                    debug!("Block for rewards: reward_block_hash={}, miner_id={}", block.reward_block_hash, block.miner_id);
+                    debug!("Block for rewards: reward_block_hash={}", block.reward_block_hash);
                 }
                 Ok(rows)
             }
-            Err(e) => Err(e)
-        }
-    }
-
-    pub async fn update_block_status(&self, reward_block_hash: &str, accepted: bool) -> Result<()> {
-        let start_time = SystemTime::now();
-        let result = sqlx::query(
-            r#"
-            UPDATE blocks SET accepted = $1 WHERE reward_block_hash = $2
-            "#,
-        )
-        .bind(if accepted { 1 } else { 0 })
-        .bind(reward_block_hash)
-        .execute(&self.pool)
-        .await
-        .context("Failed to update block status");
-
-        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
-        debug!("update_block_status query took {} seconds for reward_block_hash={}", elapsed, reward_block_hash);
-
-        match result {
-            Ok(_) => Ok(()),
             Err(e) => Err(e)
         }
     }
@@ -692,32 +647,6 @@ impl Db {
                 let rows_affected = res.rows_affected();
                 if rows_affected > 0 {
                     debug!("Cleaned up {} processed blocks", rows_affected);
-                }
-                Ok(())
-            }
-            Err(e) => Err(e)
-        }
-    }
-
-    pub async fn cleanup_unaccepted_blocks(&self) -> Result<()> {
-        let start_time = SystemTime::now();
-        let result = sqlx::query(
-            r#"
-            DELETE FROM blocks WHERE accepted = 0
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .context("Failed to clean up unaccepted blocks");
-
-        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
-        debug!("cleanup_unaccepted_blocks query took {} seconds", elapsed);
-
-        match result {
-            Ok(res) => {
-                let rows_affected = res.rows_affected();
-                if rows_affected > 0 {
-                    debug!("Cleaned up {} unaccepted blocks", rows_affected);
                 }
                 Ok(())
             }

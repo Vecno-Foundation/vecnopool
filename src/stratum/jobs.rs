@@ -9,7 +9,6 @@ use serde_json::json;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
-use crate::database::db::Db;
 use hex;
 use dashmap::DashMap;
 use std::time::{Instant, Duration};
@@ -18,7 +17,6 @@ use std::time::{Instant, Duration};
 pub struct Jobs {
     inner: Arc<RwLock<JobsInner>>,
     pending: Arc<Mutex<VecDeque<Pending>>>,
-    db: Arc<Db>,
     submitted_hashes: Arc<DashMap<String, Instant>>,
     submission_lock: Arc<Mutex<()>>,
 }
@@ -26,7 +24,6 @@ pub struct Jobs {
 impl Jobs {
     pub fn new(
         handle: VecnodHandle,
-        db: Arc<Db>,
     ) -> Self {
         let jobs = Self {
             inner: Arc::new(RwLock::new(JobsInner {
@@ -35,7 +32,6 @@ impl Jobs {
                 handle,
             })),
             pending: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
-            db,
             submitted_hashes: Arc::new(DashMap::new()),
             submission_lock: Arc::new(Mutex::new(())),
         };
@@ -95,14 +91,14 @@ impl Jobs {
             Ok(lock) => lock,
             Err(_) => {
                 debug!(target: "stratum::jobs", "Submission lock timeout for job_id={}", job_id);
-                let pending = Pending { id: rpc_id, send, block_hash: "timeout".to_string() };
+                let pending = Pending { id: rpc_id, send };
                 pending.resolve(Some(Box::from("Submission lock timeout")));
                 return false;
             }
         };
 
         // Critical section: validate job and check for duplicates
-        let (submission_key, reward_block_hash, block, handle, network_difficulty) = {
+        let (submission_key, block, handle, network_difficulty) = {
             let r = self.inner.read().await;
             let block = match r.jobs.get(job_id as usize) {
                 Some(b) => b.clone(),
@@ -132,16 +128,16 @@ impl Jobs {
             if let Some(entry) = self.submitted_hashes.get(&submission_key) {
                 if now.duration_since(*entry.value()) < Duration::from_secs(10) {
                     warn!(target: "stratum::jobs",
-                        "Duplicate block submission detected: job_id={}, block_hash={}, nonce={}, miner={}",
-                        job_id, reward_block_hash, nonce_hex, miner_address
+                        "Duplicate block submission detected: job_id={}, nonce={}, miner={}",
+                        job_id, nonce_hex, miner_address
                     );
-                    let pending = Pending { id: rpc_id, send, block_hash: reward_block_hash };
+                    let pending = Pending { id: rpc_id, send };
                     pending.resolve(Some(Box::from("Duplicate block submission")));
                     return false;
                 }
             }
             self.submitted_hashes.insert(submission_key.clone(), now);
-            (submission_key, reward_block_hash, block, r.handle.clone(), difficulty)
+            (submission_key, block, r.handle.clone(), difficulty)
         };
 
         // Perform slow operations outside the lock
@@ -149,10 +145,10 @@ impl Jobs {
             let block_difficulty = header.difficulty();
             if block_difficulty < network_difficulty {
                 warn!(target: "stratum::jobs",
-                    "Block rejected: job_id={}, block_hash=pending, miner={}, difficulty={} below network_difficulty={}",
+                    "Block rejected: job_id={}, miner={}, difficulty={} below network_difficulty={}",
                     job_id, miner_address, block_difficulty, network_difficulty
                 );
-                let pending = Pending { id: rpc_id, send, block_hash: reward_block_hash.clone() };
+                let pending = Pending { id: rpc_id, send };
                 pending.resolve(Some(Box::from(format!(
                     "Difficulty {} below network minimum {}",
                     block_difficulty, network_difficulty
@@ -163,10 +159,10 @@ impl Jobs {
         }
 
         let mut pending = self.pending.lock().await;
-        pending.push_back(Pending { id: rpc_id, send, block_hash: reward_block_hash.clone() });
+        pending.push_back(Pending { id: rpc_id, send });
         info!(target: "stratum::jobs",
-            "Submitted block: job_id={}, block_hash={}, nonce={}, miner={}, difficulty={}",
-            job_id, reward_block_hash, format!("{:016x}", nonce), miner_address, network_difficulty
+            "Submitted block: job_id={}, nonce={}, miner={}, difficulty={}",
+            job_id, format!("{:016x}", nonce), miner_address, network_difficulty
         );
 
         // Submit block asynchronously
@@ -183,15 +179,6 @@ impl Jobs {
     pub async fn resolve_pending(&self, error: Option<Box<str>>) {
         let pending = self.pending.lock().await.pop_front();
         if let Some(pending) = pending {
-            if error.is_some() {
-                if let Err(e) = self.db.update_block_status(&pending.block_hash, false).await {
-                    debug!(target: "stratum::jobs", "Failed to update block status for hash={}: {}", pending.block_hash, e);
-                }
-            } else {
-                if let Err(e) = self.db.update_block_status(&pending.block_hash, true).await {
-                    debug!(target: "stratum::jobs", "Failed to update block status for hash={}: {}", pending.block_hash, e);
-                }
-            }
             pending.resolve(error);
         } else {
             debug!(target: "stratum::jobs", "Resolve: nothing is pending");
@@ -251,7 +238,6 @@ impl JobParams {
 pub struct Pending {
     id: Id,
     send: mpsc::UnboundedSender<PendingResult>,
-    block_hash: String,
 }
 
 impl Pending {

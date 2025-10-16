@@ -40,26 +40,12 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
         }
     };
 
-    if unconfirmed_blocks.is_empty() {
-        debug!("No unconfirmed blocks to process");
-        if let Err(e) = db.cleanup_unaccepted_blocks().await {
-            warn!("Failed to clean up unaccepted blocks: {:?}", e);
-        } else {
-            debug!("Successfully cleaned up unaccepted blocks");
-        }
-        return Ok(());
-    }
-
     debug!("Processing {} unconfirmed blocks", unconfirmed_blocks.len());
 
     let mut updates = Vec::new();
     for block in unconfirmed_blocks {
-        debug!("Examining block: reward_block_hash={}, daa_score={}, accepted={}, confirmations={}", 
-               block.reward_block_hash, block.daa_score, block.accepted, block.confirmations);
-        if block.accepted == 0 {
-            debug!("Skipping unaccepted block: {}", block.reward_block_hash);
-            continue;
-        }
+        debug!("Examining block: reward_block_hash={}, daa_score={}, confirmations={}", 
+               block.reward_block_hash, block.daa_score, block.confirmations);
 
         let confirmations = current_daa_score.saturating_sub(block.daa_score as u64);
         debug!("Processing block: {}, new_confirmations={}", block.reward_block_hash, confirmations);
@@ -91,12 +77,6 @@ pub async fn check_confirmations(db: Arc<Db>, mut daa_score_rx: watch::Receiver<
         transaction.commit().await.context("Failed to commit batch confirmations update")?;
         let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
         debug!("Batch update_block_confirmations took {} seconds for {} blocks", elapsed, updates.len());
-    }
-
-    if let Err(e) = db.cleanup_unaccepted_blocks().await {
-        warn!("Failed to clean up unaccepted blocks: {:?}", e);
-    } else {
-        debug!("Successfully cleaned up unaccepted blocks");
     }
 
     if let Err(e) = process_rewards(db.clone(), window_time_ms).await {
@@ -147,7 +127,7 @@ pub async fn process_rewards(db: Arc<Db>, window_time_ms: u64) -> Result<()> {
             continue;
         }
 
-        debug!("Block {} reached 100 confirmations and PPLNS window, processing: daa_score={}", 
+        debug!("Block {} reached 101 confirmations and PPLNS window, processing: daa_score={}", 
                block.reward_block_hash, block.daa_score);
         processed_blocks.push(block.reward_block_hash.clone());
 

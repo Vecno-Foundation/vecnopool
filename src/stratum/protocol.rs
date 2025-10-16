@@ -35,7 +35,7 @@ pub struct StratumConn<'a> {
     pub share_handler: Arc<Sharehandler>,
     pub last_template: Arc<RwLock<Option<RpcBlock>>>,
     pub extranonce: String,
-    pub mining_addr: String,
+    pub pool_address: String,
     pub duplicate_share_count: Arc<AtomicU64>,
 }
 
@@ -51,7 +51,7 @@ async fn validate_and_submit_share(
     pending_send: &mpsc::UnboundedSender<PendingResult>,
     extranonce: String,
     difficulty: u64,
-    _mining_addr: &str,
+    _pool_address: &str,
     duplicate_share_count: &Arc<AtomicU64>,
 ) -> Result<()> {
     let block_hash = {
@@ -209,7 +209,7 @@ impl<'a> StratumConn<'a> {
             if self.difficulty != network_difficulty {
                 self.difficulty = network_difficulty;
                 let difficulty_f64 = (network_difficulty as f64) / ((1u64 << 32) as f64);
-                info!(
+                debug!(
                     "Sending network difficulty {} (raw: {}) to worker: {} (source: network, job_id: {})",
                     difficulty_f64, network_difficulty, address, job_id
                 );
@@ -341,7 +341,7 @@ impl<'a> StratumConn<'a> {
                                 };
                                 self.difficulty = network_difficulty;
                                 let difficulty_f64 = (network_difficulty as f64) / ((1u64 << 32) as f64);
-                                info!(
+                                debug!(
                                     "Sending network difficulty {} (raw: {}) to worker: {} (source: network)",
                                     difficulty_f64, network_difficulty, address
                                 );
@@ -402,7 +402,7 @@ impl<'a> StratumConn<'a> {
                                     &self.pending_send,
                                     self.extranonce.clone(),
                                     self.difficulty,
-                                    &self.mining_addr,
+                                    &self.pool_address,
                                     &self.duplicate_share_count,
                                 ).await {
                                     warn!("Share validation failed for worker={}: {:?}", self.payout_addr.as_ref().unwrap_or(&String::new()), e);

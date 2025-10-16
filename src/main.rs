@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
     debug!("Environment variables:");
     debug!("RPC_URL: {}", env::var("RPC_URL").unwrap_or_default());
     debug!("STRATUM_ADDR: {}", env::var("STRATUM_ADDR").unwrap_or_default());
-    debug!("MINING_ADDR: {}", env::var("MINING_ADDR").unwrap_or_default());
+    debug!("POOL_ADDR: {}", env::var("POOL_ADDR").unwrap_or_default());
     debug!("POOL_FEE_PERCENT: {}", env::var("POOL_FEE_PERCENT").unwrap_or_default());
     debug!("EXTRA_DATA: {}", env::var("EXTRA_DATA").unwrap_or_default());
     debug!("SQL_URI: {}", env::var("SQL_URI").unwrap_or_default());
@@ -55,8 +55,7 @@ async fn main() -> Result<()> {
     let rpc_url = env::var("RPC_URL").context("RPC_URL must be set in .env")?;
     let stratum_addr = env::var("STRATUM_ADDR").unwrap_or("localhost:6969".to_string());
     let extra_data = env::var("EXTRA_DATA").unwrap_or("Vecno Mining Pool".to_string());
-    let pool_address = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
-    let pool_script_public_key = env::var("POOL_SCRIPT_PUBLIC_KEY").context("POOL_SCRIPT_PUBLIC_KEY must be set in .env")?;
+    let pool_address = env::var("POOL_ADDR").context("POOL_ADDR must be set in .env")?;
     let debug = env::var("DEBUG")
         .map(|v| {
             debug!("DEBUG env var: {}", v);
@@ -152,7 +151,7 @@ async fn main() -> Result<()> {
         handle.clone(),
         recv_cmd,
         stratum.share_handler.db.clone(),
-        pool_script_public_key.clone(),
+        pool_address.clone(),
     );
     debug!("Vecnod client created with RPC_URL: {}", rpc_url);
 

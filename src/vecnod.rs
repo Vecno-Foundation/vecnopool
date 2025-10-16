@@ -1,5 +1,7 @@
+//src/vecnod.rs
+
 use anyhow::Result;
-use log::warn;
+use log::{debug, warn, info};
 use proto::vecnod_message::Payload as RequestPayload;
 use proto::vecnod_response::Payload as ResponsePayload;
 use proto::submit_block_response_message::RejectReason;
@@ -12,6 +14,8 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 use http::Uri;
 use std::convert::TryFrom;
+use std::sync::Arc;
+use crate::database::db::Db;
 
 pub type Send<T> = mpsc::UnboundedSender<T>;
 type Recv<T> = mpsc::UnboundedReceiver<T>;
@@ -53,6 +57,8 @@ struct ClientTask {
     url: String,
     send_msg: Send<Message>,
     recv_cmd: Recv<RequestPayload>,
+    db: Arc<Db>,
+    pool_script_public_key: String,
 }
 
 impl ClientTask {
@@ -120,7 +126,70 @@ impl ClientTask {
                         Message::NewBlock
                     }
                 },
-                Some(ResponsePayload::BlockAddedNotification(_)) => {
+                Some(ResponsePayload::BlockAddedNotification(block_added)) => {
+                    if let Some(block) = block_added.block {
+                        let matches_pool = block.transactions.iter().any(|tx| {
+                            tx.outputs.iter().any(|output| {
+                                output
+                                    .script_public_key
+                                    .as_ref()
+                                    .map(|spk| spk.script_public_key == self.pool_script_public_key)
+                                    .unwrap_or(false)
+                            })
+                        });
+
+                        if matches_pool {
+                            info!("Block with matching pool script public key found: {:?}", block.verbose_data.as_ref().map(|vd| &vd.hash));
+                            if let Some(header) = &block.header {
+                                let reward_block_hash = block
+                                    .verbose_data
+                                    .as_ref()
+                                    .map(|vd| vd.hash.clone())
+                                    .unwrap_or_default();
+                                let job_id = 0;
+                                let extranonce = "";
+                                let nonce = format!("{:016x}", header.nonce);
+                                let daa_score = header.daa_score;
+                                let pool_wallet = self.pool_script_public_key.clone();
+                                let amount = block.transactions.iter().filter(|tx| {
+                                    tx.outputs.iter().any(|output| {
+                                        output
+                                            .script_public_key
+                                            .as_ref()
+                                            .map(|spk| spk.script_public_key == self.pool_script_public_key)
+                                            .unwrap_or(false)
+                                    })
+                                }).map(|tx| {
+                                    tx.outputs.iter().filter(|output| {
+                                        output
+                                            .script_public_key
+                                            .as_ref()
+                                            .map(|spk| spk.script_public_key == self.pool_script_public_key)
+                                            .unwrap_or(false)
+                                    }).map(|output| output.amount).sum::<u64>()
+                                }).sum::<u64>();
+                                let miner_id = "unknown".to_string();
+
+                                if let Err(e) = self.db.add_block_details(
+                                    &reward_block_hash,
+                                    &miner_id,
+                                    &reward_block_hash,
+                                    job_id,
+                                    extranonce,
+                                    &nonce,
+                                    daa_score,
+                                    &pool_wallet,
+                                    amount,
+                                ).await {
+                                    warn!("Failed to add block details to database: {:?}", e);
+                                } else {
+                                    info!("Successfully added block details to database: hash = {}, daaScore = {}", reward_block_hash, daa_score);
+                                }
+                            }
+                        } else {
+                            debug!("Block does not match pool script public key");
+                        }
+                    }
                     Message::NewBlock
                 },
                 Some(payload) => {
@@ -154,6 +223,8 @@ impl Client {
         extra_data: &str,
         handle: VecnodHandle,
         recv_cmd: Recv<RequestPayload>,
+        db: Arc<Db>,
+        pool_script_public_key: String,
     ) -> (Self, Recv<Message>) {
         let (send_msg, recv_msg) = mpsc::unbounded_channel();
 
@@ -172,6 +243,8 @@ impl Client {
             url,
             send_msg,
             recv_cmd,
+            db,
+            pool_script_public_key,
         };
 
         tokio::spawn(async move {

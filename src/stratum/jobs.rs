@@ -1,4 +1,5 @@
 //src/stratum/jobs.rs
+
 use crate::stratum::{Id, Response};
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use crate::uint::U256;
@@ -18,14 +19,15 @@ pub struct Jobs {
     inner: Arc<RwLock<JobsInner>>,
     pending: Arc<Mutex<VecDeque<Pending>>>,
     db: Arc<Db>,
-    pool_address: String,
-    pool_fee: f64,
     submitted_hashes: Arc<DashMap<String, Instant>>,
     submission_lock: Arc<Mutex<()>>,
 }
 
 impl Jobs {
-    pub fn new(handle: VecnodHandle, db: Arc<Db>, pool_address: String, pool_fee: f64) -> Self {
+    pub fn new(
+        handle: VecnodHandle,
+        db: Arc<Db>,
+    ) -> Self {
         let jobs = Self {
             inner: Arc::new(RwLock::new(JobsInner {
                 next: 0,
@@ -34,8 +36,6 @@ impl Jobs {
             })),
             pending: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
             db,
-            pool_address,
-            pool_fee,
             submitted_hashes: Arc::new(DashMap::new()),
             submission_lock: Arc::new(Mutex::new(())),
         };
@@ -87,7 +87,6 @@ impl Jobs {
         job_id: u8,
         nonce: u64,
         miner_address: String,
-        extranonce: String,
         send: mpsc::UnboundedSender<PendingResult>,
     ) -> bool {
         let start = Instant::now();
@@ -162,48 +161,6 @@ impl Jobs {
                 return false;
             }
         }
-
-        // Calculate reward from the first output of the coinbase transaction
-        let reward = match block.transactions.get(0) {
-            Some(coinbase_tx) if coinbase_tx.inputs.is_empty() => {
-                match coinbase_tx.outputs.get(0) {
-                    Some(output) => ((output.amount as f64) * (1.0 - self.pool_fee / 100.0)) as u64,
-                    None => {
-                        debug!(target: "stratum::jobs", "No outputs in coinbase transaction for job_id={}", job_id);
-                        self.submitted_hashes.remove(&submission_key);
-                        return false;
-                    }
-                }
-            }
-            _ => {
-                info!(target: "stratum::jobs", "No valid coinbase transaction found for job_id={}", job_id);
-                self.submitted_hashes.remove(&submission_key);
-                return false;
-            }
-        };
-
-        let daa_score = block.header.as_ref().map(|h| h.daa_score).unwrap_or(0);
-        // Offload database write to a background task
-        let db = Arc::clone(&self.db);
-        let reward_block_hash_clone = reward_block_hash.clone();
-        let miner_address_clone = miner_address.clone();
-        let extranonce_clone = extranonce.clone();
-        let pool_address_clone = self.pool_address.clone();
-        tokio::spawn(async move {
-            if let Err(e) = db.add_block_details(
-                &reward_block_hash_clone,
-                &miner_address_clone,
-                &reward_block_hash_clone,
-                job_id,
-                &extranonce_clone,
-                &format!("{:016x}", nonce),
-                daa_score,
-                &pool_address_clone,
-                reward,
-            ).await {
-                debug!(target: "stratum::jobs", "Failed to store block submission for job_id={}: {}", job_id, e);
-            }
-        });
 
         let mut pending = self.pending.lock().await;
         pending.push_back(Pending { id: rpc_id, send, block_hash: reward_block_hash.clone() });

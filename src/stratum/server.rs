@@ -32,7 +32,7 @@ impl Stratum {
         info!("Listening on {}, pool fee: {}%, window_time_ms: {}ms ({}s)", addr, pool_fee, window_time_ms, window_time_ms / 1000);
         let last_template = Arc::new(tokio::sync::RwLock::new(None));
         let db = Arc::new(Db::new().await?);
-        let jobs = Arc::new(Jobs::new(handle, db.clone(), pool_address.to_string(), pool_fee));
+        let jobs = Arc::new(Jobs::new(handle, db.clone()));
         let (pending, _) = mpsc::unbounded_channel();
         let (send, recv) = watch::channel(None);
         let share_handler = Arc::new(Sharehandler::new(

@@ -5,7 +5,7 @@ use sqlx::postgres::{PgPoolOptions, PgPool};
 use sqlx::Row;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use log::{debug, warn};
+use log::{debug, warn, info};
 
 #[derive(Debug)]
 pub struct Db {
@@ -20,6 +20,16 @@ pub struct Block {
     pub amount: i64,
     pub confirmations: i64,
     pub accepted: i64,
+    #[allow(dead_code)]
+    pub processed: i64,
+    #[allow(dead_code)]
+    pub pool_wallet: String,
+    #[allow(dead_code)]
+    pub job_id: String,
+    #[allow(dead_code)]
+    pub extranonce: String,
+    #[allow(dead_code)]
+    pub nonce: String,
     pub timestamp: Option<i64>,
 }
 
@@ -477,7 +487,7 @@ impl Db {
             .expect("Time went backwards")
             .as_secs() as i64;
 
-        debug!("Adding block details: reward_block_hash={}, miner_id={}, job_id={}, daa_score={}, amount={}", 
+        info!("Adding block details: reward_block_hash={}, miner_id={}, job_id={}, daa_score={}, amount={}", 
                reward_block_hash, miner_id, job_id, daa_score, amount);
 
         let result = sqlx::query(
@@ -527,8 +537,8 @@ impl Db {
         let start_time = SystemTime::now();
         let result = sqlx::query_as::<_, Block>(
             r#"
-            SELECT reward_block_hash, miner_id, daa_score, pool_wallet, amount, confirmations, processed, accepted,
-                   job_id, extranonce, nonce, timestamp
+            SELECT reward_block_hash, miner_id, daa_score, amount, confirmations, processed, accepted,
+                   pool_wallet, job_id, extranonce, nonce, timestamp
             FROM blocks WHERE processed = 0
             "#,
         )
@@ -554,8 +564,8 @@ impl Db {
         let start_time = SystemTime::now();
         let result = sqlx::query_as::<_, Block>(
             r#"
-            SELECT reward_block_hash, miner_id, daa_score, pool_wallet, amount, confirmations, processed, accepted,
-                   job_id, extranonce, nonce, timestamp
+            SELECT reward_block_hash, miner_id, daa_score, amount, confirmations, processed, accepted,
+                   pool_wallet, job_id, extranonce, nonce, timestamp
             FROM blocks WHERE confirmations >= 100 AND accepted = 1 AND processed = 0
             "#,
         )

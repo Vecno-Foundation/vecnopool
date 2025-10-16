@@ -117,6 +117,12 @@ pub async fn process_rewards(db: Arc<Db>, window_time_ms: u64) -> Result<()> {
         .expect("Time went backwards")
         .as_secs() as i64;
 
+    let pool_fee = std::env::var("POOL_FEE_PERCENT")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|f| f / 100.0)
+        .unwrap_or(0.0);        
+
     let blocks = match db.get_blocks_for_rewards().await {
         Ok(blocks) => {
             debug!("Fetched {} blocks for reward processing", blocks.len());
@@ -161,12 +167,13 @@ pub async fn process_rewards(db: Arc<Db>, window_time_ms: u64) -> Result<()> {
             continue;
         }
 
-        let amount = block.amount as u64;
+        let full_amount = block.amount as u64;
+        let net_amount = ((full_amount as f64) * (1.0 - pool_fee)) as u64;
 
         for (address, miner_difficulty) in share_counts.iter() {
             let base_address = address.split('.').next().unwrap_or(address);
             let share_percentage = *miner_difficulty as f64 / total_difficulty as f64;
-            let miner_reward = ((amount as f64) * share_percentage) as u64;
+            let miner_reward = ((net_amount as f64) * share_percentage) as u64;
             info!("Distributing reward for block {}: address={}, reward={} veni, share_percentage={:.2}%", 
                   block.reward_block_hash, base_address, miner_reward, share_percentage * 100.0);
 

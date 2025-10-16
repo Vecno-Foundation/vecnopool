@@ -35,6 +35,7 @@ async fn main() -> Result<()> {
     debug!("SQL_URI: {}", env::var("SQL_URI").unwrap_or_default());
     debug!("WINDOW_TIME_MS: {}", env::var("WINDOW_TIME_MS").unwrap_or_default());
     debug!("DEBUG: {}", env::var("DEBUG").unwrap_or_default());
+    debug!("POOL_SCRIPT_PUBLIC_KEY: {}", env::var("POOL_SCRIPT_PUBLIC_KEY").unwrap_or_default());
 
     let window_time_ms: u64 = env::var("WINDOW_TIME_MS")
         .map(|val| {
@@ -55,6 +56,7 @@ async fn main() -> Result<()> {
     let stratum_addr = env::var("STRATUM_ADDR").unwrap_or("localhost:6969".to_string());
     let extra_data = env::var("EXTRA_DATA").unwrap_or("Vecno Mining Pool".to_string());
     let pool_address = env::var("MINING_ADDR").context("MINING_ADDR must be set in .env")?;
+    let pool_script_public_key = env::var("POOL_SCRIPT_PUBLIC_KEY").context("POOL_SCRIPT_PUBLIC_KEY must be set in .env")?;
     let debug = env::var("DEBUG")
         .map(|v| {
             debug!("DEBUG env var: {}", v);
@@ -81,9 +83,15 @@ async fn main() -> Result<()> {
     let (handle, recv_cmd) = VecnodHandle::new();
     debug!("Initializing database");
 
-    let stratum = Stratum::new(&stratum_addr, handle.clone(), &pool_address, pool_fee, window_time_ms)
-        .await
-        .context("Failed to initialize Stratum")?;
+    let stratum = Stratum::new(
+        &stratum_addr,
+        handle.clone(),
+        &pool_address,
+        pool_fee,
+        window_time_ms,
+    )
+    .await
+    .context("Failed to initialize Stratum")?;
     debug!("Stratum server initialized at {}", stratum_addr);
 
     // Create a watch channel for sharing the latest DAA score
@@ -119,6 +127,7 @@ async fn main() -> Result<()> {
     tokio::spawn({
         let db = stratum.share_handler.db.clone();
         let daa_score_rx = daa_score_rx.clone();
+        let window_time_ms = window_time_ms;
         async move {
             let mut confirmations_interval = time::interval(Duration::from_secs(60));
             confirmations_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -136,7 +145,15 @@ async fn main() -> Result<()> {
     });
 
     debug!("Creating Vecnod client");
-    let (client, mut msgs) = Client::new(&rpc_url, &pool_address, &extra_data, handle.clone(), recv_cmd);
+    let (client, mut msgs) = Client::new(
+        &rpc_url,
+        &pool_address,
+        &extra_data,
+        handle.clone(),
+        recv_cmd,
+        stratum.share_handler.db.clone(),
+        pool_script_public_key.clone(),
+    );
     debug!("Vecnod client created with RPC_URL: {}", rpc_url);
 
     // Request initial DAA score

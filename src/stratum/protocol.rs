@@ -142,7 +142,7 @@ async fn validate_and_submit_share(
     }
 
     debug!("Submitting share to jobs: job_id={}, nonce={:016x}, block_hash={}", job_id, nonce, block_hash);
-    if jobs.submit(i.clone(), job_id, nonce, address.clone(), extranonce.clone(), pending_send.clone()).await {
+    if jobs.submit(i.clone(), job_id, nonce, address.clone(), pending_send.clone()).await {
         info!("Share accepted: job_id={} for worker={}", job_id, address);
         if let Err(e) = share_handler.record_share(&contribution, difficulty, is_valid, is_duplicate).await {
             info!("Failed to record share for worker={}: {:?}", address, e);

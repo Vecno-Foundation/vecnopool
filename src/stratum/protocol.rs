@@ -35,7 +35,6 @@ pub struct StratumConn<'a> {
     pub share_handler: Arc<Sharehandler>,
     pub last_template: Arc<RwLock<Option<RpcBlock>>>,
     pub extranonce: String,
-    pub pool_address: String,
     pub duplicate_share_count: Arc<AtomicU64>,
 }
 
@@ -51,7 +50,6 @@ async fn validate_and_submit_share(
     pending_send: &mpsc::UnboundedSender<PendingResult>,
     extranonce: String,
     difficulty: u64,
-    _pool_address: &str,
     duplicate_share_count: &Arc<AtomicU64>,
 ) -> Result<()> {
     let block_hash = {
@@ -402,7 +400,6 @@ impl<'a> StratumConn<'a> {
                                     &self.pending_send,
                                     self.extranonce.clone(),
                                     self.difficulty,
-                                    &self.pool_address,
                                     &self.duplicate_share_count,
                                 ).await {
                                     warn!("Share validation failed for worker={}: {:?}", self.payout_addr.as_ref().unwrap_or(&String::new()), e);

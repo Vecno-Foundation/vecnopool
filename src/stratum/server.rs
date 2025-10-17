@@ -24,7 +24,6 @@ impl Stratum {
     pub async fn new(
         addr: &str,
         handle: VecnodHandle,
-        pool_address: &str,
         pool_fee: f64,
         window_time_ms: u64,
     ) -> Result<Self> {
@@ -47,7 +46,6 @@ impl Stratum {
         let share_handler_clone = share_handler.clone();
         let last_template_clone = last_template.clone();
         let pending_clone = pending.clone();
-        let pool_address_clone = pool_address.to_string();
 
         tokio::spawn(async move {
             loop {
@@ -71,7 +69,6 @@ impl Stratum {
                         let last_template = last_template_clone.clone();
                         let pending_send = pending_clone.clone();
                         let (pending_send_inner, pending_recv) = mpsc::unbounded_channel();
-                        let pool_address = pool_address_clone.clone();
                         let recv_clone = recv.clone();
                         tokio::spawn(async move {
                             let (reader, writer) = stream.split();
@@ -91,7 +88,6 @@ impl Stratum {
                                 share_handler,
                                 last_template,
                                 extranonce: String::new(),
-                                pool_address,
                                 duplicate_share_count: Arc::new(AtomicU64::new(0)),
                             };
                             debug!(

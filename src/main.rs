@@ -85,7 +85,6 @@ async fn main() -> Result<()> {
     let stratum = Stratum::new(
         &stratum_addr,
         handle.clone(),
-        &pool_address,
         pool_fee,
         window_time_ms,
     )

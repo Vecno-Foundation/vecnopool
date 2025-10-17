@@ -1,7 +1,5 @@
 //src/vecnod.rs
 
-// src/vecnod.rs
-
 use anyhow::Result;
 use log::{debug, warn, info};
 use proto::vecnod_message::Payload as RequestPayload;
@@ -203,6 +201,11 @@ impl ClientTask {
                                     })
                                     .map(|output| output.amount)
                                     .sum::<u64>();
+                                let is_chain_block = block
+                                    .verbose_data
+                                    .as_ref()
+                                    .map(|vd| vd.is_chain_block)
+                                    .unwrap_or(false);
 
                                 if let Err(e) = self.db.add_block_details(
                                     &reward_block_hash,
@@ -213,10 +216,12 @@ impl ClientTask {
                                     daa_score,
                                     &pool_wallet,
                                     amount,
+                                    is_chain_block,
                                 ).await {
                                     warn!("Failed to add block details to database: {:?}", e);
                                 } else {
-                                    info!("Successfully added block details to database: hash = {}, daaScore = {}, amount = {}", reward_block_hash, daa_score, amount);
+                                    info!("Successfully added block details to database: hash = {}, daaScore = {}, amount = {}, is_chain_block = {}", 
+                                         reward_block_hash, daa_score, amount, is_chain_block);
                                 }
                             }
                         } else {
@@ -325,7 +330,6 @@ impl Client {
     }
 }
 
-// The proto module remains unchanged, so it's included as is
 pub mod proto {
     use crate::pow;
     use crate::uint::U256;

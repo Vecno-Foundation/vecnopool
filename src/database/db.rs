@@ -29,6 +29,7 @@ pub struct Block {
     #[allow(dead_code)]
     pub nonce: String,
     pub timestamp: Option<i64>,
+    pub is_chain_block: bool,
 }
 
 impl Db {
@@ -155,7 +156,8 @@ impl Db {
                 job_id TEXT NOT NULL,
                 extranonce TEXT NOT NULL,
                 nonce TEXT NOT NULL,
-                timestamp BIGINT
+                timestamp BIGINT,
+                is_chain_block BOOLEAN NOT NULL DEFAULT FALSE
             )
             "#,
         )
@@ -208,7 +210,7 @@ impl Db {
         .context("Failed to verify blocks table schema")?;
         let expected_columns = vec![
             "reward_block_hash", "daa_score", "pool_wallet", "amount",
-            "confirmations", "processed", "job_id", "extranonce", "nonce", "timestamp"
+            "confirmations", "processed", "job_id", "extranonce", "nonce", "timestamp", "is_chain_block"
         ];
         for column in expected_columns {
             if !block_columns.iter().any(|(name,)| name == column) {
@@ -457,6 +459,7 @@ impl Db {
         daa_score: u64,
         pool_wallet: &str,
         amount: u64,
+        is_chain_block: bool,
     ) -> Result<()> {
         let start_time = SystemTime::now();
         let timestamp = SystemTime::now()
@@ -464,15 +467,15 @@ impl Db {
             .expect("Time went backwards")
             .as_secs() as i64;
 
-        debug!("Adding block details: reward_block_hash={}, job_id={}, daa_score={}, amount={}", 
-               reward_block_hash, job_id, daa_score, amount);
+        debug!("Adding block details: reward_block_hash={}, job_id={}, daa_score={}, amount={}, is_chain_block={}", 
+               reward_block_hash, job_id, daa_score, amount, is_chain_block);
 
         let result = sqlx::query(
             r#"
             INSERT INTO blocks (
                 reward_block_hash, daa_score, pool_wallet, amount, confirmations, processed,
-                job_id, extranonce, nonce, timestamp
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                job_id, extranonce, nonce, timestamp, is_chain_block
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             ON CONFLICT (reward_block_hash) DO UPDATE SET
                 daa_score = EXCLUDED.daa_score,
                 pool_wallet = EXCLUDED.pool_wallet,
@@ -480,7 +483,8 @@ impl Db {
                 job_id = EXCLUDED.job_id,
                 extranonce = EXCLUDED.extranonce,
                 nonce = EXCLUDED.nonce,
-                timestamp = EXCLUDED.timestamp
+                timestamp = EXCLUDED.timestamp,
+                is_chain_block = EXCLUDED.is_chain_block
             "#,
         )
         .bind(reward_block_hash)
@@ -493,6 +497,7 @@ impl Db {
         .bind(extranonce)
         .bind(nonce)
         .bind(timestamp)
+        .bind(is_chain_block)
         .execute(&self.pool)
         .await
         .context("Failed to add block details");
@@ -515,7 +520,7 @@ impl Db {
         let result = sqlx::query_as::<_, Block>(
             r#"
             SELECT reward_block_hash, daa_score, amount, confirmations, processed,
-                   pool_wallet, job_id, extranonce, nonce, timestamp
+                   pool_wallet, job_id, extranonce, nonce, timestamp, is_chain_block
             FROM blocks WHERE processed = 0
             "#,
         )
@@ -542,7 +547,7 @@ impl Db {
         let result = sqlx::query_as::<_, Block>(
             r#"
             SELECT reward_block_hash, daa_score, amount, confirmations, processed,
-                   pool_wallet, job_id, extranonce, nonce, timestamp
+                   pool_wallet, job_id, extranonce, nonce, timestamp, is_chain_block
             FROM blocks WHERE confirmations >= 101 AND processed = 0
             "#,
         )

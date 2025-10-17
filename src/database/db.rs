@@ -5,14 +5,19 @@ use sqlx::postgres::{PgPoolOptions, PgPool};
 use sqlx::Row;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
-use log::{debug, warn};
+use log::{debug, warn, info};
+use crate::vecnod::VecnodHandle;
+use crate::vecnod::proto::vecnod_message::Payload;
+use crate::vecnod::proto::GetBlockRequestMessage;
+use tokio::sync::oneshot;
+use tokio::time::Duration;
 
 #[derive(Debug)]
 pub struct Db {
     pub pool: PgPool,
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Block {
     pub reward_block_hash: String,
     pub daa_score: i64,
@@ -467,8 +472,10 @@ impl Db {
             .expect("Time went backwards")
             .as_secs() as i64;
 
-        debug!("Adding block details: reward_block_hash={}, job_id={}, daa_score={}, amount={}, is_chain_block={}", 
-               reward_block_hash, job_id, daa_score, amount, is_chain_block);
+        debug!(
+            "Adding block details: reward_block_hash={}, job_id={}, daa_score={}, amount={}, is_chain_block={}",
+            reward_block_hash, job_id, daa_score, amount, is_chain_block
+        );
 
         let result = sqlx::query(
             r#"
@@ -491,7 +498,7 @@ impl Db {
         .bind(daa_score as i64)
         .bind(pool_wallet)
         .bind(amount as i64)
-        .bind(0 as i64) 
+        .bind(0 as i64)
         .bind(0 as i64)
         .bind(job_id.to_string())
         .bind(extranonce)
@@ -504,15 +511,156 @@ impl Db {
 
         let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
         if elapsed > 1.0 {
-            warn!("add_block_details query took {} seconds for reward_block_hash={}", elapsed, reward_block_hash);
+            warn!(
+                "add_block_details query took {} seconds for reward_block_hash={}",
+                elapsed, reward_block_hash
+            );
         } else {
-            debug!("add_block_details query took {} seconds for reward_block_hash={}", elapsed, reward_block_hash);
+            debug!(
+                "add_block_details query took {} seconds for reward_block_hash={}",
+                elapsed, reward_block_hash
+            );
         }
 
         match result {
             Ok(_) => Ok(()),
             Err(e) => Err(e)
         }
+    }
+
+    pub async fn update_block_chain_status(&self, reward_block_hash: &str, vecnod_handle: &VecnodHandle) -> Result<bool> {
+        let start_time = SystemTime::now();
+        debug!("Checking chain status for block: reward_block_hash={}", reward_block_hash);
+
+        // Check if block exists and its is_chain_block and processed status
+        let status: Option<(bool, i64)> = sqlx::query_as(
+            "SELECT is_chain_block, processed FROM blocks WHERE reward_block_hash = $1"
+        )
+        .bind(reward_block_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .context("Failed to check block status")?;
+
+        match status {
+            Some((true, _)) => {
+                debug!("Block {} is already marked as chain block, skipping update", reward_block_hash);
+                return Ok(true);
+            }
+            Some((_, 1)) => {
+                info!("Block {} is already processed, skipping chain status check", reward_block_hash);
+                return Ok(false);
+            }
+            _ => {
+                // Either block doesn't exist or is_chain_block = false and processed = 0
+                debug!("Block {} requires chain status check", reward_block_hash);
+            }
+        }
+
+        // Create a one-shot channel to receive the response
+        let (tx, rx) = oneshot::channel();
+
+        // Store the sender in the block_status_senders map
+        {
+            let mut senders = vecnod_handle.block_status_senders.lock().await;
+            senders.insert(reward_block_hash.to_string(), tx);
+        }
+
+        // Send GetBlockRequest
+        vecnod_handle.send_cmd(Payload::GetBlockRequest(GetBlockRequestMessage {
+            hash: reward_block_hash.to_string(),
+            include_transactions: false,
+        }));
+
+        // Wait for the response with a timeout
+        let is_chain_block = tokio::time::timeout(Duration::from_secs(30), async {
+            rx.await.map_err(|e| anyhow::anyhow!("Failed to receive block status: {}", e))
+        })
+        .await
+        .context("Timeout waiting for block status response")?
+        .context("Error receiving block status")?;
+
+        // Clean up the sender from the map
+        {
+            let mut senders = vecnod_handle.block_status_senders.lock().await;
+            senders.remove(reward_block_hash);
+        }
+
+        if is_chain_block {
+            // Update the database with is_chain_block = true
+            let result = sqlx::query(
+                r#"
+                UPDATE blocks
+                SET is_chain_block = $1
+                WHERE reward_block_hash = $2
+                "#,
+            )
+            .bind(is_chain_block)
+            .bind(reward_block_hash)
+            .execute(&self.pool)
+            .await
+            .context("Failed to update is_chain_block status");
+
+            match result {
+                Ok(res) => {
+                    if res.rows_affected() > 0 {
+                        info!(
+                            "Updated is_chain_block to {} for block= {}",
+                            is_chain_block, reward_block_hash
+                        );
+                    } else {
+                        debug!(
+                            "No block found to update for block= {}",
+                            reward_block_hash
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to update block status for {}: {:?}", reward_block_hash, e);
+                    return Err(e);
+                }
+            }
+        } else {
+            // Delete the block if is_chain_block = false
+            let result = sqlx::query(
+                r#"
+                DELETE FROM blocks
+                WHERE reward_block_hash = $1
+                "#,
+            )
+            .bind(reward_block_hash)
+            .execute(&self.pool)
+            .await
+            .context("Failed to delete non-chain block");
+
+            match result {
+                Ok(res) => {
+                    if res.rows_affected() > 0 {
+                        info!("Deleted non-chain block: reward_block_hash= {}", reward_block_hash);
+                    } else {
+                        debug!("No block found to delete for reward_block_hash= {}", reward_block_hash);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to delete block {}: {:?}", reward_block_hash, e);
+                    return Err(e);
+                }
+            }
+        }
+
+        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
+        if elapsed > 1.0 {
+            warn!(
+                "update_block_chain_status query took {} seconds for reward_block_hash={}",
+                elapsed, reward_block_hash
+            );
+        } else {
+            debug!(
+                "update_block_chain_status query took {} seconds for reward_block_hash={}",
+                elapsed, reward_block_hash
+            );
+        }
+
+        Ok(is_chain_block)
     }
 
     pub async fn get_unconfirmed_blocks(&self) -> Result<Vec<Block>> {
@@ -561,7 +709,10 @@ impl Db {
         match result {
             Ok(rows) => {
                 for block in &rows {
-                    debug!("Block for rewards: reward_block_hash={}", block.reward_block_hash);
+                    debug!(
+                        "Block for rewards: reward_block_hash={}, is_chain_block={}",
+                        block.reward_block_hash, block.is_chain_block
+                    );
                 }
                 Ok(rows)
             }
@@ -619,13 +770,19 @@ impl Db {
         .context("Failed to clean up old shares");
 
         let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
-        debug!("cleanup_old_shares query took {} seconds for cutoff_time={}", elapsed, cutoff_time);
+        debug!(
+            "cleanup_old_shares query took {} seconds for cutoff_time={}",
+            elapsed, cutoff_time
+        );
 
         match result {
             Ok(res) => {
                 let rows_affected = res.rows_affected();
                 if rows_affected > 0 {
-                    debug!("Cleaned up {} old shares older than {} seconds", rows_affected, retention_period_secs);
+                    debug!(
+                        "Cleaned up {} old shares older than {} seconds",
+                        rows_affected, retention_period_secs
+                    );
                 }
                 Ok(())
             }

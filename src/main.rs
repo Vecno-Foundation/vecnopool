@@ -35,7 +35,6 @@ async fn main() -> Result<()> {
     debug!("SQL_URI: {}", env::var("SQL_URI").unwrap_or_default());
     debug!("WINDOW_TIME_MS: {}", env::var("WINDOW_TIME_MS").unwrap_or_default());
     debug!("DEBUG: {}", env::var("DEBUG").unwrap_or_default());
-    debug!("POOL_SCRIPT_PUBLIC_KEY: {}", env::var("POOL_SCRIPT_PUBLIC_KEY").unwrap_or_default());
 
     let window_time_ms: u64 = env::var("WINDOW_TIME_MS")
         .map(|val| {
@@ -47,10 +46,16 @@ async fn main() -> Result<()> {
 
     // Validate window_time_ms
     if window_time_ms < 30000 {
-        return Err(anyhow::anyhow!("WINDOW_TIME_MS must be at least 30000 milliseconds"));
+        return Err(anyhow::anyhow!(
+            "WINDOW_TIME_MS must be at least 30000 milliseconds"
+        ));
     }
 
-    debug!("Loaded WINDOW_TIME_MS: {}ms ({}s)", window_time_ms, window_time_ms / 1000);
+    debug!(
+        "Loaded WINDOW_TIME_MS: {}ms ({}s)",
+        window_time_ms,
+        window_time_ms / 1000
+    );
 
     let rpc_url = env::var("RPC_URL").context("RPC_URL must be set in .env")?;
     let stratum_addr = env::var("STRATUM_ADDR").unwrap_or("localhost:6969".to_string());
@@ -76,20 +81,18 @@ async fn main() -> Result<()> {
     env_logger::Builder::new()
         .filter_level(if debug { LevelFilter::Debug } else { LevelFilter::Info })
         .init();
-    debug!("Logger initialized with level: {}", if debug { "Debug" } else { "Info" });
+    debug!(
+        "Logger initialized with level: {}",
+        if debug { "Debug" } else { "Info" }
+    );
 
     debug!("Creating VecnodHandle");
     let (handle, recv_cmd) = VecnodHandle::new();
     debug!("Initializing database");
 
-    let stratum = Stratum::new(
-        &stratum_addr,
-        handle.clone(),
-        pool_fee,
-        window_time_ms,
-    )
-    .await
-    .context("Failed to initialize Stratum")?;
+    let stratum = Stratum::new(&stratum_addr, handle.clone(), pool_fee, window_time_ms)
+        .await
+        .context("Failed to initialize Stratum")?;
     debug!("Stratum server initialized at {}", stratum_addr);
 
     // Create a watch channel for sharing the latest DAA score
@@ -126,6 +129,7 @@ async fn main() -> Result<()> {
         let db = stratum.share_handler.db.clone();
         let daa_score_rx = daa_score_rx.clone();
         let window_time_ms = window_time_ms;
+        let handle = handle.clone();
         async move {
             let mut confirmations_interval = time::interval(Duration::from_secs(60));
             confirmations_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
@@ -133,7 +137,16 @@ async fn main() -> Result<()> {
                 debug!("Confirmation task loop iteration");
                 confirmations_interval.tick().await;
                 debug!("Triggering check_confirmations");
-                if let Err(e) = check_confirmations(db.clone(), daa_score_rx.clone(), window_time_ms).await {
+
+                // Pass VecnodHandle to check_confirmations
+                if let Err(e) = check_confirmations(
+                    db.clone(),
+                    daa_score_rx.clone(),
+                    window_time_ms,
+                    handle.clone(),
+                )
+                .await
+                {
                     warn!("Failed to check confirmations: {:?}", e);
                 } else {
                     debug!("check_confirmations completed successfully");
@@ -182,7 +195,9 @@ async fn main() -> Result<()> {
                 if let Some(ref e) = error {
                     debug!("Submitted invalid block: {}", e);
                 }
-                stratum.resolve_pending_job(error.map(|e| anyhow::anyhow!(e.to_string()))).await;
+                stratum
+                    .resolve_pending_job(error.map(|e| anyhow::anyhow!(e.to_string())))
+                    .await;
             }
             Message::BlockDagInfo { virtual_daa_score } => {
                 debug!("Received BlockDagInfo: virtual_daa_score={}", virtual_daa_score);
@@ -197,6 +212,10 @@ async fn main() -> Result<()> {
                 }
                 // Request updated DAA score
                 handle.send_cmd(Payload::get_block_dag_info());
+            }
+            Message::BlockStatus { .. } => {
+                // Ignore BlockStatus messages in the main loop as they are handled internally
+                debug!("Received BlockStatus message, ignoring in main loop");
             }
         }
     }

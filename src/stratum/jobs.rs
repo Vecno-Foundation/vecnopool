@@ -172,7 +172,7 @@ impl Jobs {
             async move { handle.submit_block(block); }
         });
 
-        info!(target: "stratum::jobs", "Submission processed in {:?}", start.elapsed());
+        debug!(target: "stratum::jobs", "Submission processed in {:?}", start.elapsed());
         true
     }
 

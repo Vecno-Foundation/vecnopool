@@ -16,6 +16,8 @@ use http::Uri;
 use std::convert::TryFrom;
 use std::sync::Arc;
 use crate::database::db::Db;
+use tokio::sync::oneshot;
+use std::collections::HashMap;
 
 pub type Send<T> = mpsc::UnboundedSender<T>;
 type Recv<T> = mpsc::UnboundedReceiver<T>;
@@ -23,12 +25,20 @@ type Recv<T> = mpsc::UnboundedReceiver<T>;
 #[derive(Clone, Debug)]
 pub struct VecnodHandle {
     pub send: Send<RequestPayload>,
+    pub block_status_senders: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
 }
 
 impl VecnodHandle {
     pub fn new() -> (Self, Recv<RequestPayload>) {
         let (send, recv) = mpsc::unbounded_channel();
-        (VecnodHandle { send }, recv)
+        let block_status_senders = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        (
+            VecnodHandle {
+                send,
+                block_status_senders,
+            },
+            recv,
+        )
     }
 
     pub fn submit_block(&self, block: RpcBlock) {
@@ -51,6 +61,7 @@ pub enum Message {
     NewTemplate,
     SubmitBlockResult(Option<Box<str>>),
     NewBlock,
+    BlockStatus,
 }
 
 struct ClientTask {
@@ -59,6 +70,7 @@ struct ClientTask {
     recv_cmd: Recv<RequestPayload>,
     db: Arc<Db>,
     pool_address: String,
+    block_status_senders: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
 }
 
 impl ClientTask {
@@ -129,7 +141,11 @@ impl ClientTask {
                 Some(ResponsePayload::BlockAddedNotification(block_added)) => {
                     if let Some(block) = block_added.block {
                         // Process all transactions with no inputs (coinbase transactions)
-                        let coinbase_txs: Vec<_> = block.transactions.iter().filter(|tx| tx.inputs.is_empty()).collect();
+                        let coinbase_txs: Vec<_> = block
+                            .transactions
+                            .iter()
+                            .filter(|tx| tx.inputs.is_empty())
+                            .collect();
                         let matches_pool_address = coinbase_txs.iter().any(|tx| {
                             tx.outputs.iter().any(|output| {
                                 output
@@ -150,7 +166,9 @@ impl ClientTask {
                             if coinbase_txs.len() > 1 {
                                 let tx_ids: Vec<_> = coinbase_txs
                                     .iter()
-                                    .filter_map(|tx| tx.verbose_data.as_ref().map(|vd| vd.transaction_id.clone()))
+                                    .filter_map(|tx| {
+                                        tx.verbose_data.as_ref().map(|vd| vd.transaction_id.clone())
+                                    })
                                     .collect();
                                 let amounts: Vec<_> = coinbase_txs
                                     .iter()
@@ -161,7 +179,9 @@ impl ClientTask {
                                                 output
                                                     .verbose_data
                                                     .as_ref()
-                                                    .map(|vd| vd.script_public_key_address == self.pool_address)
+                                                    .map(|vd| {
+                                                        vd.script_public_key_address == self.pool_address
+                                                    })
                                                     .unwrap_or(false)
                                             })
                                             .map(|output| output.amount)
@@ -195,7 +215,9 @@ impl ClientTask {
                                             output
                                                 .verbose_data
                                                 .as_ref()
-                                                .map(|vd| vd.script_public_key_address == self.pool_address)
+                                                .map(|vd| {
+                                                    vd.script_public_key_address == self.pool_address
+                                                })
                                                 .unwrap_or(false)
                                         })
                                     })
@@ -207,21 +229,27 @@ impl ClientTask {
                                     .map(|vd| vd.is_chain_block)
                                     .unwrap_or(false);
 
-                                if let Err(e) = self.db.add_block_details(
-                                    &reward_block_hash,
-                                    &reward_block_hash,
-                                    job_id,
-                                    extranonce,
-                                    &nonce,
-                                    daa_score,
-                                    &pool_wallet,
-                                    amount,
-                                    is_chain_block,
-                                ).await {
+                                if let Err(e) = self
+                                    .db
+                                    .add_block_details(
+                                        &reward_block_hash,
+                                        &reward_block_hash,
+                                        job_id,
+                                        extranonce,
+                                        &nonce,
+                                        daa_score,
+                                        &pool_wallet,
+                                        amount,
+                                        is_chain_block,
+                                    )
+                                    .await
+                                {
                                     warn!("Failed to add block details to database: {:?}", e);
                                 } else {
-                                    info!("Successfully added block details to database: hash = {}, daaScore = {}, amount = {}, is_chain_block = {}", 
-                                         reward_block_hash, daa_score, amount, is_chain_block);
+                                    info!(
+                                        "Successfully added block details to database: hash = {}, daaScore = {}, amount = {}",
+                                        reward_block_hash, daa_score, amount
+                                    );
                                 }
                             }
                         } else {
@@ -229,6 +257,42 @@ impl ClientTask {
                         }
                     }
                     Message::NewBlock
+                },
+                Some(ResponsePayload::GetBlockResponse(res)) => {
+                    let block_hash = res
+                        .block
+                        .as_ref()
+                        .and_then(|b| b.verbose_data.as_ref().map(|vd| vd.hash.clone()))
+                        .unwrap_or_default();
+                    let is_chain_block = res
+                        .block
+                        .as_ref()
+                        .and_then(|b| b.verbose_data.as_ref().map(|vd| vd.is_chain_block))
+                        .unwrap_or(false);
+
+                    // Retrieve and remove the responder from the map
+                    let mut senders = self.block_status_senders.lock().await;
+                    if let Some(sender) = senders.remove(&block_hash) {
+                        if let Err(e) = sender.send(is_chain_block) {
+                            warn!("Failed to send block status for {}: {:?}", block_hash, e);
+                        } else {
+                            debug!("Sent block status for {}: is_chain_block={}", block_hash, is_chain_block);
+                        }
+                    } else {
+                        debug!("No responder found for block status request: {}", block_hash);
+                    }
+
+                    if let Some(error) = res.error {
+                        warn!("Error in GetBlockResponse for {}: {}", block_hash, error.message);
+                        // Notify any waiting responder with a default value
+                        if !block_hash.is_empty() {
+                            if let Some(sender) = senders.remove(&block_hash) {
+                                let _ = sender.send(false);
+                            }
+                        }
+                    }
+
+                    Message::BlockStatus
                 },
                 Some(payload) => {
                     warn!("Received unhandled response type: {:?}", payload);
@@ -277,12 +341,14 @@ impl Client {
         } else {
             url.into()
         };
+        let block_status_senders = handle.block_status_senders.clone();
         let task = ClientTask {
             url,
             send_msg,
             recv_cmd,
             db,
             pool_address,
+            block_status_senders,
         };
 
         tokio::spawn(async move {
@@ -293,7 +359,9 @@ impl Client {
         });
 
         let send_cmd = handle.send.clone();
-        send_cmd.send(RequestPayload::GetInfoRequest(GetInfoRequestMessage {})).unwrap();
+        send_cmd
+            .send(RequestPayload::GetInfoRequest(GetInfoRequestMessage {}))
+            .unwrap();
         send_cmd
             .send(RequestPayload::NotifyNewBlockTemplateRequest(
                 NotifyNewBlockTemplateRequestMessage {

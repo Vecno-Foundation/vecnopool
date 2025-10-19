@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
         let window_time_ms = window_time_ms;
         let handle = handle.clone();
         async move {
-            let mut confirmations_interval = time::interval(Duration::from_secs(60));
+            let mut confirmations_interval = time::interval(Duration::from_secs(150));
             confirmations_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             loop {
                 debug!("Confirmation task loop iteration");

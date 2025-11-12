@@ -1,5 +1,3 @@
-//src/stratum/jobs.rs
-
 use crate::stratum::{Id, Response};
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use crate::uint::U256;
@@ -22,9 +20,7 @@ pub struct Jobs {
 }
 
 impl Jobs {
-    pub fn new(
-        handle: VecnodHandle,
-    ) -> Self {
+    pub fn new(handle: VecnodHandle) -> Self {
         let jobs = Self {
             inner: Arc::new(RwLock::new(JobsInner {
                 next: 0,
@@ -35,17 +31,16 @@ impl Jobs {
             submitted_hashes: Arc::new(DashMap::new()),
             submission_lock: Arc::new(Mutex::new(())),
         };
-        // Start background task for cleaning up submitted_hashes
-        tokio::spawn({
-            let submitted_hashes = Arc::clone(&jobs.submitted_hashes);
-            async move {
+        {
+            let submitted_hashes = jobs.submitted_hashes.clone();
+            tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     let now = Instant::now();
                     submitted_hashes.retain(|_, v| now.duration_since(*v) < Duration::from_secs(60));
                 }
-            }
-        });
+            });
+        }
         jobs
     }
 
@@ -86,7 +81,7 @@ impl Jobs {
         send: mpsc::UnboundedSender<PendingResult>,
     ) -> bool {
         let start = Instant::now();
-        // Acquire lock with timeout
+
         let _lock = match tokio::time::timeout(Duration::from_millis(100), self.submission_lock.lock()).await {
             Ok(lock) => lock,
             Err(_) => {
@@ -97,7 +92,6 @@ impl Jobs {
             }
         };
 
-        // Critical section: validate job and check for duplicates
         let (submission_key, block, handle, network_difficulty) = {
             let r = self.inner.read().await;
             let block = match r.jobs.get(job_id as usize) {
@@ -122,9 +116,11 @@ impl Jobs {
                 debug!(target: "stratum::jobs", "No header found for job_id={}", job_id);
                 return false;
             };
+
             let nonce_hex = format!("{:016x}", nonce);
             let submission_key = format!("{}:{}", reward_block_hash, nonce_hex);
             let now = Instant::now();
+
             if let Some(entry) = self.submitted_hashes.get(&submission_key) {
                 if now.duration_since(*entry.value()) < Duration::from_secs(10) {
                     warn!(target: "stratum::jobs",
@@ -137,10 +133,10 @@ impl Jobs {
                 }
             }
             self.submitted_hashes.insert(submission_key.clone(), now);
+
             (submission_key, block, r.handle.clone(), difficulty)
         };
 
-        // Perform slow operations outside the lock
         if let Some(header) = &block.header {
             let block_difficulty = header.difficulty();
             if block_difficulty < network_difficulty {
@@ -165,12 +161,11 @@ impl Jobs {
             job_id, format!("{:016x}", nonce), miner_address, network_difficulty
         );
 
-        // Submit block asynchronously
-        tokio::spawn({
+        {
             let handle = handle.clone();
             let block = block.clone();
-            async move { handle.submit_block(block); }
-        });
+            tokio::spawn(async move { handle.submit_block(block); });
+        }
 
         debug!(target: "stratum::jobs", "Submission processed in {:?}", start.elapsed());
         true
@@ -242,21 +237,33 @@ pub struct Pending {
 
 impl Pending {
     pub fn resolve(self, error: Option<Box<str>>) {
-        let result = PendingResult { id: self.id, error };
+        let result = PendingResult {
+            id: self.id,
+            error,
+            block_hash: None,
+        };
         let _ = self.send.send(result);
     }
 }
 
+#[derive(Debug)]
 pub struct PendingResult {
     pub id: Id,
     pub error: Option<Box<str>>,
+    pub block_hash: Option<String>,
 }
 
 impl PendingResult {
     pub fn into_response(self) -> Result<Response> {
         match self.error {
             Some(e) => Response::err(self.id, 20, e),
-            None => Response::ok(self.id, true),
+            None => Response::ok(
+                self.id,
+                json!({
+                    "accepted": true,
+                    "block_hash": self.block_hash
+                }),
+            ),
         }
     }
 }

@@ -219,14 +219,6 @@ pub async fn process_rewards(db: Arc<Db>, window_time_ms: u64) -> Result<()> {
             block.reward_block_hash, total_difficulty, share_counts
         );
 
-        if total_difficulty == 0 {
-            warn!(
-                "No valid shares found for block {} in time window {}",
-                block.reward_block_hash, block_timestamp
-            );
-            continue;
-        }
-
         let full_amount = block.amount as u64;
         let net_amount = ((full_amount as f64) * (1.0 - pool_fee)) as u64;
 

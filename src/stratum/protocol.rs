@@ -1,5 +1,3 @@
-//src/stratum/protocol.rs
-
 use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
 use serde::Serialize;
@@ -146,18 +144,18 @@ async fn validate_and_submit_share(
             info!("Failed to record share for worker={}: {:?}", address, e);
         }
 
-        write_response(writer, i, Some(true)).await?;
+        let result = PendingResult {
+            id: i,
+            error: None,
+            block_hash: Some(block_hash),
+        };
+        let _ = pending_send.send(result);
     } else {
         debug!("Unable to submit share: job_id={}, block_hash={}", job_id, block_hash);
         write_error_response(writer, i, 20, "Unable to submit share".into()).await?;
     }
 
     Ok(())
-}
-
-async fn write_response<T: Serialize>(writer: &Arc<Mutex<WriteHalf<'_>>>, id: Id, result: Option<T>) -> Result<()> {
-    let res = Response::ok(id, result)?;
-    write(writer, &res).await
 }
 
 async fn write_error_response(writer: &Arc<Mutex<WriteHalf<'_>>>, id: Id, code: u64, message: Box<str>) -> Result<()> {

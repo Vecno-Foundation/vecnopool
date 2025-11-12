@@ -1,5 +1,3 @@
-//src/stratum/server.rs
-
 use anyhow::Result;
 use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
@@ -28,18 +26,23 @@ impl Stratum {
         window_time_ms: u64,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
-        info!("Listening on {}, pool fee: {}%, window_time_ms: {}ms ({}s)", addr, pool_fee, window_time_ms, window_time_ms / 1000);
+        info!(
+            "Listening on {}, pool fee: {}%, window_time_ms: {}ms ({}s)",
+            addr,
+            pool_fee,
+            window_time_ms,
+            window_time_ms / 1000
+        );
+
         let last_template = Arc::new(tokio::sync::RwLock::new(None));
         let db = Arc::new(Db::new().await?);
         let jobs = Arc::new(Jobs::new(handle));
         let (pending, _) = mpsc::unbounded_channel();
         let (send, recv) = watch::channel(None);
-        let share_handler = Arc::new(Sharehandler::new(
-            db,
-            pool_fee,
-            jobs.clone(),
-            window_time_ms,
-        ).await?);
+        let share_handler = Arc::new(
+            Sharehandler::new(db, pool_fee, jobs.clone(), window_time_ms)
+                .await?,
+        );
         let worker_counter = Arc::new(AtomicU32::new(1));
 
         let jobs_clone = jobs.clone();
@@ -99,6 +102,7 @@ impl Stratum {
                                 let result = PendingResult {
                                     id: conn.id.into(),
                                     error: Some(format!("Connection closed: {}", e).into_boxed_str()),
+                                    block_hash: None,
                                 };
                                 let _ = pending_send.send(result);
                             }

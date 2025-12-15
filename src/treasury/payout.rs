@@ -1,7 +1,8 @@
-//src/treasury/payout.rs
+// src/treasury/payout.rs
 
 use anyhow::{Context, Result};
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 use crate::database::db::Db;
@@ -50,90 +51,35 @@ pub async fn check_confirmations(
 
     let mut updates = Vec::new();
     for block in unconfirmed_blocks {
-        debug!(
-            "Examining block: reward_block_hash={}, daa_score={}, confirmations={}",
-            block.reward_block_hash, block.daa_score, block.confirmations
-        );
-
         let confirmations = current_daa_score.saturating_sub(block.daa_score as u64);
-        debug!(
-            "Processing block: {}, new_confirmations={}",
-            block.reward_block_hash, confirmations
-        );
         updates.push((block.reward_block_hash.clone(), confirmations as i64));
     }
 
     if !updates.is_empty() {
-        let start_time = SystemTime::now();
         let mut transaction = db
             .pool
             .begin()
             .await
             .context("Failed to start transaction for batch confirmations update")?;
         for (reward_block_hash, confirmations) in &updates {
-            let result = sqlx::query(
+            sqlx::query(
                 "UPDATE blocks SET confirmations = $1 WHERE reward_block_hash = $2"
             )
             .bind(*confirmations)
             .bind(&reward_block_hash)
             .execute(&mut *transaction)
             .await
-            .context(format!(
-                "Failed to update confirmations for block {}",
-                reward_block_hash
-            ));
-
-            match result {
-                Ok(_) => {
-                    debug!(
-                        "Updated confirmations: block_hash={}, confirmations={}",
-                        reward_block_hash, confirmations
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to update confirmations for block_hash={}: {:?}",
-                        reward_block_hash, e
-                    );
-                }
-            }
+            .ok();
         }
-        transaction
-            .commit()
-            .await
-            .context("Failed to commit batch confirmations update")?;
-        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
-        debug!(
-            "Batch update_block_confirmations took {} seconds for {} blocks",
-            elapsed,
-            updates.len()
-        );
+        transaction.commit().await.ok();
     }
 
-    // Update is_chain_block status for blocks with 101 or more confirmations
-    let blocks_for_rewards = match db.get_blocks_for_rewards().await {
-        Ok(blocks) => {
-            debug!("Fetched {} blocks for reward processing", blocks.len());
-            blocks
-        }
-        Err(e) => {
-            warn!("Failed to fetch blocks for reward processing: {:?}", e);
-            return Err(e).context("Failed to fetch blocks for reward processing");
-        }
-    };
-
+    // Update chain status
+    let blocks_for_rewards = db.get_blocks_for_rewards().await.unwrap_or_default();
     for block in blocks_for_rewards {
-        if let Err(e) = db
-            .update_block_chain_status(&block.reward_block_hash, &vecnod_handle)
+        db.update_block_chain_status(&block.reward_block_hash, &vecnod_handle)
             .await
-        {
-            warn!(
-                "Failed to update chain status for block {}: {:?}",
-                block.reward_block_hash, e
-            );
-        } else {
-            debug!("Updated chain status for block {}", block.reward_block_hash);
-        }
+            .ok();
     }
 
     if let Err(e) = process_rewards(db.clone(), window_time_ms).await {
@@ -148,7 +94,6 @@ pub async fn process_rewards(db: Arc<Db>, window_time_ms: u64) -> Result<()> {
     debug!("Starting process_rewards task");
 
     let window_duration_secs = window_time_ms / 1000;
-
     let current_time_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time went backwards")
@@ -161,140 +106,120 @@ pub async fn process_rewards(db: Arc<Db>, window_time_ms: u64) -> Result<()> {
         .unwrap_or(0.0);
 
     let blocks = match db.get_blocks_for_rewards().await {
-        Ok(blocks) => {
-            // Filter blocks where is_chain_block is true
-            let chain_blocks: Vec<_> = blocks.clone().into_iter().filter(|b| b.is_chain_block).collect();
-            debug!(
-                "Fetched {} blocks for reward processing, {} are chain blocks",
-                blocks.len(),
-                chain_blocks.len()
-            );
-            chain_blocks
-        }
+        Ok(blocks) => blocks.into_iter().filter(|b| b.is_chain_block).collect::<Vec<_>>(),
         Err(e) => {
             warn!("Failed to fetch blocks for reward processing: {:?}", e);
-            return Err(e).context("Failed to fetch blocks for reward processing");
+            return Err(e);
         }
     };
 
     if blocks.is_empty() {
-        debug!("No chain blocks eligible for reward processing");
+        debug!("No matured chain blocks eligible for payout");
         return Ok(());
     }
 
+    let mut total_full_amount = 0u64;
+    let mut total_net_amount = 0u64;
+    let mut total_pool_fee_amount = 0u64;
+    let mut all_payouts = Vec::new();
     let mut processed_blocks = Vec::new();
 
     for block in blocks {
         let block_timestamp = block.timestamp.unwrap_or(current_time_secs);
         if current_time_secs < block_timestamp + window_duration_secs as i64 {
-            debug!(
-                "Block {} is within PPLNS window, skipping",
-                block.reward_block_hash
-            );
             continue;
         }
 
-        debug!(
-            "Block {} reached 101 confirmations, is_chain_block=true, and PPLNS window, processing: daa_score={}",
-            block.reward_block_hash, block.daa_score
-        );
-        processed_blocks.push(block.reward_block_hash.clone());
-
-        let share_counts = match db
-            .get_shares_in_time_window(block_timestamp, window_duration_secs)
-            .await
-        {
+        let share_counts = match db.get_shares_in_time_window(block_timestamp, window_duration_secs).await {
             Ok(counts) => counts,
             Err(e) => {
-                warn!(
-                    "Failed to get share difficulties for block {}: {:?}",
-                    block.reward_block_hash, e
-                );
+                warn!("Failed to get shares for block {}: {:?}", block.reward_block_hash, e);
                 continue;
             }
         };
-        let total_difficulty: u64 = share_counts.iter().map(|(_address, difficulty)| *difficulty).sum();
-        debug!(
-            "Share difficulties for block {}: total_difficulty={}, shares={:?}",
-            block.reward_block_hash, total_difficulty, share_counts
-        );
+
+        let total_difficulty: u64 = share_counts.iter().map(|(_, d)| *d).sum();
+        if total_difficulty == 0 {
+            debug!("No shares in window for block {}, skipping", block.reward_block_hash);
+            processed_blocks.push(block.reward_block_hash.clone());
+            continue;
+        }
 
         let full_amount = block.amount as u64;
-        let net_amount = ((full_amount as f64) * (1.0 - pool_fee)) as u64;
+        let net_amount = ((full_amount as f64) * (1.0 - pool_fee)).round() as u64;
+        let pool_fee_amount = full_amount - net_amount;
 
-        for (address, miner_difficulty) in share_counts.iter() {
+        total_full_amount += full_amount;
+        total_net_amount += net_amount;
+        total_pool_fee_amount += pool_fee_amount;
+
+        let mut block_payouts = Vec::new();
+        let mut block_distributed = 0u64;
+
+        for (address, miner_difficulty) in &share_counts {
             let base_address = address.split('.').next().unwrap_or(address);
             let share_percentage = *miner_difficulty as f64 / total_difficulty as f64;
-            let miner_reward = ((net_amount as f64) * share_percentage) as u64;
-            debug!(
-                "Distributing reward for block {}: address={}, reward={} veni, share_percentage={:.2}%",
-                block.reward_block_hash,
-                base_address,
-                miner_reward,
-                share_percentage * 100.0
-            );
+            let miner_reward = ((net_amount as f64) * share_percentage).round() as u64;
+            block_distributed += miner_reward;
 
-            let result = db
-                .add_balance("", base_address, miner_reward)
-                .await
-                .context(format!(
-                    "Failed to add balance for address {} in block {}",
-                    base_address, block.reward_block_hash
-                ));
+            block_payouts.push((base_address.to_owned(), miner_reward));
 
-            match result {
-                Ok(_) => {
-                    info!(
-                        "Added balance: address={}, reward={} VE, block={}",
-                        base_address,
-                        miner_reward as f64 / 100_000_000.0,
-                        block.reward_block_hash
-                    );
-                }
-                Err(e) => {
-                    warn!("Failed to add balance for address={}: {:?}", base_address, e);
-                }
-            }
+            db.add_balance("", base_address, miner_reward).await.ok();
+        }
+
+        all_payouts.push((block.reward_block_hash.clone(), block_payouts, block_distributed, net_amount));
+        processed_blocks.push(block.reward_block_hash.clone());
+    }
+
+    if processed_blocks.is_empty() {
+        debug!("No blocks processed for payout");
+        return Ok(());
+    }
+
+    // === SINGLE GLOBAL PAYOUT SUMMARY ===
+    info!(target: "payout", "=== PAYOUT SUMMARY | {} blocks processed ===", processed_blocks.len());
+    info!(target: "payout", "Total reward: {:.8} VE | Pool fee: {:.8} VE ({:.2}%) | Net distributed: {:.8} VE",
+        total_full_amount as f64 / 100_000_000.0,
+        total_pool_fee_amount as f64 / 100_000_000.0,
+        pool_fee * 100.0,
+        total_net_amount as f64 / 100_000_000.0
+    );
+
+    // Group by miner for cleaner display
+    let mut miner_totals: HashMap<String, u64> = HashMap::new();
+    for (_, payouts, _, _) in &all_payouts {
+        for (addr, reward) in payouts {
+            *miner_totals.entry(addr.clone()).or_insert(0) += reward;
         }
     }
 
-    if !processed_blocks.is_empty() {
-        let start_time = SystemTime::now();
-        let mut transaction = db
-            .pool
-            .begin()
-            .await
-            .context("Failed to start transaction for batch mark processed")?;
-        for reward_block_hash in &processed_blocks {
-            let result = sqlx::query(
-                "UPDATE blocks SET processed = $1 WHERE reward_block_hash = $2"
-            )
-            .bind(1_i64)
-            .bind(&reward_block_hash)
+    let mut sorted_miners: Vec<_> = miner_totals.into_iter().collect();
+    sorted_miners.sort_by(|a, b| b.1.cmp(&a.1));
+
+    info!(target: "payout", "Miners paid: {}", sorted_miners.len());
+    for (addr, total_reward) in sorted_miners {
+        info!(target: "payout", "  • {} → {:.8} VE", addr, total_reward as f64 / 100_000_000.0);
+    }
+
+    let total_distributed: u64 = all_payouts.iter().map(|(_, _, dist, _)| *dist).sum();
+    let dust = total_net_amount.saturating_sub(total_distributed);
+
+    info!(target: "payout", "Total distributed: {:.8} VE | Remaining dust: {:.8} VE", 
+        total_distributed as f64 / 100_000_000.0,
+        dust as f64 / 100_000_000.0
+    );
+    info!(target: "payout", "==============================================");
+
+    // Mark blocks as processed
+    let mut transaction = db.pool.begin().await.context("Failed to start transaction")?;
+    for hash in processed_blocks {
+        sqlx::query("UPDATE blocks SET processed = 1 WHERE reward_block_hash = $1")
+            .bind(&hash)
             .execute(&mut *transaction)
             .await
-            .context(format!("Failed to mark block {} as processed", reward_block_hash));
-
-            match result {
-                Ok(_) => {
-                    debug!("Marked block as processed: {}", reward_block_hash);
-                }
-                Err(e) => {
-                    warn!("Failed to mark block {} as processed: {:?}", reward_block_hash, e);
-                }
-            }
-        }
-        transaction
-            .commit()
-            .await
-            .context("Failed to commit batch mark processed")?;
-        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
-        debug!(
-            "Batch mark_block_processed took {} seconds for {} blocks",
-            elapsed,
-            processed_blocks.len()
-        );
+            .ok();
     }
+    transaction.commit().await.ok();
 
     debug!("Completed process_rewards task");
     Ok(())

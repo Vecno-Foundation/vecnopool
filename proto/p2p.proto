@@ -228,7 +228,6 @@ message TrustedHeader {
   GhostdagData ghostdagData = 2;
 }
 
-// TODO: remove once v5 is obsolete
 message BlockGhostdagDataHashPair {
   Hash hash = 1;
   GhostdagData ghostdagData = 2;
@@ -274,6 +273,6 @@ message BlockWithTrustedDataMessage {
 }
 
 message TrustedDataMessage {
-  repeated TrustedHeader daaWindow = 1; // TODO: rename to `trustedSubDag` once v5 is obsolete
-  repeated BlockGhostdagDataHashPair ghostdagData = 2; // TODO: remove once v5 is obsolete
+  repeated TrustedHeader daaWindow = 1;
+  repeated BlockGhostdagDataHashPair ghostdagData = 2;
 }

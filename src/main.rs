@@ -9,23 +9,22 @@ use crate::treasury::payout::check_confirmations;
 use crate::vecnod::{Client, Message, VecnodHandle};
 use crate::stratum::Stratum;
 use crate::vecnod::proto::vecnod_message::Payload;
+use crate::config::DifficultyConfig;
 
 mod vecnod;
 mod pow;
 mod stratum;
 mod treasury;
 mod database;
-mod uint;
+mod config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Load .env file and log the result
     match dotenv::dotenv() {
         Ok(_) => debug!(".env file loaded successfully"),
         Err(e) => warn!("Failed to load .env file: {}", e),
     }
 
-    // Log all environment variables for debugging
     debug!("Environment variables:");
     debug!("RPC_URL: {}", env::var("RPC_URL").unwrap_or_default());
     debug!("STRATUM_ADDR: {}", env::var("STRATUM_ADDR").unwrap_or_default());
@@ -36,6 +35,13 @@ async fn main() -> Result<()> {
     debug!("WINDOW_TIME_MS: {}", env::var("WINDOW_TIME_MS").unwrap_or_default());
     debug!("DEBUG: {}", env::var("DEBUG").unwrap_or_default());
 
+    let diff_config = DifficultyConfig::load();
+
+    debug!(
+        "Loaded DifficultyConfig: min={}, default={}, max={}, enabled={}",
+        diff_config.min, diff_config.default, diff_config.max, diff_config.enabled
+    );
+
     let window_time_ms: u64 = env::var("WINDOW_TIME_MS")
         .map(|val| {
             val.parse::<u64>()
@@ -44,7 +50,6 @@ async fn main() -> Result<()> {
         .unwrap_or(Ok(300_000))
         .context("Failed to parse WINDOW_TIME_MS")?;
 
-    // Validate window_time_ms
     if window_time_ms < 30000 {
         return Err(anyhow::anyhow!(
             "WINDOW_TIME_MS must be at least 30000 milliseconds"
@@ -77,7 +82,6 @@ async fn main() -> Result<()> {
 
     info!("Loaded pool fee: {}%", pool_fee);
 
-    // Initialize logger with global debug level when DEBUG=true
     env_logger::Builder::new()
         .filter_level(if debug { LevelFilter::Debug } else { LevelFilter::Info })
         .init();
@@ -90,21 +94,24 @@ async fn main() -> Result<()> {
     let (handle, recv_cmd) = VecnodHandle::new();
     debug!("Initializing database");
 
-    let stratum = Stratum::new(&stratum_addr, handle.clone(), pool_fee, window_time_ms)
-        .await
-        .context("Failed to initialize Stratum")?;
-    debug!("Stratum server initialized at {}", stratum_addr);
+    let stratum = Stratum::new(
+        &stratum_addr,
+        handle.clone(),
+        pool_fee,
+        window_time_ms,
+        diff_config,
+    )
+    .await
+    .context("Failed to initialize Stratum")?;
 
-    // Create a watch channel for sharing the latest DAA score
     let (daa_score_tx, daa_score_rx) = watch::channel::<Option<u64>>(None);
     debug!("Created DAA score watch channel");
 
-    // Start cleanup task
     debug!("Spawning cleanup task");
     tokio::spawn({
         let db = stratum.share_handler.db.clone();
         async move {
-            let mut cleanup_interval = time::interval(Duration::from_secs(6000)); // Run every 60 minutes
+            let mut cleanup_interval = time::interval(Duration::from_secs(6000));
             cleanup_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
             loop {
                 debug!("Cleanup task loop iteration");
@@ -123,7 +130,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Start confirmation task
     debug!("Spawning confirmation task");
     tokio::spawn({
         let db = stratum.share_handler.db.clone();
@@ -138,7 +144,6 @@ async fn main() -> Result<()> {
                 confirmations_interval.tick().await;
                 debug!("Triggering check_confirmations");
 
-                // Pass VecnodHandle to check_confirmations
                 if let Err(e) = check_confirmations(
                     db.clone(),
                     daa_score_rx.clone(),
@@ -167,7 +172,6 @@ async fn main() -> Result<()> {
     );
     debug!("Vecnod client created with RPC_URL: {}", rpc_url);
 
-    // Request initial DAA score
     handle.send_cmd(Payload::get_block_dag_info());
     debug!("Requested initial DAA score");
 
@@ -201,7 +205,6 @@ async fn main() -> Result<()> {
             }
             Message::BlockDagInfo { virtual_daa_score } => {
                 debug!("Received BlockDagInfo: virtual_daa_score={}", virtual_daa_score);
-                // Update the shared DAA score
                 let _ = daa_score_tx.send(Some(virtual_daa_score));
             }
             Message::NewBlock => {
@@ -210,11 +213,9 @@ async fn main() -> Result<()> {
                     warn!("Failed to request template after new block: channel closed");
                     break;
                 }
-                // Request updated DAA score
                 handle.send_cmd(Payload::get_block_dag_info());
             }
             Message::BlockStatus { .. } => {
-                // Ignore BlockStatus messages in the main loop as they are handled internally
                 debug!("Received BlockStatus message, ignoring in main loop");
             }
         }

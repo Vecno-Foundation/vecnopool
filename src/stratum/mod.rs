@@ -3,6 +3,8 @@
 pub mod jobs;
 pub mod server;
 pub mod protocol;
+pub mod variable_difficulty;
+pub mod worker_stats;
 
 use anyhow::Result;
 use serde::{de, Serializer, Deserialize, Serialize};

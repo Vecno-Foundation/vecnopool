@@ -1,7 +1,7 @@
-//src/vecnod.rs
+// src/vecnod.rs
 
 use anyhow::Result;
-use log::{debug, warn, info};
+use log::{debug, warn};
 use proto::vecnod_message::Payload as RequestPayload;
 use proto::vecnod_response::Payload as ResponsePayload;
 use proto::submit_block_response_message::RejectReason;
@@ -112,8 +112,10 @@ impl ClientTask {
                             warn!("Template block is missing a header");
                             continue;
                         }
+                        debug!("Fresh block template received from node (triggered by notification or initial request)");
                         Message::Template(block)
                     } else {
+                        warn!("GetBlockTemplateResponse contained no block");
                         continue;
                     }
                 },
@@ -123,10 +125,12 @@ impl ClientTask {
                         Message::NewTemplate
                     }
                     None => {
+                        debug!("Successfully subscribed to NewBlockTemplate notifications");
                         Message::NewTemplate
                     }
                 },
                 Some(ResponsePayload::NewBlockTemplateNotification(_)) => {
+                    debug!("NewBlockTemplate notification received — a fresh template is available!");
                     Message::NewTemplate
                 },
                 Some(ResponsePayload::NotifyBlockAddedResponse(res)) => match res.error {
@@ -135,12 +139,13 @@ impl ClientTask {
                         continue;
                     }
                     None => {
+                        debug!("Successfully subscribed to BlockAdded notifications");
                         Message::NewBlock
                     }
                 },
                 Some(ResponsePayload::BlockAddedNotification(block_added)) => {
                     if let Some(block) = block_added.block {
-                        // Process all transactions with no inputs (coinbase transactions)
+                        // Existing reward detection logic (unchanged)
                         let coinbase_txs: Vec<_> = block
                             .transactions
                             .iter()
@@ -162,91 +167,54 @@ impl ClientTask {
                                 .as_ref()
                                 .map(|vd| vd.hash.clone())
                                 .unwrap_or_default();
-                            // Log if multiple coinbase-like transactions are found
                             if coinbase_txs.len() > 1 {
+                                // existing multi-coinbase logging
                                 let tx_ids: Vec<_> = coinbase_txs
                                     .iter()
-                                    .filter_map(|tx| {
-                                        tx.verbose_data.as_ref().map(|vd| vd.transaction_id.clone())
-                                    })
+                                    .filter_map(|tx| tx.verbose_data.as_ref().map(|vd| vd.transaction_id.clone()))
                                     .collect();
-                                let amounts: Vec<_> = coinbase_txs
-                                    .iter()
-                                    .map(|tx| {
-                                        tx.outputs
-                                            .iter()
-                                            .filter(|output| {
-                                                output
-                                                    .verbose_data
-                                                    .as_ref()
-                                                    .map(|vd| {
-                                                        vd.script_public_key_address == self.pool_address
-                                                    })
-                                                    .unwrap_or(false)
-                                            })
-                                            .map(|output| output.amount)
-                                            .sum::<u64>()
-                                    })
-                                    .collect();
-                                info!(
+                                let amounts: Vec<_> = coinbase_txs.iter().map(|tx| {
+                                    tx.outputs.iter().filter(|output| {
+                                        output.verbose_data.as_ref().map(|vd| vd.script_public_key_address == self.pool_address).unwrap_or(false)
+                                    }).map(|output| output.amount).sum::<u64>()
+                                }).collect();
+                                debug!(
                                     "Multiple coinbase-like transactions found in block {}: count={}, transaction_ids={:?}, amounts={:?}, total_amount={}",
-                                    block_hash,
-                                    coinbase_txs.len(),
-                                    tx_ids,
-                                    amounts,
-                                    amounts.iter().sum::<u64>()
+                                    block_hash, coinbase_txs.len(), tx_ids, amounts, amounts.iter().sum::<u64>()
                                 );
                             } else {
                                 debug!("Block with matching pool address found in coinbase: {:?}", block_hash);
                             }
 
                             if let Some(header) = &block.header {
-                                let reward_block_hash = block_hash;
+                                // existing DB recording logic
+                                let reward_block_hash = block_hash.clone();
                                 let job_id = 0;
                                 let extranonce = "";
                                 let nonce = format!("{:016x}", header.nonce);
                                 let daa_score = header.daa_score;
                                 let pool_wallet = self.pool_address.clone();
-                                let amount = coinbase_txs
-                                    .iter()
-                                    .filter(|tx| tx.inputs.is_empty())
-                                    .flat_map(|tx| {
-                                        tx.outputs.iter().filter(|output| {
-                                            output
-                                                .verbose_data
-                                                .as_ref()
-                                                .map(|vd| {
-                                                    vd.script_public_key_address == self.pool_address
-                                                })
-                                                .unwrap_or(false)
-                                        })
+                                let amount = coinbase_txs.iter().filter(|tx| tx.inputs.is_empty()).flat_map(|tx| {
+                                    tx.outputs.iter().filter(|output| {
+                                        output.verbose_data.as_ref().map(|vd| vd.script_public_key_address == self.pool_address).unwrap_or(false)
                                     })
-                                    .map(|output| output.amount)
-                                    .sum::<u64>();
-                                let is_chain_block = block
-                                    .verbose_data
-                                    .as_ref()
-                                    .map(|vd| vd.is_chain_block)
-                                    .unwrap_or(false);
+                                }).map(|output| output.amount).sum::<u64>();
+                                let is_chain_block = block.verbose_data.as_ref().map(|vd| vd.is_chain_block).unwrap_or(false);
 
-                                if let Err(e) = self
-                                    .db
-                                    .add_block_details(
-                                        &reward_block_hash,
-                                        &reward_block_hash,
-                                        job_id,
-                                        extranonce,
-                                        &nonce,
-                                        daa_score,
-                                        &pool_wallet,
-                                        amount,
-                                        is_chain_block,
-                                    )
-                                    .await
-                                {
+                                if let Err(e) = self.db.add_block_details(
+                                    &reward_block_hash,
+                                    &reward_block_hash,
+                                    job_id,
+                                    extranonce,
+                                    &nonce,
+                                    daa_score,
+                                    &pool_wallet,
+                                    amount,
+                                    is_chain_block,
+                                ).await {
                                     warn!("Failed to add block details to database: {:?}", e);
                                 } else {
-                                    info!(
+                                    debug!(
                                         "Successfully added block details to database: hash = {}, daaScore = {}, amount = {}",
                                         reward_block_hash, daa_score, amount
                                     );
@@ -259,37 +227,17 @@ impl ClientTask {
                     Message::NewBlock
                 },
                 Some(ResponsePayload::GetBlockResponse(res)) => {
-                    let block_hash = res
-                        .block
-                        .as_ref()
-                        .and_then(|b| b.verbose_data.as_ref().map(|vd| vd.hash.clone()))
-                        .unwrap_or_default();
-                    let is_chain_block = res
-                        .block
-                        .as_ref()
-                        .and_then(|b| b.verbose_data.as_ref().map(|vd| vd.is_chain_block))
-                        .unwrap_or(false);
+                    // existing block status handling
+                    let block_hash = res.block.as_ref().and_then(|b| b.verbose_data.as_ref().map(|vd| vd.hash.clone())).unwrap_or_default();
+                    let is_chain_block = res.block.as_ref().and_then(|b| b.verbose_data.as_ref().map(|vd| vd.is_chain_block)).unwrap_or(false);
 
-                    // Retrieve and remove the responder from the map
                     let mut senders = self.block_status_senders.lock().await;
                     if let Some(sender) = senders.remove(&block_hash) {
-                        if let Err(e) = sender.send(is_chain_block) {
-                            warn!("Failed to send block status for {}: {:?}", block_hash, e);
-                        } else {
-                            debug!("Sent block status for {}: is_chain_block={}", block_hash, is_chain_block);
-                        }
-                    } else {
-                        debug!("No responder found for block status request: {}", block_hash);
+                        let _ = sender.send(is_chain_block);
                     }
 
-                    if let Some(error) = res.error {
-                        warn!("Error in GetBlockResponse for {}: {}", block_hash, error.message);
-                        // Notify any waiting responder with a default value
-                        if !block_hash.is_empty() {
-                            if let Some(sender) = senders.remove(&block_hash) {
-                                let _ = sender.send(false);
-                            }
-                        }
+                    if res.error.is_some() {
+                        warn!("Error in GetBlockResponse for {}: {:?}", block_hash, res.error);
                     }
 
                     Message::BlockStatus
@@ -303,7 +251,7 @@ impl ClientTask {
                     continue;
                 },
             };
-            self.send_msg.send(msg)?;
+            let _ = self.send_msg.send(msg);
         }
 
         warn!("Vecnod connection closed, attempting to reconnect");
@@ -352,37 +300,30 @@ impl Client {
         };
 
         tokio::spawn(async move {
-            match task.run().await {
-                Ok(_) => warn!("Vecnod connection closed"),
-                Err(e) => warn!("Vecnod connection closed: {e}"),
+            if let Err(e) = task.run().await {
+                warn!("Vecnod client task failed: {}", e);
             }
         });
 
         let send_cmd = handle.send.clone();
-        send_cmd
-            .send(RequestPayload::GetInfoRequest(GetInfoRequestMessage {}))
-            .unwrap();
-        send_cmd
-            .send(RequestPayload::NotifyNewBlockTemplateRequest(
-                NotifyNewBlockTemplateRequestMessage {
-                    command: RpcNotifyCommand::NotifyStart as i32,
-                },
-            ))
-            .unwrap();
-        send_cmd
-            .send(RequestPayload::NotifyBlockAddedRequest(
-                NotifyBlockAddedRequestMessage {
-                    command: RpcNotifyCommand::NotifyStart as i32,
-                },
-            ))
-            .unwrap();
+        let _ = send_cmd.send(RequestPayload::GetInfoRequest(GetInfoRequestMessage {}));
+        let _ = send_cmd.send(RequestPayload::NotifyNewBlockTemplateRequest(
+            NotifyNewBlockTemplateRequestMessage {
+                command: RpcNotifyCommand::NotifyStart as i32,
+            },
+        ));
+        let _ = send_cmd.send(RequestPayload::NotifyBlockAddedRequest(
+            NotifyBlockAddedRequestMessage {
+                command: RpcNotifyCommand::NotifyStart as i32,
+            },
+        ));
 
         let client = Client {
             pay_address,
             extra_data: extra_data.into(),
             send_cmd,
         };
-        client.request_template();
+        let _ = client.request_template();  // Initial template
         (client, recv_msg)
     }
 
@@ -400,7 +341,7 @@ impl Client {
 
 pub mod proto {
     use crate::pow;
-    use crate::uint::U256;
+    use primitive_types::U256;
     use anyhow::Result;
     use blake3::Hash as Blake3Hash;
     use blake3::Hasher as Blake3State;
@@ -408,36 +349,25 @@ pub mod proto {
     const BLOCK_HASH_DOMAIN: &[u8; 32] = b"BlockHash\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
 
     include!(concat!(env!("OUT_DIR"), "/protowire.rs"));
+
     #[allow(dead_code)]
     impl vecnod_message::Payload {
-        pub fn get_info() -> Self {
-            vecnod_message::Payload::GetInfoRequest(GetInfoRequestMessage {})
-        }
-
-        pub fn get_block_dag_info() -> Self {
-            vecnod_message::Payload::GetBlockDagInfoRequest(GetBlockDagInfoRequestMessage {})
-        }
-
+        pub fn get_info() -> Self { vecnod_message::Payload::GetInfoRequest(GetInfoRequestMessage {}) }
+        pub fn get_block_dag_info() -> Self { vecnod_message::Payload::GetBlockDagInfoRequest(GetBlockDagInfoRequestMessage {}) }
         pub fn submit_block(block: RpcBlock, allow_non_daa_blocks: bool) -> Self {
-            vecnod_message::Payload::SubmitBlockRequest(SubmitBlockRequestMessage {
-                block: Some(block),
-                allow_non_daa_blocks,
-            })
+            vecnod_message::Payload::SubmitBlockRequest(SubmitBlockRequestMessage { block: Some(block), allow_non_daa_blocks })
         }
-
         pub fn get_block_template(pay_address: &str, extra_data: &str) -> Self {
             vecnod_message::Payload::GetBlockTemplateRequest(GetBlockTemplateRequestMessage {
                 pay_address: pay_address.into(),
                 extra_data: extra_data.into(),
             })
         }
-
         pub fn notify_new_block_template() -> Self {
             vecnod_message::Payload::NotifyNewBlockTemplateRequest(NotifyNewBlockTemplateRequestMessage {
                 command: RpcNotifyCommand::NotifyStart as i32,
             })
         }
-
         pub fn notify_block_added() -> Self {
             vecnod_message::Payload::NotifyBlockAddedRequest(NotifyBlockAddedRequestMessage {
                 command: RpcNotifyCommand::NotifyStart as i32,
@@ -447,7 +377,7 @@ pub mod proto {
 
     impl RpcBlockHeader {
         pub fn difficulty(&self) -> u64 {
-            let target = pow::u256_from_compact_target(self.bits);
+            let target = pow::u256_from_compact_target_bits(self.bits);
             pow::difficulty(target)
         }
 
@@ -457,7 +387,7 @@ pub mod proto {
             for (o, c) in out.iter_mut().zip(hash.as_bytes().chunks_exact(8)) {
                 *o = u64::from_le_bytes(c.try_into().unwrap());
             }
-            Ok(out.into())
+            Ok(U256(out))
         }
 
         pub fn hash(&self, pre_pow: bool) -> Result<Blake3Hash> {
@@ -484,11 +414,7 @@ pub mod proto {
             hex::decode_to_slice(&self.utxo_commitment, &mut hash)?;
             state.update(&hash);
 
-            let (timestamp, nonce) = if pre_pow {
-                (0, 0)
-            } else {
-                (self.timestamp, self.nonce)
-            };
+            let (timestamp, nonce) = if pre_pow { (0, 0) } else { (self.timestamp, self.nonce) };
 
             state
                 .update(&timestamp.to_le_bytes())

@@ -1,21 +1,28 @@
+// src/stratum/server.rs
+
 use anyhow::Result;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch, Mutex};
-use tokio::io::AsyncBufReadExt;
 use crate::stratum::protocol::StratumConn;
 use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
 use crate::treasury::sharehandler::Sharehandler;
 use crate::vecnod::{VecnodHandle, RpcBlock};
 use crate::database::db::Db;
+use crate::config::DifficultyConfig;
+use crate::stratum::variable_difficulty::VariableDifficulty;
+use tokio::io::AsyncBufReadExt;
+use std::collections::HashSet;
 
 pub struct Stratum {
     pub last_template: Arc<tokio::sync::RwLock<Option<RpcBlock>>>,
     pub jobs: Arc<Jobs>,
     pub share_handler: Arc<Sharehandler>,
     pub send: watch::Sender<Option<JobParams>>,
+    pub current_network_diff: Arc<AtomicU64>,
 }
 
 impl Stratum {
@@ -24,87 +31,97 @@ impl Stratum {
         handle: VecnodHandle,
         pool_fee: f64,
         window_time_ms: u64,
+        diff_config: DifficultyConfig,
     ) -> Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         info!(
-            "Listening on {}, pool fee: {}%, window_time_ms: {}ms ({}s)",
-            addr,
-            pool_fee,
-            window_time_ms,
-            window_time_ms / 1000
+            "Stratum server listening on {} | Pool fee: {}% | PPLNS window: {}s",
+            addr, pool_fee, window_time_ms / 1000
         );
 
         let last_template = Arc::new(tokio::sync::RwLock::new(None));
         let db = Arc::new(Db::new().await?);
-        let jobs = Arc::new(Jobs::new(handle));
+
+        let current_network_diff = Arc::new(AtomicU64::new(0));
+        let jobs = Arc::new(Jobs::new(handle.clone(), current_network_diff.clone()));
+
         let (pending, _) = mpsc::unbounded_channel();
         let (send, recv) = watch::channel(None);
         let share_handler = Arc::new(
-            Sharehandler::new(db, pool_fee, jobs.clone(), window_time_ms)
-                .await?,
+            Sharehandler::new(db, pool_fee, jobs.clone(), window_time_ms).await?,
         );
-        let worker_counter = Arc::new(AtomicU32::new(1));
 
+        let diff_config = Arc::new(diff_config);
+
+        let var_diff = Arc::new(VariableDifficulty::new(
+            (*diff_config).clone(),
+            current_network_diff.clone(),
+        ));
+        var_diff.clone().start_thread();
+
+        let worker_counter = Arc::new(AtomicU32::new(1));
         let jobs_clone = jobs.clone();
         let share_handler_clone = share_handler.clone();
-        let last_template_clone = last_template.clone();
         let pending_clone = pending.clone();
+        let recv_clone = recv.clone();
+        let current_network_diff_for_connections = current_network_diff.clone();
+        let diff_config_shared = diff_config.clone();
+        let var_diff_shared = var_diff.clone();
 
         tokio::spawn(async move {
             loop {
                 let worker_id = worker_counter.fetch_add(1, AtomicOrdering::SeqCst);
                 if worker_id == 0 {
                     worker_counter.fetch_add(1, AtomicOrdering::SeqCst);
-                    debug!("Skipped worker_id=0 to avoid zeroed extranonce");
                 }
                 let worker = worker_id.to_be_bytes();
-                let worker_hex = format!("{:08x}", worker_id);
-                debug!(
-                    "Assigned worker ID: raw={:?}, hex={}, worker_id={} for new connection",
-                    worker, worker_hex, worker_id
-                );
 
                 match listener.accept().await {
                     Ok((mut stream, addr)) => {
-                        info!("New connection from {}", addr);
+                        info!("New miner connected: {}", addr);
+
                         let jobs = jobs_clone.clone();
                         let share_handler = share_handler_clone.clone();
-                        let last_template = last_template_clone.clone();
                         let pending_send = pending_clone.clone();
                         let (pending_send_inner, pending_recv) = mpsc::unbounded_channel();
-                        let recv_clone = recv.clone();
+                        let recv_conn = recv_clone.clone();
+                        let network_diff_conn = current_network_diff_for_connections.clone();
+                        let diff_config_conn = diff_config_shared.clone();
+                        let var_diff_conn = var_diff_shared.clone();
+
                         tokio::spawn(async move {
                             let (reader, writer) = stream.split();
                             let mut conn = StratumConn {
                                 reader: tokio::io::BufReader::new(reader).lines(),
                                 writer: Arc::new(Mutex::new(writer)),
-                                recv: recv_clone,
+                                recv: recv_conn,
                                 jobs,
                                 pending_send: pending_send_inner,
                                 pending_recv,
                                 worker,
                                 id: 0,
                                 subscribed: false,
-                                difficulty: 0,
+                                difficulty: diff_config_conn.default,
                                 authorized: false,
                                 payout_addr: None,
                                 share_handler,
-                                last_template,
                                 extranonce: String::new(),
-                                duplicate_share_count: Arc::new(AtomicU64::new(0)),
+                                diff_config: diff_config_conn.clone(),
+                                last_share_time: Instant::now(),
+                                window_start: Instant::now(),
+                                current_network_diff: network_diff_conn,
+                                var_diff: var_diff_conn,
+                                worker_stats: None,
+                                submitted_nonces: Arc::new(Mutex::new(HashSet::new())),
                             };
-                            debug!(
-                                "Initialized StratumConn for worker: addr={}, worker_id={}, worker_bytes={:?}, worker_hex={}",
-                                addr, worker_id, conn.worker, worker_hex
-                            );
+
                             if let Err(e) = conn.run().await {
-                                error!("Stratum connection error for {}: {}", addr, e);
-                                let result = PendingResult {
+                                error!("Stratum connection closed for {}: {}", addr, e);
+                                let _ = pending_send.send(PendingResult {
                                     id: conn.id.into(),
-                                    error: Some(format!("Connection closed: {}", e).into_boxed_str()),
+                                    error: Some(format!("Connection error: {}", e).into_boxed_str()),
                                     block_hash: None,
-                                };
-                                let _ = pending_send.send(result);
+                                });
                             }
                         });
                     }
@@ -118,10 +135,17 @@ impl Stratum {
             jobs,
             share_handler,
             send,
+            current_network_diff,
         })
     }
 
     pub async fn broadcast(&self, template: RpcBlock) {
+        if let Some(header) = template.header.as_ref() {
+            let network_diff = header.difficulty();
+            self.current_network_diff.store(network_diff, AtomicOrdering::Relaxed);
+            debug!("Updated current network difficulty: {}", network_diff);
+        }
+
         if let Some(job) = self.jobs.insert(template.clone()).await {
             *self.last_template.write().await = Some(template);
             debug!("Broadcasting new job: id={}", job.id);
@@ -131,7 +155,7 @@ impl Stratum {
 
     pub async fn resolve_pending_job(&self, error: Option<anyhow::Error>) {
         if let Some(e) = &error {
-            warn!("Error resolving pending job: {}", e);
+            log::warn!("Block submission failed: {}", e);
         }
         let error_str = error.map(|e| e.to_string().into_boxed_str());
         self.jobs.resolve_pending(error_str).await;

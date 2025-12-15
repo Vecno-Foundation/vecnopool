@@ -22,6 +22,7 @@ pub struct Block {
     pub reward_block_hash: String,
     pub daa_score: i64,
     pub amount: i64,
+    #[allow(dead_code)]
     pub confirmations: i64,
     #[allow(dead_code)]
     pub processed: i64,
@@ -297,7 +298,6 @@ impl Db {
         match result {
             Ok(res) => {
                 if res.rows_affected() > 0 {
-                    // No metrics
                 } else {
                     debug!(
                         "Skipping duplicate share for job_id={job_id}, address={address}, extranonce={extranonce}, nonce={nonce}"
@@ -341,7 +341,7 @@ impl Db {
         let query = if let Some(secs) = window_secs {
             sqlx::query(
                 r#"
-                SELECT address, SUM(difficulty)::BIGINT as total_difficulty
+                SELECT address, COUNT(*) as share_count
                 FROM shares
                 WHERE timestamp >= $1
                 GROUP BY address
@@ -351,7 +351,7 @@ impl Db {
         } else {
             sqlx::query(
                 r#"
-                SELECT address, SUM(difficulty)::BIGINT as total_difficulty
+                SELECT address, COUNT(*) as share_count
                 FROM shares
                 GROUP BY address
                 "#,
@@ -371,8 +371,8 @@ impl Db {
                 let mut sums = HashMap::new();
                 for row in rows {
                     let address: String = row.get(0);
-                    let total_difficulty: i64 = row.get(1);
-                    sums.insert(address, total_difficulty as u64);
+                    let share_count: i64 = row.get(1);
+                    sums.insert(address, share_count as u64);
                 }
                 Ok(sums)
             }
@@ -603,7 +603,7 @@ impl Db {
             match result {
                 Ok(res) => {
                     if res.rows_affected() > 0 {
-                        info!(
+                        debug!(
                             "Updated is_chain_block to {} for block= {}",
                             is_chain_block, reward_block_hash
                         );
@@ -635,7 +635,7 @@ impl Db {
             match result {
                 Ok(res) => {
                     if res.rows_affected() > 0 {
-                        info!("Deleted non-chain block: reward_block_hash= {}", reward_block_hash);
+                        debug!("Deleted non-chain block: reward_block_hash= {}", reward_block_hash);
                     } else {
                         debug!("No block found to delete for reward_block_hash= {}", reward_block_hash);
                     }
@@ -715,38 +715,6 @@ impl Db {
                     );
                 }
                 Ok(rows)
-            }
-            Err(e) => Err(e)
-        }
-    }
-
-    pub async fn check_duplicate_share(&self, reward_block_hash: &str, nonce: &str) -> Result<i64> {
-        let start_time = SystemTime::now();
-        let result = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*) FROM shares WHERE reward_block_hash = $1 AND nonce = $2
-            "#,
-        )
-        .bind(reward_block_hash)
-        .bind(nonce)
-        .fetch_one(&self.pool)
-        .await
-        .context("Failed to check for duplicate share by hash");
-
-        let elapsed = start_time.elapsed().unwrap_or_default().as_secs_f64();
-        debug!(
-            "check_duplicate_share query took {} seconds for reward_block_hash={}, nonce={}",
-            elapsed, reward_block_hash, nonce
-        );
-
-        match result {
-            Ok(count) => {
-                if count > 0 {
-                    debug!(
-                        "Duplicate share found for reward_block_hash={reward_block_hash}, nonce={nonce}"
-                    );
-                }
-                Ok(count)
             }
             Err(e) => Err(e)
         }

@@ -83,7 +83,7 @@ impl<'a> StratumConn<'a> {
         }
     }
 
-    pub async fn write_request(&mut self, method: &'static str, params: Option<serde_json::Value>) -> Result<()> {
+    async fn write_request(&mut self, method: &'static str, params: Option<serde_json::Value>) -> Result<()> {
         self.id += 1;
         let req = Request {
             id: Some(self.id.into()),
@@ -288,12 +288,12 @@ impl<'a> StratumConn<'a> {
                                     let actual_diff = difficulty(u256_from_compact_target_bits(header.bits));
                                     let share_threshold = ((network_diff as f64) * 0.95) as u64;
                                     let is_valid_share = actual_diff >= share_threshold;
-                                    let is_block = actual_diff >= network_diff;
+                                    let is_block_candidate = actual_diff >= network_diff && self.difficulty >= network_diff;
 
                                     info!(
-                                        "Share → {} | job={} | actual={} | pool={} | net={} | threshold={} | valid_share={} | block={}",
+                                        "Share → {} | job={} | actual={} | pool={} | net={} | threshold={} | valid_share={} | block_candidate={}",
                                         worker_name, job_id, actual_diff, self.difficulty, network_diff,
-                                        share_threshold, is_valid_share, is_block
+                                        share_threshold, is_valid_share, is_block_candidate
                                     );
 
                                     if !is_valid_share {
@@ -319,16 +319,16 @@ impl<'a> StratumConn<'a> {
                                         daa_score: header.daa_score as i64,
                                         extranonce: self.extranonce.clone(),
                                         nonce: nonce_hex_full.clone(),
-                                        reward_block_hash: is_block.then(|| block_hash_hex.clone()),
+                                        reward_block_hash: is_block_candidate.then(|| block_hash_hex.clone()),
                                         pool_difficulty: self.difficulty,
                                     };
 
                                     let _ = self.share_handler.record_share(&contribution, actual_diff, true).await;
 
-                                    if is_block {
+                                    if is_block_candidate {
                                         info!(
-                                            "BLOCK FOUND → {} | diff={} ≥ net={} | hash={}",
-                                            worker_name, actual_diff, network_diff, block_hash_hex
+                                            "BLOCK FOUND → {} | diff={} ≥ net={} | pool={} ≥ net={} | hash={}",
+                                            worker_name, actual_diff, network_diff, self.difficulty, network_diff, block_hash_hex
                                         );
                                         SUBMITTED_BLOCK_HASHES.insert(block_hash_hex.clone());
 
@@ -341,21 +341,29 @@ impl<'a> StratumConn<'a> {
                                         ).await;
 
                                         if !submitted {
-                                            warn!("Stale block submission skipped");
-                                            self.write_error_response(request_id, 22, "Stale block").await?;
-                                            continue;
+                                            warn!("Block submission failed: stale or invalid template");
                                         }
 
+                                        // Notify miner of block (some clients expect block_hash on success)
                                         let _ = self.pending_send.send(PendingResult {
                                             id: request_id,
                                             error: None,
                                             block_hash: Some(block_hash_hex),
                                         });
                                     } else {
-                                        info!(
-                                            "Valid sub-network share → {} | diff={} ({}% of net) | recorded for rewards only",
-                                            worker_name, actual_diff, (actual_diff as f64 / network_diff as f64 * 100.0).round()
-                                        );
+                                        // Normal valid share (or lucky high-diff share below pool target)
+                                        if actual_diff >= network_diff {
+                                            info!(
+                                                "LUCKY HIGH-DIFF SHARE → {} | actual={} ≥ net={} but pool={} < net | recorded as high-value share, NOT submitted",
+                                                worker_name, actual_diff, network_diff, self.difficulty
+                                            );
+                                        } else {
+                                            info!(
+                                                "Valid share → {} | actual={} ({:.1}% of net) | recorded for rewards",
+                                                worker_name, actual_diff, (actual_diff as f64 / network_diff as f64 * 100.0)
+                                            );
+                                        }
+
                                         let _ = self.pending_send.send(PendingResult {
                                             id: request_id,
                                             error: None,

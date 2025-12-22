@@ -1,14 +1,14 @@
-// src/treasury/sharehandler.rs
+//src/treasury/sharehandler.rs
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use log::info;
+use log::{info, debug};
 use crate::database::db::Db;
 use crate::stratum::jobs::Jobs;
 
@@ -33,6 +33,7 @@ pub struct Sharehandler {
     pub last_periodic_log: Arc<AtomicU64>,
     pub pool_fee: f64,
     pub jobs: Arc<Jobs>,
+    pub is_synced: Arc<AtomicBool>,
 }
 
 impl Sharehandler {
@@ -41,6 +42,7 @@ impl Sharehandler {
         pool_fee: f64,
         jobs: Arc<Jobs>,
         window_time_ms: u64,
+        is_synced: Arc<AtomicBool>,
     ) -> Result<Self> {
         let total_shares = db.get_total_shares(window_time_ms / 1000).await.context("Failed to load total shares")?;
         let total_shares = Arc::new(AtomicU64::new(total_shares));
@@ -87,6 +89,7 @@ impl Sharehandler {
             last_periodic_log,
             pool_fee,
             jobs,
+            is_synced,
         })
     }
 
@@ -124,8 +127,18 @@ impl Sharehandler {
         _miner_difficulty: u64,
         is_valid: bool,
     ) -> Result<()> {
+        if !self.is_synced.load(AtomicOrdering::Relaxed) {
+            debug!(
+                "Share ignored (node not synced): {} | diff={} | block={}",
+                contribution.address,
+                contribution.difficulty,
+                contribution.reward_block_hash.is_some()
+            );
+            return Ok(());
+        }
         if let Ok(job_id) = contribution.job_id.parse::<u8>() {
             if self.jobs.get_job(job_id).await.is_none() {
+                debug!("Ignoring share for stale job {}", job_id);
                 return Ok(());
             }
         }

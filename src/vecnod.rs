@@ -1,7 +1,7 @@
-// src/vecnod.rs
+//src/vecnod.rs
 
 use anyhow::Result;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use proto::vecnod_message::Payload as RequestPayload;
 use proto::vecnod_response::Payload as ResponsePayload;
 use proto::submit_block_response_message::RejectReason;
@@ -18,6 +18,8 @@ use std::sync::Arc;
 use crate::database::db::Db;
 use tokio::sync::oneshot;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use dashmap::DashSet;
 
 pub type Send<T> = mpsc::UnboundedSender<T>;
 type Recv<T> = mpsc::UnboundedReceiver<T>;
@@ -71,6 +73,8 @@ struct ClientTask {
     db: Arc<Db>,
     pool_address: String,
     block_status_senders: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<bool>>>>,
+    is_synced: Arc<AtomicBool>,
+    recorded_rewards: Arc<DashSet<String>>,  // Global deduplication set
 }
 
 impl ClientTask {
@@ -87,12 +91,24 @@ impl ClientTask {
 
         while let Some(VecnodResponse { id: _, payload }) = stream.message().await? {
             let msg = match payload {
-                Some(ResponsePayload::GetInfoResponse(info)) => Message::Info {
-                    version: info.server_version,
-                },
+                Some(ResponsePayload::GetInfoResponse(info)) => {
+                    let was_synced = self.is_synced.swap(info.is_synced, Ordering::Relaxed);
+                    if was_synced != info.is_synced {
+                        if info.is_synced {
+                            info!("Node synced — mining enabled");
+                        } else {
+                            warn!("Node not synced — pausing operations");
+                        }
+                    }
+                    Message::Info {
+                        version: info.server_version,
+                    }
+                }
+
                 Some(ResponsePayload::GetBlockDagInfoResponse(info)) => Message::BlockDagInfo {
                     virtual_daa_score: info.virtual_daa_score,
                 },
+
                 Some(ResponsePayload::SubmitBlockResponse(res)) => {
                     let res = match (RejectReason::try_from(res.reject_reason), res.error) {
                         (Ok(RejectReason::None), None) => None,
@@ -102,134 +118,156 @@ impl ClientTask {
                     };
                     Message::SubmitBlockResult(res)
                 },
+
                 Some(ResponsePayload::GetBlockTemplateResponse(res)) => {
                     if let Some(e) = res.error {
                         warn!("Error in GetBlockTemplateResponse: {}", e.message);
                         continue;
                     }
+
+                    let was_synced = self.is_synced.swap(res.is_synced, Ordering::Relaxed);
+                    if was_synced != res.is_synced {
+                        if res.is_synced {
+                            info!("Node is now synced — full mining operations resumed");
+                        } else {
+                            warn!("Node lost sync — pausing block submissions and reward recording");
+                        }
+                    }
+
                     if let Some(block) = res.block {
                         if block.header.is_none() {
-                            warn!("Template block is missing a header");
+                            warn!("Received template missing header");
                             continue;
                         }
-                        debug!("Fresh block template received from node (triggered by notification or initial request)");
+                        debug!("Fresh block template received");
                         Message::Template(block)
                     } else {
                         warn!("GetBlockTemplateResponse contained no block");
                         continue;
                     }
                 },
+
                 Some(ResponsePayload::NotifyNewBlockTemplateResponse(res)) => match res.error {
                     Some(e) => {
-                        warn!("Unable to subscribe to new templates: {}", e.message);
+                        warn!("Failed to subscribe to new templates: {}", e.message);
                         Message::NewTemplate
                     }
                     None => {
-                        debug!("Successfully subscribed to NewBlockTemplate notifications");
+                        debug!("Subscribed to NewBlockTemplate notifications");
                         Message::NewTemplate
                     }
                 },
+
                 Some(ResponsePayload::NewBlockTemplateNotification(_)) => {
-                    debug!("NewBlockTemplate notification received — a fresh template is available!");
+                    debug!("New template available — requesting update");
                     Message::NewTemplate
                 },
+
                 Some(ResponsePayload::NotifyBlockAddedResponse(res)) => match res.error {
                     Some(e) => {
-                        warn!("Error in NotifyBlockAddedResponse: {}", e.message);
+                        warn!("Failed to subscribe to BlockAdded: {}", e.message);
                         continue;
                     }
                     None => {
-                        debug!("Successfully subscribed to BlockAdded notifications");
+                        debug!("Subscribed to BlockAdded notifications");
                         Message::NewBlock
                     }
                 },
+
                 Some(ResponsePayload::BlockAddedNotification(block_added)) => {
-                    if let Some(block) = block_added.block {
-                        // Existing reward detection logic (unchanged)
-                        let coinbase_txs: Vec<_> = block
-                            .transactions
-                            .iter()
-                            .filter(|tx| tx.inputs.is_empty())
-                            .collect();
-                        let matches_pool_address = coinbase_txs.iter().any(|tx| {
-                            tx.outputs.iter().any(|output| {
-                                output
-                                    .verbose_data
-                                    .as_ref()
-                                    .map(|vd| vd.script_public_key_address == self.pool_address)
-                                    .unwrap_or(false)
-                            })
-                        });
+                    if !self.is_synced.load(Ordering::Relaxed) {
+                        debug!("Ignoring BlockAddedNotification — node not synced");
+                        Message::NewBlock
+                    } else {
+                        if let Some(block) = block_added.block {
+                            let coinbase_txs: Vec<_> = block
+                                .transactions
+                                .iter()
+                                .filter(|tx| tx.inputs.is_empty())
+                                .collect();
 
-                        if matches_pool_address {
-                            let block_hash = block
-                                .verbose_data
-                                .as_ref()
-                                .map(|vd| vd.hash.clone())
-                                .unwrap_or_default();
-                            if coinbase_txs.len() > 1 {
-                                // existing multi-coinbase logging
-                                let tx_ids: Vec<_> = coinbase_txs
-                                    .iter()
-                                    .filter_map(|tx| tx.verbose_data.as_ref().map(|vd| vd.transaction_id.clone()))
-                                    .collect();
-                                let amounts: Vec<_> = coinbase_txs.iter().map(|tx| {
-                                    tx.outputs.iter().filter(|output| {
-                                        output.verbose_data.as_ref().map(|vd| vd.script_public_key_address == self.pool_address).unwrap_or(false)
-                                    }).map(|output| output.amount).sum::<u64>()
-                                }).collect();
-                                debug!(
-                                    "Multiple coinbase-like transactions found in block {}: count={}, transaction_ids={:?}, amounts={:?}, total_amount={}",
-                                    block_hash, coinbase_txs.len(), tx_ids, amounts, amounts.iter().sum::<u64>()
-                                );
-                            } else {
-                                debug!("Block with matching pool address found in coinbase: {:?}", block_hash);
-                            }
+                            let matches_pool_address = coinbase_txs.iter().any(|tx| {
+                                tx.outputs.iter().any(|output| {
+                                    output.verbose_data.as_ref()
+                                        .map(|vd| vd.script_public_key_address == self.pool_address)
+                                        .unwrap_or(false)
+                                })
+                            });
 
-                            if let Some(header) = &block.header {
-                                // existing DB recording logic
-                                let reward_block_hash = block_hash.clone();
-                                let job_id = 0;
-                                let extranonce = "";
-                                let nonce = format!("{:016x}", header.nonce);
-                                let daa_score = header.daa_score;
-                                let pool_wallet = self.pool_address.clone();
-                                let amount = coinbase_txs.iter().filter(|tx| tx.inputs.is_empty()).flat_map(|tx| {
-                                    tx.outputs.iter().filter(|output| {
-                                        output.verbose_data.as_ref().map(|vd| vd.script_public_key_address == self.pool_address).unwrap_or(false)
-                                    })
-                                }).map(|output| output.amount).sum::<u64>();
-                                let is_chain_block = block.verbose_data.as_ref().map(|vd| vd.is_chain_block).unwrap_or(false);
+                            if matches_pool_address {
+                                let block_hash = block.verbose_data.as_ref()
+                                    .map(|vd| vd.hash.clone())
+                                    .unwrap_or_default();
 
-                                if let Err(e) = self.db.add_block_details(
-                                    &reward_block_hash,
-                                    &reward_block_hash,
-                                    job_id,
-                                    extranonce,
-                                    &nonce,
-                                    daa_score,
-                                    &pool_wallet,
-                                    amount,
-                                    is_chain_block,
-                                ).await {
-                                    warn!("Failed to add block details to database: {:?}", e);
+                                // Deduplicate using global set
+                                if self.recorded_rewards.contains(&block_hash) {
+                                    debug!("Skipping duplicate reward recording for block {}", block_hash);
+                                    Message::NewBlock
                                 } else {
-                                    debug!(
-                                        "Successfully added block details to database: hash = {}, daaScore = {}, amount = {}",
-                                        reward_block_hash, daa_score, amount
-                                    );
+                                    self.recorded_rewards.insert(block_hash.clone());
+
+                                    debug!("Pool reward found in block {}", block_hash);
+
+                                    if let Some(header) = &block.header {
+                                        let reward_block_hash = block_hash.clone();
+                                        let job_id = 0;
+                                        let extranonce = "";
+                                        let nonce = format!("{:016x}", header.nonce);
+                                        let daa_score = header.daa_score;
+                                        let pool_wallet = self.pool_address.clone();
+                                        let amount = coinbase_txs.iter()
+                                            .filter(|tx| tx.inputs.is_empty())
+                                            .flat_map(|tx| tx.outputs.iter())
+                                            .filter(|output| {
+                                                output.verbose_data.as_ref()
+                                                    .map(|vd| vd.script_public_key_address == self.pool_address)
+                                                    .unwrap_or(false)
+                                            })
+                                            .map(|output| output.amount)
+                                            .sum::<u64>();
+                                        let is_chain_block = block.verbose_data.as_ref()
+                                            .map(|vd| vd.is_chain_block)
+                                            .unwrap_or(false);
+
+                                        if let Err(e) = self.db.add_block_details(
+                                            &reward_block_hash,
+                                            &reward_block_hash,
+                                            job_id,
+                                            extranonce,
+                                            &nonce,
+                                            daa_score,
+                                            &pool_wallet,
+                                            amount,
+                                            is_chain_block,
+                                        ).await {
+                                            warn!("Failed to save block reward to DB: {:?}", e);
+                                            self.recorded_rewards.remove(&reward_block_hash);
+                                        } else {
+                                            info!(
+                                                "Recorded pool block reward: hash={}, amount={}, daa_score={}",
+                                                reward_block_hash, amount, daa_score
+                                            );
+                                        }
+                                    }
+                                    Message::NewBlock
                                 }
+                            } else {
+                                debug!("No pool reward in this block");
+                                Message::NewBlock
                             }
                         } else {
-                            debug!("No coinbase transactions match pool address");
+                            Message::NewBlock
                         }
                     }
-                    Message::NewBlock
                 },
+
                 Some(ResponsePayload::GetBlockResponse(res)) => {
-                    // existing block status handling
-                    let block_hash = res.block.as_ref().and_then(|b| b.verbose_data.as_ref().map(|vd| vd.hash.clone())).unwrap_or_default();
-                    let is_chain_block = res.block.as_ref().and_then(|b| b.verbose_data.as_ref().map(|vd| vd.is_chain_block)).unwrap_or(false);
+                    let block_hash = res.block.as_ref()
+                        .and_then(|b| b.verbose_data.as_ref().map(|vd| vd.hash.clone()))
+                        .unwrap_or_default();
+                    let is_chain_block = res.block.as_ref()
+                        .and_then(|b| b.verbose_data.as_ref().map(|vd| vd.is_chain_block))
+                        .unwrap_or(false);
 
                     let mut senders = self.block_status_senders.lock().await;
                     if let Some(sender) = senders.remove(&block_hash) {
@@ -237,24 +275,27 @@ impl ClientTask {
                     }
 
                     if res.error.is_some() {
-                        warn!("Error in GetBlockResponse for {}: {:?}", block_hash, res.error);
+                        warn!("GetBlockResponse error for {}: {:?}", block_hash, res.error);
                     }
 
                     Message::BlockStatus
                 },
+
                 Some(payload) => {
-                    warn!("Received unhandled response type: {:?}", payload);
+                    warn!("Unhandled response payload: {:?}", payload);
                     continue;
                 },
+
                 None => {
                     warn!("Received empty payload");
                     continue;
                 },
             };
+
             let _ = self.send_msg.send(msg);
         }
 
-        warn!("Vecnod connection closed, attempting to reconnect");
+        warn!("Vecnod connection closed — will reconnect on next request");
         Ok(())
     }
 }
@@ -275,6 +316,8 @@ impl Client {
         recv_cmd: Recv<RequestPayload>,
         db: Arc<Db>,
         pool_address: String,
+        is_synced: Arc<AtomicBool>,
+        recorded_rewards: Arc<DashSet<String>>,
     ) -> (Self, Recv<Message>) {
         let (send_msg, recv_msg) = mpsc::unbounded_channel();
 
@@ -289,7 +332,9 @@ impl Client {
         } else {
             url.into()
         };
+
         let block_status_senders = handle.block_status_senders.clone();
+
         let task = ClientTask {
             url,
             send_msg,
@@ -297,15 +342,18 @@ impl Client {
             db,
             pool_address,
             block_status_senders,
+            is_synced: is_synced.clone(),
+            recorded_rewards: recorded_rewards.clone(),
         };
 
         tokio::spawn(async move {
             if let Err(e) = task.run().await {
-                warn!("Vecnod client task failed: {}", e);
+                warn!("Vecnod client task terminated: {}", e);
             }
         });
 
         let send_cmd = handle.send.clone();
+
         let _ = send_cmd.send(RequestPayload::GetInfoRequest(GetInfoRequestMessage {}));
         let _ = send_cmd.send(RequestPayload::NotifyNewBlockTemplateRequest(
             NotifyNewBlockTemplateRequestMessage {
@@ -323,7 +371,8 @@ impl Client {
             extra_data: extra_data.into(),
             send_cmd,
         };
-        let _ = client.request_template();  // Initial template
+        let _ = client.request_template();
+
         (client, recv_msg)
     }
 

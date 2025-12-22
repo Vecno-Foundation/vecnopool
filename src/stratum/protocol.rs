@@ -3,10 +3,10 @@
 use anyhow::Result;
 use serde_json::json;
 use tokio::io::{AsyncWriteExt, BufReader, Lines};
-use tokio::net::tcp::{ReadHalf, WriteHalf};
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::{broadcast, mpsc, watch, Mutex};
 use std::collections::HashSet;
-use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+use std::sync::{Arc, atomic::{AtomicU64, Ordering as AtomicOrdering}};
 use std::time::Instant;
 use crate::stratum::{Id, Request, Response};
 use crate::stratum::jobs::{Jobs, JobParams, PendingResult};
@@ -23,9 +23,9 @@ use hex;
 const NEW_LINE: &'static str = "\n";
 static SUBMITTED_BLOCK_HASHES: Lazy<Arc<DashSet<String>>> = Lazy::new(|| Arc::new(DashSet::new()));
 
-pub struct StratumConn<'a> {
-    pub reader: Lines<BufReader<ReadHalf<'a>>>,
-    pub writer: Arc<Mutex<WriteHalf<'a>>>,
+pub struct StratumConn {
+    pub reader: Lines<BufReader<OwnedReadHalf>>,
+    pub writer: Arc<Mutex<OwnedWriteHalf>>,
     pub recv: watch::Receiver<Option<JobParams>>,
     pub jobs: Arc<Jobs>,
     pub pending_send: mpsc::UnboundedSender<PendingResult>,
@@ -45,9 +45,10 @@ pub struct StratumConn<'a> {
     pub var_diff: Arc<VariableDifficulty>,
     pub worker_stats: Option<Arc<tokio::sync::RwLock<WorkerStats>>>,
     pub submitted_nonces: Arc<Mutex<HashSet<(u8, u64)>>>,
+    pub shutdown_rx: broadcast::Receiver<()>,
 }
 
-impl<'a> StratumConn<'a> {
+impl StratumConn {
     async fn maybe_update_difficulty(&mut self) -> Result<()> {
         let new_diff = if let Some(stats) = &self.worker_stats {
             let stats_read = stats.read().await;
@@ -118,14 +119,15 @@ impl<'a> StratumConn<'a> {
         self.window_start = now;
 
         if self.recv.borrow().is_none() {
-            self.write_error_response(Id::Number(0), 25, "Node disconnected").await?;
+            self.write_error_response(Id::Number(0), 25, "No active job — node disconnected").await?;
             return Ok(());
         }
+        let mut shutdown_rx = self.shutdown_rx.resubscribe();
 
         loop {
             tokio::select! {
                 _ = self.recv.changed() => {
-                    if self.subscribed {
+                    if self.subscribed && self.jobs.is_synced.load(AtomicOrdering::Relaxed) {
                         let _ = self.write_template().await;
                     }
                 }
@@ -139,6 +141,13 @@ impl<'a> StratumConn<'a> {
                 line = read(&mut self.reader) => {
                     match line? {
                         Some(msg) => {
+                            if msg.method == "mining.submit" && !self.jobs.is_synced.load(AtomicOrdering::Relaxed) {
+                                if let Some(id) = msg.id {
+                                    self.write_error_response(id, 25, "Node not synced — share rejected").await?;
+                                }
+                                continue;
+                            }
+
                             match (msg.id, &*msg.method, msg.params) {
                                 (Some(id), "mining.subscribe", Some(_)) => {
                                     self.subscribed = true;
@@ -157,7 +166,7 @@ impl<'a> StratumConn<'a> {
                                     };
 
                                     if params.is_empty() || !params[0].starts_with("vecno:") {
-                                        self.write_error_response(id, 21, "Invalid address").await?;
+                                        self.write_error_response(id, 21, "Invalid payout address (must start with vecno:)").await?;
                                         continue;
                                     }
 
@@ -165,7 +174,7 @@ impl<'a> StratumConn<'a> {
                                     self.payout_addr = Some(address.clone());
                                     self.authorized = true;
 
-                                    let network_diff = self.current_network_diff.load(Ordering::Relaxed);
+                                    let network_diff = self.current_network_diff.load(AtomicOrdering::Relaxed);
 
                                     if network_diff > 0 {
                                         let scaled = (network_diff as f64 / self.diff_config.scale_factor as f64).round() as u64;
@@ -243,7 +252,7 @@ impl<'a> StratumConn<'a> {
 
                                     if is_duplicate {
                                         warn!("Duplicate nonce: job={} nonce={:016x}", job_id, nonce);
-                                        self.write_error_response(request_id, 22, "Duplicate nonce").await?;
+                                        self.write_error_response(request_id, 22, "Duplicate share").await?;
                                         continue;
                                     }
 
@@ -271,7 +280,7 @@ impl<'a> StratumConn<'a> {
                                     let pow_hash = match header.hash(false) {
                                         Ok(h) => h,
                                         Err(_) => {
-                                            self.write_error_response(request_id, 22, "Hash error").await?;
+                                            self.write_error_response(request_id, 22, "Hash calculation error").await?;
                                             continue;
                                         }
                                     };
@@ -280,20 +289,19 @@ impl<'a> StratumConn<'a> {
                                     let nonce_hex_full = format!("{:016x}", nonce);
 
                                     if SUBMITTED_BLOCK_HASHES.contains(&block_hash_hex) {
-                                        warn!("Duplicate block hash: {}", block_hash_hex);
+                                        warn!("Duplicate block hash detected: {}", block_hash_hex);
                                         self.write_error_response(request_id, 22, "Duplicate block").await?;
                                         continue;
                                     }
 
                                     let actual_diff = difficulty(u256_from_compact_target_bits(header.bits));
-                                    let share_threshold = ((network_diff as f64) * 0.95) as u64;
-                                    let is_valid_share = actual_diff >= share_threshold;
-                                    let is_block_candidate = actual_diff >= network_diff && self.difficulty >= network_diff;
+                                    let is_valid_share = actual_diff >= network_diff;
+                                    let is_block_candidate = is_valid_share && self.difficulty >= network_diff;
 
                                     info!(
-                                        "Share → {} | job={} | actual={} | pool={} | net={} | threshold={} | valid_share={} | block_candidate={}",
+                                        "Share → {} | job={} | actual={} | pool={} | net={} | valid={} | block_candidate={}",
                                         worker_name, job_id, actual_diff, self.difficulty, network_diff,
-                                        share_threshold, is_valid_share, is_block_candidate
+                                        is_valid_share, is_block_candidate
                                     );
 
                                     if !is_valid_share {
@@ -327,7 +335,7 @@ impl<'a> StratumConn<'a> {
 
                                     if is_block_candidate {
                                         info!(
-                                            "BLOCK FOUND → {} | diff={} ≥ net={} | pool={} ≥ net={} | hash={}",
+                                            "BLOCK FOUND → {} | actual={} ≥ net={} | pool={} ≥ net={} | hash={}",
                                             worker_name, actual_diff, network_diff, self.difficulty, network_diff, block_hash_hex
                                         );
                                         SUBMITTED_BLOCK_HASHES.insert(block_hash_hex.clone());
@@ -341,25 +349,23 @@ impl<'a> StratumConn<'a> {
                                         ).await;
 
                                         if !submitted {
-                                            warn!("Block submission failed: stale or invalid template");
+                                            warn!("Block submission failed (likely stale)");
                                         }
 
-                                        // Notify miner of block (some clients expect block_hash on success)
                                         let _ = self.pending_send.send(PendingResult {
                                             id: request_id,
                                             error: None,
                                             block_hash: Some(block_hash_hex),
                                         });
                                     } else {
-                                        // Normal valid share (or lucky high-diff share below pool target)
                                         if actual_diff >= network_diff {
                                             info!(
-                                                "LUCKY HIGH-DIFF SHARE → {} | actual={} ≥ net={} but pool={} < net | recorded as high-value share, NOT submitted",
+                                                "LUCKY SHARE → {} | actual={} ≥ net={} but pool={} < net | counted but not submitted",
                                                 worker_name, actual_diff, network_diff, self.difficulty
                                             );
                                         } else {
                                             info!(
-                                                "Valid share → {} | actual={} ({:.1}% of net) | recorded for rewards",
+                                                "Valid share → {} | actual={} ({:.1}% of net)",
                                                 worker_name, actual_diff, (actual_diff as f64 / network_diff as f64 * 100.0)
                                             );
                                         }
@@ -378,13 +384,20 @@ impl<'a> StratumConn<'a> {
                         None => break,
                     }
                 }
+
+                _ = shutdown_rx.recv() => {
+                    let addr = self.payout_addr.as_deref().unwrap_or("unknown");
+                    info!("Node out of sync — closing connection for {}", addr);
+                    let _ = self.write_request("mining.notify", Some(json!(["", false, "cleanup"]))).await;
+                    break;
+                }
             }
         }
         Ok(())
     }
 }
 
-pub async fn read(r: &mut Lines<BufReader<ReadHalf<'_>>>) -> Result<Option<Request>> {
+pub async fn read(r: &mut Lines<BufReader<OwnedReadHalf>>) -> Result<Option<Request>> {
     let line = match r.next_line().await? {
         Some(l) => l,
         None => return Ok(None),

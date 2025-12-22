@@ -1,4 +1,4 @@
-// src/stratum/jobs.rs
+//src/stratum/jobs.rs
 
 use crate::stratum::{Id, Response};
 use crate::vecnod::{VecnodHandle, RpcBlock};
@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use hex;
 use dashmap::DashMap;
 use std::time::{Instant, Duration};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 const MAX_DAA_LAG: u64 = 3;
 
@@ -22,11 +22,16 @@ pub struct Jobs {
     pending: Arc<Mutex<VecDeque<Pending>>>,
     submitted_hashes: Arc<DashMap<String, Instant>>,
     submission_lock: Arc<Mutex<()>>,
-    current_network_diff: Arc<AtomicU64>,
+    current_daa_score: Arc<AtomicU64>,
+    pub is_synced: Arc<AtomicBool>,
 }
 
 impl Jobs {
-    pub fn new(handle: VecnodHandle, current_network_diff: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        handle: VecnodHandle,
+        current_daa_score: Arc<AtomicU64>,
+        is_synced: Arc<AtomicBool>,
+    ) -> Self {
         let jobs = Self {
             inner: Arc::new(RwLock::new(JobsInner {
                 next: 0,
@@ -36,7 +41,8 @@ impl Jobs {
             pending: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
             submitted_hashes: Arc::new(DashMap::new()),
             submission_lock: Arc::new(Mutex::new(())),
-            current_network_diff,
+            current_daa_score,
+            is_synced,
         };
 
         {
@@ -54,7 +60,7 @@ impl Jobs {
     }
 
     pub async fn insert(&self, template: RpcBlock) -> Option<JobParams> {
-        let header = template.header.as_ref()?.clone(); // Clone to avoid borrow conflict
+        let header = template.header.as_ref()?.clone();
         let pre_pow = header.pre_pow().ok()?;
         let network_difficulty = header.difficulty();
         let timestamp = header.timestamp as u64;
@@ -93,6 +99,15 @@ impl Jobs {
         send: mpsc::UnboundedSender<PendingResult>,
     ) -> bool {
         let start = Instant::now();
+        if !self.is_synced.load(Ordering::Relaxed) {
+            warn!(
+                target: "stratum::jobs",
+                "BLOCK SUBMISSION REJECTED: Node not synced → miner={} job_id={} nonce={:016x}",
+                miner_address, job_id, nonce
+            );
+            Pending { id: rpc_id, send }.resolve(Some("node not synced".into()));
+            return false;
+        }
 
         let _lock = match tokio::time::timeout(Duration::from_millis(100), self.submission_lock.lock()).await {
             Ok(lock) => lock,
@@ -111,9 +126,8 @@ impl Jobs {
             };
 
             let template_daa_score = template.header.as_ref().map(|h| h.daa_score).unwrap_or(0);
-            let current_daa_approx = self.current_network_diff.load(Ordering::Relaxed);
+            let current_daa_approx = self.current_daa_score.load(Ordering::Relaxed);
 
-            // Strict freshness check: reject if job is more than 1 DAA behind
             if template_daa_score + MAX_DAA_LAG < current_daa_approx {
                 info!(
                     target: "stratum::jobs",
